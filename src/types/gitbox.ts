@@ -67,6 +67,8 @@ export interface DiffResponse {
   path?: string | null;
   staged: boolean;
   text: string;
+  oldText?: string | null;
+  newText?: string | null;
   hunks: DiffHunk[];
 }
 

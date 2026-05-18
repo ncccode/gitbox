@@ -114,6 +114,8 @@ pub struct DiffResponse {
     pub path: Option<String>,
     pub staged: bool,
     pub text: String,
+    pub old_text: Option<String>,
+    pub new_text: Option<String>,
     pub hunks: Vec<DiffHunk>,
 }
 
@@ -850,6 +852,8 @@ pub fn get_diff_core(
     Ok(DiffResponse {
         path: normalized_path,
         staged,
+        old_text: None,
+        new_text: None,
         hunks: parse_diff_hunks(&text),
         text,
     })
@@ -1491,6 +1495,12 @@ pub fn commit_file_diff_core(
     let pathspec = repo_path_string(&rel);
     let diff_mode = mode.unwrap_or_else(|| "commit".to_string());
 
+    let parent_treeish = if matches!(diff_mode.as_str(), "commit" | "parent-worktree") {
+        Some(parent_or_empty_tree(&repo, &oid)?)
+    } else {
+        None
+    };
+
     let args = match diff_mode.as_str() {
         "commit" => vec![
             "show".to_string(),
@@ -1519,7 +1529,7 @@ pub fn commit_file_diff_core(
             "--patch".to_string(),
             "--no-ext-diff".to_string(),
             "--no-color".to_string(),
-            parent_or_empty_tree(&repo, &oid)?,
+            parent_treeish.clone().unwrap_or_default(),
             "--".to_string(),
             pathspec.clone(),
         ],
@@ -1527,9 +1537,35 @@ pub fn commit_file_diff_core(
     };
 
     let text = run_git(&workdir, args, None)?;
+    let (old_text, new_text) = match diff_mode.as_str() {
+        "commit" => (
+            parent_treeish
+                .as_deref()
+                .map(|treeish| read_treeish_file_text(&repo, treeish, &pathspec))
+                .transpose()?
+                .flatten(),
+            read_treeish_file_text(&repo, &oid, &pathspec)?,
+        ),
+        "worktree" => (
+            read_treeish_file_text(&repo, &oid, &pathspec)?,
+            read_workdir_file_text(&repo, &pathspec)?,
+        ),
+        "parent-worktree" => (
+            parent_treeish
+                .as_deref()
+                .map(|treeish| read_treeish_file_text(&repo, treeish, &pathspec))
+                .transpose()?
+                .flatten(),
+            read_workdir_file_text(&repo, &pathspec)?,
+        ),
+        _ => (None, None),
+    };
+
     Ok(DiffResponse {
         path: Some(pathspec),
         staged: false,
+        old_text,
+        new_text,
         hunks: parse_diff_hunks(&text),
         text,
     })
@@ -4252,6 +4288,55 @@ fn run_git_raw(
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
+}
+
+fn read_treeish_file_text(
+    repo: &Repository,
+    treeish: &str,
+    pathspec: &str,
+) -> Result<Option<String>, GitboxError> {
+    let tree = match repo
+        .revparse_single(treeish)
+        .ok()
+        .and_then(|object| object.peel_to_tree().ok())
+    {
+        Some(tree) => tree,
+        None => return Ok(None),
+    };
+    let entry = match tree.get_path(Path::new(pathspec)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    let object = entry.to_object(repo)?;
+    let Some(blob) = object.as_blob() else {
+        return Ok(None);
+    };
+    Ok(bytes_to_preview_text(blob.content()))
+}
+
+fn read_workdir_file_text(
+    repo: &Repository,
+    pathspec: &str,
+) -> Result<Option<String>, GitboxError> {
+    let path = repo_workdir(repo)?.join(pathspec);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_dir() || metadata.len() > 2_000_000 {
+        return Ok(None);
+    }
+
+    let bytes = fs::read(path)?;
+    Ok(bytes_to_preview_text(&bytes))
+}
+
+fn bytes_to_preview_text(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 2_000_000 || bytes.contains(&0) {
+        return None;
+    }
+    std::str::from_utf8(bytes).map(ToOwned::to_owned).ok()
 }
 
 fn parse_diff_hunks(text: &str) -> Vec<DiffHunk> {

@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
   ArchiveRestore,
+  ArrowDown,
+  ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ChevronDown,
   ChevronRight,
   Check,
@@ -103,18 +107,30 @@ const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
 const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
+const logDiffScroller = ref<HTMLElement | null>(null);
+const activeLogDiffHunkIndex = ref(0);
+const syncingSideBySideScroll = new WeakSet<HTMLElement>();
 const projectEditorScrollTop = ref(0);
 const projectEditorScrollLeft = ref(0);
 const expandedProjectHunkIndex = ref<number | null>(null);
 type WorkbenchMode = "changes" | "log" | "project" | "branches" | "remote" | "operations" | "advanced";
-type DiffLineView = {
-  index: number;
-  content: string;
-  type: "add" | "delete" | "hunk" | "file" | "context";
-};
 type ProjectCodeToken = {
   text: string;
   kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
+};
+type SideBySideDiffCell = {
+  lineNumber: number | null;
+  content: string;
+  type: "context" | "add" | "delete" | "empty" | "meta";
+  tokens: ProjectCodeToken[];
+};
+type SideBySideDiffRow = {
+  id: string;
+  type: "context" | "add" | "delete" | "modify" | "meta";
+  hunkIndex: number | null;
+  anchorHunkIndex: number | null;
+  old: SideBySideDiffCell;
+  new: SideBySideDiffCell;
 };
 type ProjectEditorLine = {
   index: number;
@@ -244,8 +260,28 @@ const selectedCommitTitle = computed(() => {
   return `${history.details.commit.shortOid} · ${history.details.commit.summary}`;
 });
 const activeLogDiffTab = computed(() => logDiffTabs.value.find((tab) => tab.id === activeLogTabId.value) ?? null);
-const activeLogDiffLines = computed(() => buildDiffLines(activeLogDiffTab.value?.diff?.text ?? ""));
-const activeLogDiffHasContent = computed(() => activeLogDiffLines.value.some((line) => line.content.trim()));
+const activeLogDiffLanguage = computed(() => projectLanguageForPath(activeLogDiffTab.value?.path));
+const activeLogSideBySideDiffRows = computed(() =>
+  buildSideBySideDiffRows(activeLogDiffTab.value?.diff ?? null, activeLogDiffLanguage.value),
+);
+const activeLogDiffHasContent = computed(() => Boolean(activeLogDiffTab.value?.diff?.text?.trim()));
+const activeLogDiffHunkCount = computed(() => activeLogDiffTab.value?.diff?.hunks.length ?? 0);
+const currentLogDiffHunkPosition = computed(() =>
+  activeLogDiffHunkCount.value > 0 ? Math.min(activeLogDiffHunkIndex.value + 1, activeLogDiffHunkCount.value) : 0,
+);
+const activeLogDiffFileIndex = computed(() => {
+  const path = activeLogDiffTab.value?.path;
+  return path ? (history.details?.files ?? []).findIndex((file) => file.path === path) : -1;
+});
+const activeLogDiffFilePosition = computed(() =>
+  activeLogDiffFileIndex.value >= 0
+    ? `${activeLogDiffFileIndex.value + 1}/${history.details?.files.length ?? 0}`
+    : `0/${history.details?.files.length ?? 0}`,
+);
+const canSelectPreviousLogDiffFile = computed(() => activeLogDiffFileIndex.value > 0);
+const canSelectNextLogDiffFile = computed(
+  () => activeLogDiffFileIndex.value >= 0 && activeLogDiffFileIndex.value < (history.details?.files.length ?? 0) - 1,
+);
 const projectEditorText = computed({
   get: () => project.editorText,
   set: (value: string) => {
@@ -617,6 +653,21 @@ watch(
   () => [changes.selectedFile, changes.selectedSide],
   () => {
     diff.loadSelected().catch(() => undefined);
+  },
+);
+
+watch(
+  () => activeLogDiffTab.value?.id,
+  () => {
+    activeLogDiffHunkIndex.value = 0;
+    logDiffScroller.value?.scrollTo({ top: 0, left: 0 });
+  },
+);
+
+watch(
+  () => activeLogDiffTab.value?.diff?.text,
+  () => {
+    activeLogDiffHunkIndex.value = 0;
   },
 );
 
@@ -1085,6 +1136,76 @@ function startPanelResize(panel: LayoutPanelKey, event: PointerEvent) {
 
 function selectFile(file: ChangedFile, side: ChangeSide) {
   changes.selectFile(file, side);
+}
+
+function commitFileRowFromChange(file: CommitFileChange): LogFileTreeRow {
+  return {
+    id: `file:${file.path}`,
+    name: fileBaseName(file.path),
+    path: file.path,
+    parent: null,
+    depth: 0,
+    directory: false,
+    status: file.status,
+    oldPath: file.oldPath,
+  };
+}
+
+async function selectAdjacentLogDiffFile(direction: -1 | 1) {
+  const tab = activeLogDiffTab.value;
+  const files = history.details?.files ?? [];
+  if (!tab || !files.length) return;
+
+  const currentIndex = activeLogDiffFileIndex.value >= 0 ? activeLogDiffFileIndex.value : 0;
+  const nextIndex = Math.min(Math.max(currentIndex + direction, 0), files.length - 1);
+  if (nextIndex === activeLogDiffFileIndex.value) return;
+
+  await showCommitFileDiff(commitFileRowFromChange(files[nextIndex]), tab.mode);
+}
+
+async function jumpLogDiffHunk(direction: -1 | 1) {
+  const count = activeLogDiffHunkCount.value;
+  if (!count) return;
+
+  const currentIndex =
+    activeLogDiffHunkIndex.value >= 0 && activeLogDiffHunkIndex.value < count ? activeLogDiffHunkIndex.value : 0;
+  const nextIndex = (currentIndex + direction + count) % count;
+  activeLogDiffHunkIndex.value = nextIndex;
+  await nextTick();
+  scrollSideBySideHunkIntoView(logDiffScroller.value, nextIndex);
+}
+
+function syncSideBySideEditorScroll(event: Event) {
+  const source = event.currentTarget as HTMLElement | null;
+  if (!source) return;
+  if (syncingSideBySideScroll.has(source)) {
+    syncingSideBySideScroll.delete(source);
+    return;
+  }
+
+  const group = source.closest<HTMLElement>(".side-by-side-editors");
+  if (!group) return;
+
+  for (const target of Array.from(group.querySelectorAll<HTMLElement>(".side-by-side-column"))) {
+    if (target === source) continue;
+    if (target.scrollTop === source.scrollTop && target.scrollLeft === source.scrollLeft) continue;
+    syncingSideBySideScroll.add(target);
+    target.scrollTop = source.scrollTop;
+    target.scrollLeft = source.scrollLeft;
+  }
+}
+
+function scrollSideBySideHunkIntoView(container: HTMLElement | null, hunkIndex: number) {
+  const anchors = container?.querySelectorAll<HTMLElement>(`[data-hunk-anchor="${hunkIndex}"]`) ?? [];
+  for (const anchor of Array.from(anchors)) {
+    const column = anchor.closest<HTMLElement>(".side-by-side-column");
+    if (!column) {
+      anchor.scrollIntoView({ block: "center", inline: "nearest", behavior: "smooth" });
+      continue;
+    }
+    const nextTop = anchor.offsetTop - column.clientHeight / 2 + anchor.clientHeight / 2;
+    column.scrollTo({ top: Math.max(0, nextTop), behavior: "smooth" });
+  }
 }
 
 function pickFirstAvailable(side: ChangeSide) {
@@ -2273,20 +2394,193 @@ function formatCommitFileStatusCode(status = "") {
   return labels[code] ?? status;
 }
 
-function buildDiffLines(text: string): DiffLineView[] {
-  return text.split("\n").map((content, index) => ({
-    index,
+function buildSideBySideDiffRows(response: DiffResponse | null, language: string): SideBySideDiffRow[] {
+  if (!response?.text) return [];
+
+  const rows: SideBySideDiffRow[] = [];
+  let rowIndex = 0;
+  const anchoredHunks = new Set<number>();
+
+  const emptyCell = (): SideBySideDiffCell => ({
+    lineNumber: null,
+    content: "",
+    type: "empty",
+    tokens: [{ text: " " }],
+  });
+
+  const diffCell = (
+    lineNumber: number | null,
+    content: string,
+    type: SideBySideDiffCell["type"],
+  ): SideBySideDiffCell => ({
+    lineNumber,
     content,
-    type: content.startsWith("+")
-      ? "add"
-      : content.startsWith("-")
-        ? "delete"
-        : content.startsWith("@@")
-          ? "hunk"
-          : content.startsWith("diff --git")
-            ? "file"
-            : "context",
-  }));
+    type,
+    tokens: tokenizeProjectLine(content || " ", language),
+  });
+
+  const pushRow = (
+    oldCell: SideBySideDiffCell,
+    newCell: SideBySideDiffCell,
+    type: SideBySideDiffRow["type"],
+    hunkIndex: number | null,
+  ) => {
+    const anchorHunkIndex =
+      hunkIndex !== null && type !== "context" && type !== "meta" && !anchoredHunks.has(hunkIndex)
+        ? hunkIndex
+        : null;
+    if (anchorHunkIndex !== null) anchoredHunks.add(anchorHunkIndex);
+
+    rows.push({
+      id: `side-diff-${rowIndex}`,
+      type,
+      hunkIndex,
+      anchorHunkIndex,
+      old: oldCell,
+      new: newCell,
+    });
+    rowIndex += 1;
+  };
+
+  const pushChangeGroup = (
+    pendingDeletes: Array<{ lineNumber: number; content: string }>,
+    pendingAdds: Array<{ lineNumber: number; content: string }>,
+    hunkIndex: number,
+  ) => {
+    const total = Math.max(pendingDeletes.length, pendingAdds.length);
+    for (let index = 0; index < total; index += 1) {
+      const deleted = pendingDeletes[index];
+      const added = pendingAdds[index];
+      const rowType = deleted && added ? "modify" : deleted ? "delete" : "add";
+      pushRow(
+        deleted ? diffCell(deleted.lineNumber, deleted.content, "delete") : emptyCell(),
+        added ? diffCell(added.lineNumber, added.content, "add") : emptyCell(),
+        rowType,
+        hunkIndex,
+      );
+    }
+    pendingDeletes.length = 0;
+    pendingAdds.length = 0;
+  };
+
+  const appendPatchHunk = (patch: string, hunkIndex: number, fallbackOldStart: number, fallbackNewStart: number) => {
+    const pendingDeletes: Array<{ lineNumber: number; content: string }> = [];
+    const pendingAdds: Array<{ lineNumber: number; content: string }> = [];
+    let oldLine = fallbackOldStart;
+    let newLine = fallbackNewStart;
+    let insideHunk = false;
+
+    const flushChanges = () => pushChangeGroup(pendingDeletes, pendingAdds, hunkIndex);
+
+    for (const line of patch.split("\n")) {
+      if (!line && !insideHunk) continue;
+
+      if (line.startsWith("@@ ")) {
+        flushChanges();
+        insideHunk = true;
+        const ranges = parseUnifiedHunkRange(line);
+        oldLine = ranges.oldStart;
+        newLine = ranges.newStart;
+        continue;
+      }
+
+      if (!insideHunk) continue;
+
+      if (line.startsWith(" ")) {
+        flushChanges();
+        const content = line.slice(1);
+        pushRow(diffCell(oldLine, content, "context"), diffCell(newLine, content, "context"), "context", hunkIndex);
+        oldLine += 1;
+        newLine += 1;
+        continue;
+      }
+
+      if (line.startsWith("-")) {
+        pendingDeletes.push({ lineNumber: oldLine, content: line.slice(1) });
+        oldLine += 1;
+        continue;
+      }
+
+      if (line.startsWith("+")) {
+        pendingAdds.push({ lineNumber: newLine, content: line.slice(1) });
+        newLine += 1;
+        continue;
+      }
+
+      if (line.startsWith("\\")) {
+        flushChanges();
+        pushRow(emptyCell(), diffCell(null, line, "meta"), "meta", hunkIndex);
+      }
+    }
+
+    flushChanges();
+    return { oldLine: Math.max(oldLine, 1), newLine: Math.max(newLine, 1) };
+  };
+
+  const hasCompleteText =
+    response.oldText !== undefined &&
+    response.newText !== undefined &&
+    (response.oldText !== null || response.newText !== null);
+  if (hasCompleteText) {
+    const oldLines = splitFileContentLines(response.oldText ?? "");
+    const newLines = splitFileContentLines(response.newText ?? "");
+    let oldCursor = 1;
+    let newCursor = 1;
+
+    const pushUnchangedGap = (oldEndExclusive: number, newEndExclusive: number) => {
+      while (oldCursor < oldEndExclusive || newCursor < newEndExclusive) {
+        if (oldCursor < oldEndExclusive && newCursor < newEndExclusive) {
+          pushRow(
+            diffCell(oldCursor, oldLines[oldCursor - 1] ?? "", "context"),
+            diffCell(newCursor, newLines[newCursor - 1] ?? "", "context"),
+            "context",
+            null,
+          );
+          oldCursor += 1;
+          newCursor += 1;
+        } else if (oldCursor < oldEndExclusive) {
+          pushRow(diffCell(oldCursor, oldLines[oldCursor - 1] ?? "", "context"), emptyCell(), "context", null);
+          oldCursor += 1;
+        } else {
+          pushRow(emptyCell(), diffCell(newCursor, newLines[newCursor - 1] ?? "", "context"), "context", null);
+          newCursor += 1;
+        }
+      }
+    };
+
+    for (const hunk of response.hunks) {
+      const oldStart = hunk.oldStart > 0 ? hunk.oldStart : oldCursor;
+      const newStart = hunk.newStart > 0 ? hunk.newStart : newCursor;
+      pushUnchangedGap(oldStart, newStart);
+      const next = appendPatchHunk(hunk.patch, hunk.index, oldStart, newStart);
+      oldCursor = next.oldLine;
+      newCursor = next.newLine;
+    }
+
+    pushUnchangedGap(oldLines.length + 1, newLines.length + 1);
+    return rows;
+  }
+
+  for (const hunk of response.hunks) {
+    appendPatchHunk(hunk.patch, hunk.index, hunk.oldStart, hunk.newStart);
+  }
+
+  return rows;
+}
+
+function splitFileContentLines(content: string) {
+  if (!content) return [];
+  const lines = content.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+function parseUnifiedHunkRange(header: string) {
+  const match = header.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+  return {
+    oldStart: Number(match?.[1] ?? 0),
+    newStart: Number(match?.[2] ?? 0),
+  };
 }
 
 function formatOperationName(name?: string | null) {
@@ -4337,11 +4631,50 @@ function deleteChangelist(id: string) {
         </div>
           <section v-else-if="activeLogDiffTab" class="log-diff-tab-pane">
             <div class="diff-header">
-              <div>
+              <div class="diff-title-block">
                 <span class="eyebrow">{{ activeLogDiffTab ? commitFileDiffModeLabels[activeLogDiffTab.mode] : "差异" }}</span>
                 <h2 :title="activeLogDiffTab?.path">{{ activeLogDiffTab?.path }}</h2>
+                <small>
+                  文件 {{ activeLogDiffFilePosition }} · 差异 {{ currentLogDiffHunkPosition }}/{{ activeLogDiffHunkCount }}
+                </small>
               </div>
-              <div class="log-actions">
+              <div class="diff-header-actions">
+                <div class="diff-nav-group" aria-label="日志差异跳转">
+                  <button
+                    class="icon-only-button diff-nav-button"
+                    title="上一个差异"
+                    :disabled="activeLogDiffHunkCount === 0"
+                    @click="jumpLogDiffHunk(-1)"
+                  >
+                    <ArrowUp :size="15" />
+                  </button>
+                  <button
+                    class="icon-only-button diff-nav-button"
+                    title="下一个差异"
+                    :disabled="activeLogDiffHunkCount === 0"
+                    @click="jumpLogDiffHunk(1)"
+                  >
+                    <ArrowDown :size="15" />
+                  </button>
+                </div>
+                <div class="diff-nav-group" aria-label="日志文件切换">
+                  <button
+                    class="icon-only-button diff-nav-button"
+                    title="上一个文件"
+                    :disabled="!canSelectPreviousLogDiffFile"
+                    @click="selectAdjacentLogDiffFile(-1)"
+                  >
+                    <ArrowLeft :size="15" />
+                  </button>
+                  <button
+                    class="icon-only-button diff-nav-button"
+                    title="下一个文件"
+                    :disabled="!canSelectNextLogDiffFile"
+                    @click="selectAdjacentLogDiffFile(1)"
+                  >
+                    <ArrowRight :size="15" />
+                  </button>
+                </div>
                 <button class="tool-button" @click="selectLogRootTab">
                   <GitBranch :size="14" />
                   <span>返回日志</span>
@@ -4356,32 +4689,63 @@ function deleteChangelist(id: string) {
               </div>
             </div>
 
-            <div class="commit-detail-strip">
-              <div>
-                <span>提交</span>
-                <strong>{{ activeLogDiffTab?.shortOid }}</strong>
-              </div>
-              <div>
-                <span>来源</span>
-                <strong>{{ activeLogDiffTab?.subtitle }}</strong>
-              </div>
-              <div>
-                <span>文件</span>
-                <strong>{{ activeLogDiffTab?.path }}</strong>
-              </div>
-            </div>
-
-            <div class="diff-scroller">
+            <div ref="logDiffScroller" class="diff-scroller side-by-side-scroller">
               <div v-if="activeLogDiffTab?.loading" class="diff-empty">加载中</div>
               <div v-else-if="activeLogDiffTab?.error" class="diff-empty">{{ activeLogDiffTab?.error }}</div>
               <div v-else-if="!activeLogDiffHasContent" class="diff-empty">没有差异</div>
-              <pre v-else class="diff-lines"><code
-                v-for="line in activeLogDiffLines"
-                :key="line.index"
-                class="diff-line"
-                :class="line.type"
-              ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
-</code></pre>
+              <div v-else-if="activeLogSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
+              <div v-else class="side-by-side-diff">
+                <div class="side-by-side-file-header">
+                  <div class="side-by-side-title">
+                    <strong>提交</strong>
+                    <span>{{ activeLogDiffTab?.shortOid }}</span>
+                  </div>
+                  <div class="side-by-side-title">
+                    <strong>来源</strong>
+                    <span>{{ activeLogDiffTab?.subtitle }}</span>
+                  </div>
+                </div>
+                <div class="side-by-side-editors">
+                  <div class="side-by-side-column old" @scroll="syncSideBySideEditorScroll">
+                    <div class="side-by-side-column-lines">
+                      <div
+                        v-for="row in activeLogSideBySideDiffRows"
+                        :key="`old-${row.id}`"
+                        class="side-by-side-line"
+                        :class="[row.type, { active: row.hunkIndex === activeLogDiffHunkIndex }]"
+                        :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
+                      >
+                        <div class="diff-cell old" :class="row.old.type">
+                          <span class="line-number">{{ row.old.lineNumber ?? "" }}</span>
+                          <span class="line-content"><template
+                            v-for="(token, tokenIndex) in row.old.tokens"
+                            :key="tokenIndex"
+                          ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="side-by-side-column new" @scroll="syncSideBySideEditorScroll">
+                    <div class="side-by-side-column-lines">
+                      <div
+                        v-for="row in activeLogSideBySideDiffRows"
+                        :key="`new-${row.id}`"
+                        class="side-by-side-line"
+                        :class="[row.type, { active: row.hunkIndex === activeLogDiffHunkIndex }]"
+                        :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
+                      >
+                        <div class="diff-cell new" :class="row.new.type">
+                          <span class="line-number">{{ row.new.lineNumber ?? "" }}</span>
+                          <span class="line-content"><template
+                            v-for="(token, tokenIndex) in row.new.tokens"
+                            :key="tokenIndex"
+                          ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </section>
         </div>
@@ -8064,6 +8428,37 @@ button:disabled {
   white-space: nowrap;
 }
 
+.diff-title-block {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.diff-title-block small {
+  color: #6b7971;
+  font-size: 11px;
+}
+
+.diff-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+
+.diff-nav-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.diff-nav-button {
+  width: 30px;
+  height: 30px;
+}
+
 .toggle-row {
   display: flex;
   align-items: center;
@@ -8096,35 +8491,6 @@ button:disabled {
   overflow-x: auto;
   padding: 10px 16px;
   border-bottom: 1px solid #eef1ed;
-}
-
-.commit-detail-strip {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  padding: 10px 16px;
-  border-bottom: 1px solid #eef1ed;
-}
-
-.commit-detail-strip div {
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-}
-
-.commit-detail-strip span {
-  color: #718078;
-  font-size: 11px;
-  font-weight: 800;
-  text-transform: uppercase;
-}
-
-.commit-detail-strip strong {
-  overflow: hidden;
-  color: #25312b;
-  font-size: 13px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .commit-files {
@@ -8194,6 +8560,121 @@ button:disabled {
   min-height: 0;
   overflow: auto;
   background: #fbfcfa;
+}
+
+.side-by-side-scroller {
+  overflow-x: hidden;
+  background: #ffffff;
+}
+
+.side-by-side-diff {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  width: 100%;
+  min-width: 0;
+  color: #25312b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 2;
+}
+
+.side-by-side-file-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  border-bottom: 1px solid #dce2dd;
+  background: #f3f5f2;
+}
+
+.side-by-side-title {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 12px;
+  border-right: 1px solid #dce2dd;
+}
+
+.side-by-side-title strong {
+  color: #405047;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.side-by-side-title span {
+  overflow: hidden;
+  color: #718078;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-by-side-editors {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.side-by-side-column {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: #ffffff;
+}
+
+.side-by-side-column.old {
+  border-right: 1px solid #dce2dd;
+}
+
+.side-by-side-column-lines {
+  display: grid;
+  width: max-content;
+  min-width: 100%;
+  padding: 8px 0 14px;
+}
+
+.side-by-side-line {
+  min-height: 18px;
+}
+
+.diff-cell {
+  display: grid;
+  grid-template-columns: 58px max-content;
+  width: max-content;
+  min-width: 100%;
+  min-height: 18px;
+  white-space: pre;
+  background: #ffffff;
+}
+
+.diff-cell.empty {
+  color: transparent;
+  background: #f7f8f6;
+}
+
+.side-by-side-line.add .diff-cell.add,
+.side-by-side-line.modify .diff-cell.add {
+  background: #e6f4e9;
+}
+
+.side-by-side-line.delete .diff-cell.delete,
+.side-by-side-line.modify .diff-cell.delete {
+  background: #fdece7;
+}
+
+.side-by-side-line.meta .diff-cell.meta {
+  color: #7a6758;
+  background: #fff7e0;
+}
+
+.side-by-side-line.active .diff-cell.add,
+.side-by-side-line.active .diff-cell.delete {
+  box-shadow: inset 3px 0 0 #4c82d9;
 }
 
 .project-tabs {
@@ -8490,8 +8971,21 @@ button:disabled {
   user-select: none;
 }
 
+.side-by-side-column .line-number {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: inherit;
+}
+
 .line-content {
   padding: 0 18px 0 10px;
+}
+
+.side-by-side-diff .line-content {
+  display: block;
+  min-width: max-content;
+  overflow: visible;
 }
 
 .syntax-comment {
@@ -8707,7 +9201,6 @@ html[data-theme="dark"] .file-main small,
 html[data-theme="dark"] .history-header,
 html[data-theme="dark"] .commit-copy small,
 html[data-theme="dark"] .commit-row code,
-html[data-theme="dark"] .commit-detail-strip span,
 html[data-theme="dark"] .commit-file-row small,
 html[data-theme="dark"] .operation-state span,
 html[data-theme="dark"] .operation-options,
@@ -8928,7 +9421,6 @@ html[data-theme="dark"] .diff-header,
 html[data-theme="dark"] .changelist-panel,
 html[data-theme="dark"] .log-filter-panel,
 html[data-theme="dark"] .hunk-strip,
-html[data-theme="dark"] .commit-detail-strip,
 html[data-theme="dark"] .commit-files {
   background: #2b2d30;
 }
@@ -8947,7 +9439,6 @@ html[data-theme="dark"] .file-actions,
 html[data-theme="dark"] .commit-box,
 html[data-theme="dark"] .diff-header,
 html[data-theme="dark"] .hunk-strip,
-html[data-theme="dark"] .commit-detail-strip,
 html[data-theme="dark"] .commit-files {
   border-color: #3c3f41;
 }
@@ -9630,7 +10121,6 @@ html[data-theme="dark"] .log-graph-node {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
 }
 
-html[data-theme="dark"] .commit-detail-strip strong,
 html[data-theme="dark"] .commit-file-row strong {
   color: #dfe1e5;
 }
@@ -9707,6 +10197,7 @@ html[data-theme="dark"] .commit-box textarea::placeholder {
 
 html[data-theme="dark"] .commit-box textarea,
 html[data-theme="dark"] .diff-lines,
+html[data-theme="dark"] .side-by-side-diff,
 html[data-theme="dark"] .repo-path,
 html[data-theme="dark"] .remote-row span,
 html[data-theme="dark"] .file-main strong,
@@ -9748,8 +10239,74 @@ html[data-theme="dark"] .eyebrow {
   color: #7f8590;
 }
 
+html[data-theme="dark"] .diff-title-block small {
+  color: #8f949b;
+}
+
 html[data-theme="dark"] .toggle-row input {
   accent-color: #4c82d9;
+}
+
+html[data-theme="dark"] .side-by-side-scroller,
+html[data-theme="dark"] .side-by-side-diff {
+  color: #c9d1d9;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .side-by-side-file-header {
+  border-bottom-color: #3c3f41;
+  background: #2b2d30;
+}
+
+html[data-theme="dark"] .side-by-side-title {
+  border-right-color: #3c3f41;
+}
+
+html[data-theme="dark"] .side-by-side-title strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .side-by-side-title span {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .side-by-side-column {
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .side-by-side-column.old {
+  border-right-color: #323438;
+}
+
+html[data-theme="dark"] .diff-cell {
+  grid-template-columns: 66px max-content;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .diff-cell.empty {
+  background: #232427;
+}
+
+html[data-theme="dark"] .side-by-side-line.add .diff-cell.add,
+html[data-theme="dark"] .side-by-side-line.modify .diff-cell.add {
+  color: #b6d8a8;
+  background: #243729;
+}
+
+html[data-theme="dark"] .side-by-side-line.delete .diff-cell.delete,
+html[data-theme="dark"] .side-by-side-line.modify .diff-cell.delete {
+  color: #e6b0ad;
+  background: #3f2a2a;
+}
+
+html[data-theme="dark"] .side-by-side-line.meta .diff-cell.meta {
+  color: #d7ba7d;
+  background: #332d20;
+}
+
+html[data-theme="dark"] .side-by-side-line.active .diff-cell.add,
+html[data-theme="dark"] .side-by-side-line.active .diff-cell.delete {
+  box-shadow: inset 3px 0 0 #6ea2f2;
 }
 
 html[data-theme="dark"] .diff-lines {
@@ -9861,6 +10418,10 @@ html[data-theme="dark"] .line-number {
 html[data-theme="dark"] .line-content {
   min-width: 100%;
   padding-left: 12px;
+}
+
+html[data-theme="dark"] .side-by-side-diff .line-content {
+  min-width: max-content;
 }
 
 html[data-theme="dark"] .syntax-comment {
