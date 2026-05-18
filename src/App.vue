@@ -10,6 +10,7 @@ import {
   Columns3,
   Download,
   File as FileIcon,
+  FileSearch,
   Folder,
   FolderOpen,
   GitBranch,
@@ -23,11 +24,21 @@ import {
   Star,
   Trash2,
   Upload,
+  UserRound,
   X,
 } from "@lucide/vue";
 import AppTopbar from "./components/AppTopbar.vue";
 import ProjectPane from "./components/ProjectPane.vue";
 import WorkbenchRail from "./components/WorkbenchRail.vue";
+import {
+  commitFileDiff,
+  copyProjectEntry,
+  createProjectDirectory,
+  createProjectFile,
+  deleteProjectEntry,
+  moveProjectEntry,
+  renameProjectEntry,
+} from "./lib/gitboxCommands";
 import { useAdvancedStore } from "./stores/advanced";
 import { useBranchesStore } from "./stores/branches";
 import { useChangelistsStore } from "./stores/changelists";
@@ -45,8 +56,11 @@ import type {
   BranchInfo,
   ChangeSide,
   ChangedFile,
+  CommitFileDiffMode,
   CommitFileChange,
   CommitSummary,
+  DiffHunk,
+  DiffResponse,
   ProjectFileEntry,
   ShelfInfo,
   TagInfo,
@@ -71,37 +85,103 @@ const newTagTarget = ref("");
 const annotatedTag = ref(false);
 const tagMessage = ref("");
 const selectedCommitFilePaths = ref<string[]>([]);
-const expandedProjectChangeId = ref<string | null>(null);
+const expandedCommitFileDirectories = ref<Record<string, boolean>>({});
+const logAuthorPickerOpen = ref(false);
+const logFilePickerOpen = ref(false);
+const logFilePickerSearch = ref("");
+const logFilePickerDraft = ref<string[]>([]);
+const expandedLogFilePickerDirectories = ref<Record<string, boolean>>({
+  [PROJECT_ROOT_PATH]: true,
+});
+const expandedLogRefGroups = ref<Record<string, boolean>>({
+  local: true,
+  remote: true,
+  tags: true,
+});
+const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
+const projectFileClipboard = ref<ProjectFileClipboard>(null);
+const projectNameDialog = ref<ProjectNameDialog | null>(null);
+const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
+const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
+const projectEditorScrollTop = ref(0);
+const projectEditorScrollLeft = ref(0);
+const expandedProjectHunkIndex = ref<number | null>(null);
 type WorkbenchMode = "changes" | "log" | "project" | "branches" | "remote" | "operations" | "advanced";
+type DiffLineView = {
+  index: number;
+  content: string;
+  type: "add" | "delete" | "hunk" | "file" | "context";
+};
 type ProjectCodeToken = {
   text: string;
   kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
 };
-type ProjectOriginalLine = {
-  number: number;
-  content: string;
-  tokens: ProjectCodeToken[];
-};
-type ProjectChangeBlock = {
-  id: string;
-  hunkIndex: number;
-  header: string;
-  patch: string;
-  startLine: number;
-  endLine: number;
-  originalStart: number;
-  originalLines: ProjectOriginalLine[];
-};
-type ProjectCodeLine = {
+type ProjectEditorLine = {
   index: number;
   number: number;
+  tokens: ProjectCodeToken[];
+};
+type ProjectOriginalLine = {
+  index: number;
+  lineNumber: number;
   content: string;
   tokens: ProjectCodeToken[];
-  change: ProjectChangeBlock | null;
-  reveal: ProjectChangeBlock | null;
+};
+type ProjectEditorHunkView = {
+  index: number;
+  header: string;
+  tone: "added" | "deleted" | "modified";
+  lineStart: number;
+  lineCount: number;
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  addedLines: number;
+  deletedLines: number;
+  originalLines: ProjectOriginalLine[];
+};
+type LogDiffTab = {
+  id: string;
+  oid: string;
+  shortOid: string;
+  path: string;
+  mode: CommitFileDiffMode;
+  title: string;
+  subtitle: string;
+  diff: DiffResponse | null;
+  loading: boolean;
+  error: string;
+};
+type ProjectFileContextMenu = {
+  file: ProjectFileEntry | null;
+  x: number;
+  y: number;
+};
+type ProjectFileClipboard = {
+  mode: "cut" | "copy";
+  path: string;
+  name: string;
+  directory: boolean;
+} | null;
+type ProjectNameDialog = {
+  title: string;
+  value: string;
+  error: string;
+  validate: (value: string) => string;
+  resolve: (value: string | null) => void;
+};
+type ProjectCloseDialog = {
+  path: string;
+  name: string;
+  saving: boolean;
+  error: string;
 };
 
 const workbenchMode = ref<WorkbenchMode>("changes");
+const LOG_TAB_ID = "log-root";
+const activeLogTabId = ref(LOG_TAB_ID);
+const logDiffTabs = ref<LogDiffTab[]>([]);
 const activeResizePanel = ref<LayoutPanelKey | null>(null);
 const systemPrefersDark = ref(
   typeof window !== "undefined" &&
@@ -112,6 +192,8 @@ let stopSystemThemeWatch: (() => void) | null = null;
 let autoFetchTimer: number | null = null;
 const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
+const PROJECT_EDITOR_LINE_HEIGHT = 18;
+const PROJECT_EDITOR_PADDING_TOP = 12;
 
 const activeFiles = computed(() => {
   const files = changes.filesForSide(settings.selectedSide);
@@ -161,46 +243,35 @@ const selectedCommitTitle = computed(() => {
   if (!history.details) return "未选择提交";
   return `${history.details.commit.shortOid} · ${history.details.commit.summary}`;
 });
-const commitDiffLines = computed(() =>
-  (history.details?.diff ?? "").split("\n").map((content, index) => ({
+const activeLogDiffTab = computed(() => logDiffTabs.value.find((tab) => tab.id === activeLogTabId.value) ?? null);
+const activeLogDiffLines = computed(() => buildDiffLines(activeLogDiffTab.value?.diff?.text ?? ""));
+const activeLogDiffHasContent = computed(() => activeLogDiffLines.value.some((line) => line.content.trim()));
+const projectEditorText = computed({
+  get: () => project.editorText,
+  set: (value: string) => {
+    expandedProjectHunkIndex.value = null;
+    project.setEditorText(value);
+  },
+});
+const projectLanguage = computed(() => projectLanguageForPath(project.selectedPath));
+const projectEditorLines = computed<ProjectEditorLine[]>(() =>
+  projectEditorText.value.split("\n").map((content, index) => ({
     index,
-    content,
-    type: content.startsWith("+")
-      ? "add"
-      : content.startsWith("-")
-        ? "delete"
-        : content.startsWith("@@")
-          ? "hunk"
-          : content.startsWith("diff --git")
-            ? "file"
-      : "context",
+    number: index + 1,
+    tokens: tokenizeProjectLine(content || " ", projectLanguage.value),
   })),
 );
-const projectLanguage = computed(() => projectLanguageForPath(project.selectedPath));
-const projectChangeBlocks = computed(() => buildProjectChangeBlocks(project.diff?.hunks ?? [], projectLanguage.value));
-const projectChangeByLine = computed(() => {
-  const changesByLine = new Map<number, ProjectChangeBlock>();
-  for (const block of projectChangeBlocks.value) {
-    for (let line = block.startLine; line <= block.endLine; line += 1) {
-      changesByLine.set(line, block);
-    }
-  }
-  return changesByLine;
+const projectEditorHunks = computed<ProjectEditorHunkView[]>(() => {
+  if (!project.content || project.content.binary || !project.diff?.hunks.length) return [];
+  return project.diff.hunks.map((hunk) => buildProjectEditorHunkView(hunk, projectLanguage.value));
 });
-const projectContentLines = computed<ProjectCodeLine[]>(() =>
-  (project.content?.content ?? "").split("\n").map((content, index) => {
-    const number = index + 1;
-    const change = projectChangeByLine.value.get(number) ?? null;
-    return {
-      index,
-      number,
-      content,
-      tokens: tokenizeProjectLine(content || " ", projectLanguage.value),
-      change,
-      reveal: change && expandedProjectChangeId.value === change.id && number === change.endLine ? change : null,
-    };
-  }),
+const expandedProjectHunk = computed(
+  () => projectEditorHunks.value.find((hunk) => hunk.index === expandedProjectHunkIndex.value) ?? null,
 );
+const projectEditorRenderStyle = computed(() => ({
+  "--project-editor-scroll-top-offset": `${-projectEditorScrollTop.value}px`,
+  "--project-editor-scroll-left-offset": `${-projectEditorScrollLeft.value}px`,
+}));
 const projectRootEntry = computed<ProjectFileEntry | null>(() => {
   if (!repos.current) return null;
   return {
@@ -349,6 +420,11 @@ const resetModeLabels: Record<string, string> = {
   mixed: "混合重置",
   hard: "硬重置",
 };
+const commitFileDiffModeLabels: Record<CommitFileDiffMode, string> = {
+  commit: "储存库差异",
+  worktree: "与本地比较",
+  "parent-worktree": "之前版本与本地比较",
+};
 const graphLaneWidth = 14;
 const graphLaneInset = 10;
 const graphRowHeight = 30;
@@ -377,14 +453,28 @@ type LogRemoteGroup = {
   name: string;
   branches: BranchInfo[];
 };
+type LogRefGroupKey = "local" | "remote" | "tags" | `remote:${string}`;
 type LogFileTreeRow = {
   id: string;
   name: string;
   path: string;
+  parent: string | null;
   depth: number;
   directory: boolean;
+  fileCount?: number;
   status?: string;
   oldPath?: string | null;
+};
+type LogFileContextMenu = {
+  x: number;
+  y: number;
+  row: LogFileTreeRow;
+};
+type LogAuthorOption = {
+  value: string;
+  label: string;
+  meta: string;
+  count: number;
 };
 const hostedRemoteLinks = computed(() =>
   (repos.current?.remotes ?? [])
@@ -415,10 +505,112 @@ const logRemoteGroups = computed<LogRemoteGroup[]>(() => {
 });
 const logGraphRows = computed<LogGraphRow[]>(() => buildLogGraphRows(history.commits));
 const commitFileTreeRows = computed<LogFileTreeRow[]>(() => buildCommitFileTreeRows(history.details?.files ?? []));
+const visibleCommitFileTreeRows = computed<LogFileTreeRow[]>(() => {
+  const hiddenDirectories = new Set<string>();
+  const rows: LogFileTreeRow[] = [];
+
+  for (const row of commitFileTreeRows.value) {
+    if (row.parent && hiddenDirectories.has(row.parent)) {
+      if (row.directory) hiddenDirectories.add(row.path);
+      continue;
+    }
+
+    rows.push(row);
+    if (row.directory && !isCommitFileDirectoryExpanded(row.path)) {
+      hiddenDirectories.add(row.path);
+    }
+  }
+
+  return rows;
+});
+const logAuthorOptions = computed<LogAuthorOption[]>(() => {
+  const options = new Map<string, LogAuthorOption>();
+
+  for (const commitItem of history.authorCandidates) {
+    const value = formatAuthorFilterValue(commitItem);
+    const existing = options.get(value);
+    if (existing) {
+      existing.count += 1;
+      continue;
+    }
+    options.set(value, {
+      value,
+      label: commitItem.authorName || commitItem.authorEmail || "未知作者",
+      meta: commitItem.authorEmail,
+      count: 1,
+    });
+  }
+
+  for (const value of history.authorFilters) {
+    if (options.has(value)) continue;
+    options.set(value, {
+      value,
+      label: displayAuthorFilterValue(value),
+      meta: "",
+      count: 0,
+    });
+  }
+
+  return [...options.values()].sort((left, right) =>
+    left.label.localeCompare(right.label, undefined, { sensitivity: "base" }),
+  );
+});
+const logAuthorFilterLabel = computed(() => {
+  const count = history.authorFilters.length;
+  if (count === 0) return "作者";
+  if (count === 1) return displayAuthorFilterValue(history.authorFilters[0]);
+  return `${count} 位作者`;
+});
+const logFileFilterLabel = computed(() => {
+  const count = history.pathFilters.length;
+  if (count === 0) return "文件";
+  if (count === 1) return shortProjectPathLabel(history.pathFilters[0]);
+  return `${count} 个文件`;
+});
+const visibleLogFilePickerRows = computed<ProjectFileEntry[]>(() => {
+  const root = projectRootEntry.value;
+  if (!root) return [];
+
+  const query = logFilePickerSearch.value.trim().toLowerCase();
+  if (query) {
+    return [
+      root,
+      ...project.files
+        .filter((file) => !file.directory && file.path.toLowerCase().includes(query))
+        .sort(compareProjectTreeEntries),
+    ];
+  }
+
+  const rows: ProjectFileEntry[] = [root];
+  const appendChildren = (parentPath: string) => {
+    if (!isLogFilePickerDirectoryExpanded(parentPath)) return;
+    for (const child of projectChildrenByParent.value.get(parentPath) ?? []) {
+      rows.push(child);
+      if (child.directory) {
+        appendChildren(child.path);
+      }
+    }
+  };
+  appendChildren(PROJECT_ROOT_PATH);
+  return rows;
+});
 const selectedCommitRefs = computed(() => history.details?.commit.refs.map(formatRefName) ?? []);
 const activeLogRefLabel = computed(() => history.branchFilter || "全部引用");
 const logFilterActive = computed(() =>
-  Boolean(history.branchFilter || history.query.trim() || history.authorFilter.trim() || history.pathFilter.trim()),
+  Boolean(
+    history.branchFilter ||
+      history.query.trim() ||
+      history.authorFilters.length ||
+      history.pathFilters.length,
+  ),
+);
+const logFileContextMenu = ref<LogFileContextMenu | null>(null);
+const commitFileSignature = computed(() =>
+  history.details
+    ? `${history.details.commit.oid}:${history.details.files
+        .map((file) => `${file.status}:${file.oldPath ?? ""}:${file.path}`)
+        .join("\u0000")}`
+    : "",
 );
 
 watch(
@@ -431,7 +623,35 @@ watch(
 watch(
   () => project.selectedPath,
   () => {
-    expandedProjectChangeId.value = null;
+    expandedProjectHunkIndex.value = null;
+    projectEditorScrollTop.value = 0;
+    projectEditorScrollLeft.value = 0;
+    if (projectEditorTextarea.value) {
+      projectEditorTextarea.value.scrollTop = 0;
+      projectEditorTextarea.value.scrollLeft = 0;
+    }
+  },
+);
+
+watch(
+  () => project.diff?.text,
+  () => {
+    projectEditorScrollTop.value = projectEditorTextarea.value?.scrollTop ?? 0;
+    if (
+      expandedProjectHunkIndex.value !== null &&
+      !projectEditorHunks.value.some((hunk) => hunk.index === expandedProjectHunkIndex.value)
+    ) {
+      expandedProjectHunkIndex.value = null;
+    }
+  },
+);
+
+watch(
+  commitFileSignature,
+  () => {
+    selectedCommitFilePaths.value = history.details?.files.map((file) => file.path) ?? [];
+    expandedCommitFileDirectories.value = {};
+    logFileContextMenu.value = null;
   },
 );
 
@@ -583,6 +803,7 @@ async function loadCurrentRepository() {
 }
 
 function clearProjectView() {
+  clearLogDiffTabs();
   advanced.resetForRepositorySwitch();
   branches.resetForRepositorySwitch();
   changelists.resetForRepositorySwitch();
@@ -931,6 +1152,17 @@ function projectFileIndent(file: ProjectFileEntry) {
   return fileIndent(file.path === PROJECT_ROOT_PATH ? 0 : file.depth + 1);
 }
 
+function logFileIndent(depth: number) {
+  return { paddingLeft: `${10 + depth * 15}px` };
+}
+
+function compareProjectTreeEntries(left: ProjectFileEntry, right: ProjectFileEntry) {
+  if (left.directory !== right.directory) {
+    return left.directory ? -1 : 1;
+  }
+  return left.name.toLocaleLowerCase().localeCompare(right.name.toLocaleLowerCase());
+}
+
 function projectLanguageForPath(path?: string | null) {
   const extension = path?.split(".").pop()?.toLowerCase() ?? "";
   if (["js", "jsx", "mjs", "cjs"].includes(extension)) return "javascript";
@@ -939,79 +1171,11 @@ function projectLanguageForPath(path?: string | null) {
   if (["json", "jsonc"].includes(extension)) return "json";
   if (["css", "scss", "sass", "less"].includes(extension)) return "css";
   if (["html", "xml", "svg"].includes(extension)) return "markup";
-  if (["rs"].includes(extension)) return "rust";
-  if (["toml"].includes(extension)) return "toml";
+  if (extension === "rs") return "rust";
+  if (extension === "toml") return "toml";
   if (["md", "markdown"].includes(extension)) return "markdown";
   if (["sh", "zsh", "bash"].includes(extension)) return "shell";
   return "plain";
-}
-
-function buildProjectChangeBlocks(hunks: { index: number; header: string; patch: string; oldStart: number; newStart: number }[], language: string) {
-  const blocks: ProjectChangeBlock[] = [];
-
-  for (const hunk of hunks) {
-    let oldLine = hunk.oldStart;
-    let newLine = hunk.newStart;
-    let inBody = false;
-    let blockStartLine: number | null = null;
-    let blockEndLine: number | null = null;
-    let blockOriginalStart: number | null = null;
-    let originalLines: string[] = [];
-
-    const flushBlock = () => {
-      if (originalLines.length === 0 && blockStartLine === null) return;
-      const startLine = Math.max(1, blockStartLine ?? newLine);
-      const endLine = Math.max(startLine, blockEndLine ?? startLine);
-      const originalStart = Math.max(1, blockOriginalStart ?? oldLine);
-      blocks.push({
-        id: `${hunk.index}:${blocks.length}`,
-        hunkIndex: hunk.index,
-        header: hunk.header,
-        patch: hunk.patch,
-        startLine,
-        endLine,
-        originalStart,
-        originalLines: originalLines.map((content, index) => ({
-          number: originalStart + index,
-          content,
-          tokens: tokenizeProjectLine(content || " ", language),
-        })),
-      });
-      blockStartLine = null;
-      blockEndLine = null;
-      blockOriginalStart = null;
-      originalLines = [];
-    };
-
-    for (const rawLine of hunk.patch.split("\n")) {
-      if (rawLine.startsWith("@@ ")) {
-        inBody = true;
-        continue;
-      }
-      if (!inBody || rawLine.startsWith("\\ No newline")) continue;
-
-      const origin = rawLine[0];
-      const content = rawLine.slice(1);
-      if (origin === " ") {
-        flushBlock();
-        oldLine += 1;
-        newLine += 1;
-      } else if (origin === "-") {
-        if (blockOriginalStart === null) blockOriginalStart = oldLine;
-        if (blockStartLine === null) blockStartLine = Math.max(1, newLine);
-        originalLines.push(content);
-        oldLine += 1;
-      } else if (origin === "+") {
-        if (blockStartLine === null) blockStartLine = Math.max(1, newLine);
-        blockEndLine = Math.max(1, newLine);
-        newLine += 1;
-      }
-    }
-
-    flushBlock();
-  }
-
-  return blocks;
 }
 
 function tokenizeProjectLine(content: string, language: string): ProjectCodeToken[] {
@@ -1142,41 +1306,168 @@ function projectKeywords(language: string) {
   return new Set([...(byLanguage[language] ?? shared), ...(language === "plain" ? [] : shared)]);
 }
 
-function logFileIndent(depth: number) {
-  return { paddingLeft: `${10 + depth * 15}px` };
-}
+function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEditorHunkView {
+  const parsed = parseProjectHunkPatch(hunk, language);
+  const lineStart = Math.max(1, hunk.newStart || 1);
+  const lineCount = Math.max(1, hunk.newLines || 0);
+  const tone =
+    parsed.deletedLines > 0 && parsed.addedLines > 0
+      ? "modified"
+      : parsed.deletedLines > 0
+        ? "deleted"
+        : "added";
 
-function compareProjectTreeEntries(left: ProjectFileEntry, right: ProjectFileEntry) {
-  if (left.directory !== right.directory) {
-    return left.directory ? -1 : 1;
-  }
-  return left.name.toLocaleLowerCase().localeCompare(right.name.toLocaleLowerCase());
-}
-
-function projectCodeLineClass(line: ProjectCodeLine) {
-  const change = line.change;
   return {
-    changed: Boolean(change),
-    expanded: Boolean(change && expandedProjectChangeId.value === change.id),
-    "change-start": Boolean(change && line.number === change.startLine),
-    "change-end": Boolean(change && line.number === change.endLine),
+    index: hunk.index,
+    header: hunk.header,
+    tone,
+    lineStart,
+    lineCount,
+    oldStart: hunk.oldStart,
+    oldLines: hunk.oldLines,
+    newStart: hunk.newStart,
+    newLines: hunk.newLines,
+    addedLines: parsed.addedLines,
+    deletedLines: parsed.deletedLines,
+    originalLines: parsed.originalLines,
   };
 }
 
-function toggleProjectChange(change: ProjectChangeBlock | null) {
-  if (!change) return;
-  expandedProjectChangeId.value = expandedProjectChangeId.value === change.id ? null : change.id;
+function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
+  const originalLines: ProjectOriginalLine[] = [];
+  let oldLineNumber = hunk.oldStart;
+  let inHunk = false;
+  let addedLines = 0;
+  let deletedLines = 0;
+
+  for (const line of hunk.patch.split("\n")) {
+    if (line.startsWith("@@ ")) {
+      inHunk = true;
+      oldLineNumber = hunk.oldStart;
+      continue;
+    }
+    if (!inHunk || line.startsWith("\\ No newline")) continue;
+
+    const prefix = line.charAt(0);
+    const content = line.slice(1);
+    if (prefix === "-") {
+      originalLines.push({
+        index: originalLines.length,
+        lineNumber: oldLineNumber,
+        content,
+        tokens: tokenizeProjectLine(content || " ", language),
+      });
+      oldLineNumber += 1;
+      deletedLines += 1;
+    } else if (prefix === "+") {
+      addedLines += 1;
+    } else if (prefix === " ") {
+      oldLineNumber += 1;
+    }
+  }
+
+  return { originalLines, addedLines, deletedLines };
 }
 
-async function discardProjectChange(change: ProjectChangeBlock) {
-  if (!window.confirm("撤回此差异块并恢复为原本代码？")) return;
-  await project.discardHunk(change.hunkIndex);
-  expandedProjectChangeId.value = null;
+function projectEditorHunkMarkerStyle(hunk: ProjectEditorHunkView) {
+  const top =
+    PROJECT_EDITOR_PADDING_TOP +
+    (hunk.lineStart - 1) * PROJECT_EDITOR_LINE_HEIGHT -
+    projectEditorScrollTop.value;
+  const height =
+    hunk.newLines === 0
+      ? 10
+      : Math.max(10, hunk.lineCount * PROJECT_EDITOR_LINE_HEIGHT - 2);
+  return {
+    top: `${top}px`,
+    height: `${height}px`,
+  };
 }
 
-async function stageProjectChange(change: ProjectChangeBlock) {
-  await project.stageHunk(change.hunkIndex);
-  expandedProjectChangeId.value = null;
+function projectEditorOriginalPanelStyle(hunk: ProjectEditorHunkView) {
+  const markerTop =
+    PROJECT_EDITOR_PADDING_TOP +
+    (hunk.lineStart - 1) * PROJECT_EDITOR_LINE_HEIGHT -
+    projectEditorScrollTop.value;
+  const markerHeight =
+    hunk.newLines === 0
+      ? 10
+      : Math.max(10, hunk.lineCount * PROJECT_EDITOR_LINE_HEIGHT - 2);
+  return {
+    top: `${Math.max(6, markerTop + markerHeight + 4)}px`,
+  };
+}
+
+function projectEditorHunkTitle(hunk: ProjectEditorHunkView) {
+  const currentEnd = hunk.newLines > 0 ? hunk.newStart + hunk.newLines - 1 : hunk.newStart;
+  const originalEnd = hunk.oldLines > 0 ? hunk.oldStart + hunk.oldLines - 1 : hunk.oldStart;
+  return `当前 ${hunk.newStart}-${currentEnd}，原本 ${hunk.oldStart}-${originalEnd}`;
+}
+
+function toggleProjectEditorHunk(index: number) {
+  expandedProjectHunkIndex.value = expandedProjectHunkIndex.value === index ? null : index;
+}
+
+function syncProjectEditorScroll(event: Event) {
+  const target = event.target as HTMLTextAreaElement;
+  projectEditorScrollTop.value = target.scrollTop;
+  projectEditorScrollLeft.value = target.scrollLeft;
+}
+
+async function discardProjectEditorHunk(index: number) {
+  if (project.editorDirty && !window.confirm("当前文件有未保存编辑，撤回此块会放弃未保存内容并还原 Git 原本内容。继续？")) {
+    return;
+  }
+  await project.discardHunk(index);
+  expandedProjectHunkIndex.value = null;
+}
+
+async function saveProjectEditor() {
+  await project.saveSelectedContent();
+}
+
+function closeProjectEditorTab(path: string) {
+  const tab = project.openTabs.find((item) => item.path === path);
+  if (!project.isPathDirty(path)) {
+    project.closeTab(path).catch(() => undefined);
+    return;
+  }
+
+  projectCloseDialog.value = {
+    path,
+    name: tab?.name ?? path,
+    saving: false,
+    error: "",
+  };
+}
+
+function cancelProjectCloseDialog() {
+  if (projectCloseDialog.value?.saving) return;
+  projectCloseDialog.value = null;
+}
+
+async function discardAndCloseProjectFile() {
+  const dialog = projectCloseDialog.value;
+  if (!dialog || dialog.saving) return;
+
+  await project.closeTab(dialog.path);
+  projectCloseDialog.value = null;
+}
+
+async function saveAndCloseProjectFile() {
+  const dialog = projectCloseDialog.value;
+  if (!dialog || dialog.saving) return;
+
+  dialog.saving = true;
+  dialog.error = "";
+  try {
+    await project.saveContent(dialog.path);
+    await project.closeTab(dialog.path);
+    projectCloseDialog.value = null;
+  } catch (error) {
+    dialog.error = String(error);
+    dialog.saving = false;
+  }
 }
 
 function openProjectEntry(file: ProjectFileEntry) {
@@ -1185,6 +1476,301 @@ function openProjectEntry(file: ProjectFileEntry) {
     return;
   }
   project.openFile(file.path).catch(() => undefined);
+}
+
+function projectDirectoryParam(path: string | null | undefined) {
+  return !path || path === PROJECT_ROOT_PATH ? null : path;
+}
+
+function projectMenuTargetDirectory(file: ProjectFileEntry | null) {
+  if (!file) return null;
+  return file.directory ? projectDirectoryParam(file.path) : projectDirectoryParam(file.parent);
+}
+
+function ensureProjectDirectoryExpanded(path: string | null | undefined) {
+  const directoryPath = path ?? PROJECT_ROOT_PATH;
+  if (project.expandedPaths.includes(directoryPath)) return;
+  project.expandedPaths = [...project.expandedPaths, directoryPath];
+}
+
+function projectClipboardParentPath(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  parts.pop();
+  return parts.join("/");
+}
+
+function canCreateInProjectContext(file: ProjectFileEntry | null) {
+  return !file || file.directory;
+}
+
+function canModifyProjectEntry(file: ProjectFileEntry | null) {
+  return Boolean(file && file.path !== PROJECT_ROOT_PATH);
+}
+
+function canPasteProjectEntry(file: ProjectFileEntry | null) {
+  const item = projectFileClipboard.value;
+  if (!item) return false;
+  if (file && !file.directory) return false;
+
+  const targetDirectory = projectMenuTargetDirectory(file) ?? "";
+  if (item.mode === "cut" && targetDirectory === projectClipboardParentPath(item.path)) {
+    return false;
+  }
+  if (item.directory && (targetDirectory === item.path || targetDirectory.startsWith(`${item.path}/`))) {
+    return false;
+  }
+  return true;
+}
+
+function projectAbsolutePath(file: ProjectFileEntry) {
+  const root = repos.current?.workdir ?? repos.path;
+  if (!root || file.path === PROJECT_ROOT_PATH) return root;
+  const separator = root.endsWith("/") || root.endsWith("\\") ? "" : "/";
+  return `${root}${separator}${file.path}`;
+}
+
+function projectExistingChildNames(directoryPath: string | null | undefined) {
+  const parent = directoryPath ?? PROJECT_ROOT_PATH;
+  return new Set((projectChildrenByParent.value.get(parent) ?? []).map((file) => file.name.toLocaleLowerCase()));
+}
+
+function nextAvailableProjectName(directoryPath: string | null | undefined, baseName: string, extension = "") {
+  const existing = projectExistingChildNames(directoryPath);
+  for (let index = 0; index < 1000; index += 1) {
+    const suffix = index === 0 ? "" : ` ${index + 1}`;
+    const candidate = `${baseName}${suffix}${extension}`;
+    if (!existing.has(candidate.toLocaleLowerCase())) return candidate;
+  }
+  return `${baseName}${extension}`;
+}
+
+function validateProjectCreatePath(value: string) {
+  if (value.startsWith("/") || value.includes("\\") || value.split("/").some((part) => !part || part === "." || part === "..")) {
+    return "名称不能是绝对路径，不能包含空路径、.、.. 或反斜杠";
+  }
+  return "";
+}
+
+function validateProjectRenameName(value: string) {
+  if (value === "." || value === ".." || value.includes("/") || value.includes("\\")) {
+    return "重命名只能修改当前名称，不能包含路径分隔符";
+  }
+  return "";
+}
+
+function promptProjectName(title: string, defaultValue: string, validate: (value: string) => string) {
+  return new Promise<string | null>((resolve) => {
+    projectNameDialog.value = {
+      title,
+      value: defaultValue,
+      error: "",
+      validate,
+      resolve,
+    };
+  });
+}
+
+function submitProjectNameDialog() {
+  const dialog = projectNameDialog.value;
+  if (!dialog) return;
+
+  const value = dialog.value.trim();
+  if (!value) {
+    dialog.error = "请输入名称";
+    return;
+  }
+
+  const error = dialog.validate(value);
+  if (error) {
+    dialog.error = error;
+    return;
+  }
+
+  dialog.resolve(value);
+  projectNameDialog.value = null;
+}
+
+function cancelProjectNameDialog() {
+  projectNameDialog.value?.resolve(null);
+  projectNameDialog.value = null;
+}
+
+async function writeClipboardText(text: string) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    window.prompt("复制内容", text);
+  }
+}
+
+async function reloadAfterProjectFileOperation() {
+  await Promise.all([project.refresh(), changes.refresh()]);
+  changelists.pruneMissingPaths(changes.files.map((file) => file.path));
+  await diff.loadSelected().catch(() => undefined);
+}
+
+async function runProjectFileOperation<T>(operation: () => Promise<T>) {
+  if (!repos.path) return null;
+  project.error = "";
+  try {
+    return await operation();
+  } catch (error) {
+    project.error = String(error);
+    return null;
+  }
+}
+
+function openProjectFileContextMenu(file: ProjectFileEntry | null, event: MouseEvent) {
+  const menuWidth = 260;
+  const menuHeight = 326;
+  projectFileContextMenu.value = {
+    file,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function closeProjectFileContextMenu() {
+  projectFileContextMenu.value = null;
+}
+
+function closeContextMenus() {
+  closeProjectFileContextMenu();
+  closeLogFileContextMenu();
+}
+
+async function createProjectFileFromContext(file: ProjectFileEntry | null) {
+  const directoryPath = projectMenuTargetDirectory(file);
+  const defaultName = nextAvailableProjectName(directoryPath, "未命名文件", ".txt");
+  closeProjectFileContextMenu();
+  const name = await promptProjectName("新建文件", defaultName, validateProjectCreatePath);
+  if (!name) return;
+
+  ensureProjectDirectoryExpanded(directoryPath);
+  const result = await runProjectFileOperation(() => createProjectFile(repos.path, directoryPath, name));
+  if (!result) return;
+
+  await reloadAfterProjectFileOperation();
+  ensureProjectDirectoryExpanded(directoryPath);
+  await project.openFile(result.path);
+}
+
+async function createProjectDirectoryFromContext(file: ProjectFileEntry | null) {
+  const directoryPath = projectMenuTargetDirectory(file);
+  const defaultName = nextAvailableProjectName(directoryPath, "新建文件夹");
+  closeProjectFileContextMenu();
+  const name = await promptProjectName("新建文件夹", defaultName, validateProjectCreatePath);
+  if (!name) return;
+
+  ensureProjectDirectoryExpanded(directoryPath);
+  const result = await runProjectFileOperation(() => createProjectDirectory(repos.path, directoryPath, name));
+  if (!result) return;
+
+  await reloadAfterProjectFileOperation();
+  ensureProjectDirectoryExpanded(directoryPath);
+  ensureProjectDirectoryExpanded(result.path);
+}
+
+function cutProjectEntry(file: ProjectFileEntry) {
+  if (!canModifyProjectEntry(file)) return;
+  projectFileClipboard.value = {
+    mode: "cut",
+    path: file.path,
+    name: file.name,
+    directory: file.directory,
+  };
+  closeProjectFileContextMenu();
+}
+
+function copyProjectEntryToInternalClipboard(file: ProjectFileEntry) {
+  if (!canModifyProjectEntry(file)) return;
+  projectFileClipboard.value = {
+    mode: "copy",
+    path: file.path,
+    name: file.name,
+    directory: file.directory,
+  };
+  closeProjectFileContextMenu();
+}
+
+async function pasteProjectEntryToContext(file: ProjectFileEntry | null) {
+  const item = projectFileClipboard.value;
+  if (!item || !canPasteProjectEntry(file)) return;
+
+  const targetDirectory = projectMenuTargetDirectory(file);
+  const shouldOpenMovedFile = item.mode === "cut" && !item.directory && project.selectedPath === item.path;
+  closeProjectFileContextMenu();
+  ensureProjectDirectoryExpanded(targetDirectory);
+
+  const result =
+    item.mode === "cut"
+      ? await runProjectFileOperation(() => moveProjectEntry(repos.path, item.path, targetDirectory))
+      : await runProjectFileOperation(() => copyProjectEntry(repos.path, item.path, targetDirectory));
+  if (!result) return;
+
+  if (item.mode === "cut") {
+    projectFileClipboard.value = null;
+  }
+  await reloadAfterProjectFileOperation();
+  ensureProjectDirectoryExpanded(targetDirectory);
+  if (result.directory) {
+    ensureProjectDirectoryExpanded(result.path);
+  } else if (shouldOpenMovedFile) {
+    await project.openFile(result.path);
+  }
+}
+
+async function copyProjectAbsolutePath(file: ProjectFileEntry) {
+  await writeClipboardText(projectAbsolutePath(file));
+  closeProjectFileContextMenu();
+}
+
+async function copyProjectRelativePath(file: ProjectFileEntry) {
+  await writeClipboardText(file.path === PROJECT_ROOT_PATH ? "." : file.path);
+  closeProjectFileContextMenu();
+}
+
+async function renameProjectEntryFromContext(file: ProjectFileEntry) {
+  if (!canModifyProjectEntry(file)) return;
+  closeProjectFileContextMenu();
+  const newName = await promptProjectName("重命名", file.name, validateProjectRenameName);
+  if (!newName || newName === file.name) {
+    return;
+  }
+
+  const wasOpen = project.openPaths.includes(file.path);
+  const wasSelected = project.selectedPath === file.path;
+  const result = await runProjectFileOperation(() => renameProjectEntry(repos.path, file.path, newName));
+  if (!result) return;
+
+  await reloadAfterProjectFileOperation();
+  if (!result.directory && (wasOpen || wasSelected)) {
+    await project.openFile(result.path);
+  }
+}
+
+async function deleteProjectEntryFromContext(file: ProjectFileEntry) {
+  if (!canModifyProjectEntry(file)) return;
+  const message = file.directory ? `删除文件夹 ${file.name} 及其所有内容？` : `删除文件 ${file.name}？`;
+  if (!window.confirm(message)) return;
+
+  closeProjectFileContextMenu();
+  const result = await runProjectFileOperation(() => deleteProjectEntry(repos.path, file.path));
+  if (!result) return;
+
+  if (projectFileClipboard.value?.path === file.path || projectFileClipboard.value?.path.startsWith(`${file.path}/`)) {
+    projectFileClipboard.value = null;
+  }
+  await reloadAfterProjectFileOperation();
+}
+
+async function openProjectEntryLog(file: ProjectFileEntry) {
+  history.pathFilters = file.path === PROJECT_ROOT_PATH ? [] : [file.path];
+  activeLogTabId.value = LOG_TAB_ID;
+  workbenchMode.value = "log";
+  closeProjectFileContextMenu();
+  await history.refresh().catch(() => undefined);
 }
 
 function normalizeProjectGitStatus(file: ChangedFile): ProjectGitStatus {
@@ -1225,10 +1811,11 @@ function projectStatusLabel(status: ProjectGitStatus | "") {
 
 function projectFileTitle(file: ProjectFileEntry) {
   const label = projectStatusLabel(projectStatusForPath(file.path));
+  const dirty = !file.directory && project.isPathDirty(file.path);
   if (file.path === PROJECT_ROOT_PATH) {
     return label ? `${repos.path} · ${label}` : repos.path;
   }
-  return label ? `${file.path} · ${label}` : file.path;
+  return [file.path, dirty ? "未保存" : "", label].filter(Boolean).join(" · ");
 }
 
 function projectFileClass(file: ProjectFileEntry) {
@@ -1246,6 +1833,7 @@ function projectTabClass(file: ProjectFileEntry) {
   const status = projectStatusForPath(file.path);
   return {
     active: project.selectedPath === file.path,
+    dirty: project.isPathDirty(file.path),
     [`status-${status}`]: Boolean(status),
   };
 }
@@ -1279,12 +1867,129 @@ function formatRefName(ref: string) {
   return ref.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\//, "").replace(/^refs\/tags\//, "");
 }
 
+function formatAuthorFilterValue(commitItem: CommitSummary) {
+  if (commitItem.authorEmail) {
+    return `${commitItem.authorName || "未知作者"} <${commitItem.authorEmail}>`;
+  }
+  return commitItem.authorName || "未知作者";
+}
+
+function displayAuthorFilterValue(value: string) {
+  return value.replace(/\s*<[^>]+>\s*$/, "").trim() || value;
+}
+
+function shortProjectPathLabel(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+function isLogAuthorSelected(value: string) {
+  return history.authorFilters.includes(value);
+}
+
+function toggleLogAuthorPicker() {
+  logAuthorPickerOpen.value = !logAuthorPickerOpen.value;
+}
+
+function toggleLogAuthorFilter(value: string) {
+  if (isLogAuthorSelected(value)) {
+    history.authorFilters = history.authorFilters.filter((item) => item !== value);
+  } else {
+    history.authorFilters = [...history.authorFilters, value];
+  }
+  history.refresh().catch(() => undefined);
+}
+
+function clearLogAuthorFilters() {
+  if (history.authorFilters.length === 0) return;
+  history.authorFilters = [];
+  history.refresh().catch(() => undefined);
+}
+
+async function openLogFilePicker() {
+  logFilePickerOpen.value = true;
+  logFilePickerSearch.value = "";
+  logFilePickerDraft.value = [...history.pathFilters];
+  expandedLogFilePickerDirectories.value = {
+    ...expandedLogFilePickerDirectories.value,
+    [PROJECT_ROOT_PATH]: true,
+  };
+  if (repos.current && project.files.length === 0) {
+    await project.refresh();
+  }
+}
+
+function closeLogFilePicker() {
+  logFilePickerOpen.value = false;
+}
+
+function isLogFilePickerDirectoryExpanded(path: string) {
+  return expandedLogFilePickerDirectories.value[path] ?? path === PROJECT_ROOT_PATH;
+}
+
+function toggleLogFilePickerDirectory(path: string) {
+  expandedLogFilePickerDirectories.value = {
+    ...expandedLogFilePickerDirectories.value,
+    [path]: !isLogFilePickerDirectoryExpanded(path),
+  };
+}
+
+function isLogFileFilterSelected(path: string) {
+  return logFilePickerDraft.value.includes(path);
+}
+
+function toggleLogFileFilter(path: string) {
+  if (isLogFileFilterSelected(path)) {
+    logFilePickerDraft.value = logFilePickerDraft.value.filter((item) => item !== path);
+  } else {
+    logFilePickerDraft.value = [...logFilePickerDraft.value, path];
+  }
+}
+
+function applyLogFileFilters() {
+  history.pathFilters = [...logFilePickerDraft.value];
+  closeLogFilePicker();
+  history.refresh().catch(() => undefined);
+}
+
+function clearLogFilePickerDraft() {
+  logFilePickerDraft.value = [];
+}
+
+function logFilePickerRowClass(file: ProjectFileEntry) {
+  return {
+    directory: file.directory,
+    root: file.path === PROJECT_ROOT_PATH,
+    selected: !file.directory && isLogFileFilterSelected(file.path),
+  };
+}
+
+function logFilePickerIndent(file: ProjectFileEntry) {
+  if (file.path === PROJECT_ROOT_PATH) return fileIndent(0);
+  return fileIndent(file.depth + 1);
+}
+
 function shortRemoteBranchName(name: string, remoteName: string) {
   return name.startsWith(`${remoteName}/`) ? name.slice(remoteName.length + 1) : name;
 }
 
 function isLogRefActive(refName: string) {
   return history.branchFilter === refName;
+}
+
+function logRemoteGroupKey(name: string): LogRefGroupKey {
+  return `remote:${name}`;
+}
+
+function isLogRefGroupExpanded(key: LogRefGroupKey) {
+  return expandedLogRefGroups.value[key] ?? true;
+}
+
+function toggleLogRefGroup(key: LogRefGroupKey) {
+  expandedLogRefGroups.value = {
+    ...expandedLogRefGroups.value,
+    [key]: !isLogRefGroupExpanded(key),
+  };
 }
 
 function clearLogRef() {
@@ -1413,40 +2118,100 @@ function buildLogGraphRows(commits: CommitSummary[]): LogGraphRow[] {
 }
 
 function buildCommitFileTreeRows(files: CommitFileChange[]): LogFileTreeRow[] {
+  type LogFileTreeNode = LogFileTreeRow & {
+    children: Map<string, LogFileTreeNode>;
+  };
+
+  const root: LogFileTreeNode = {
+    id: "root",
+    name: "",
+    path: "",
+    parent: null,
+    depth: -1,
+    directory: true,
+    fileCount: files.length,
+    children: new Map(),
+  };
   const rows: LogFileTreeRow[] = [];
-  const seenDirectories = new Set<string>();
   const sortedFiles = [...files].sort((left, right) => left.path.localeCompare(right.path));
 
   for (const file of sortedFiles) {
     const parts = file.path.split("/").filter(Boolean);
+    let parent = root;
     let currentPath = "";
     for (let index = 0; index < parts.length - 1; index += 1) {
       currentPath = currentPath ? `${currentPath}/${parts[index]}` : parts[index];
-      if (!seenDirectories.has(currentPath)) {
-        rows.push({
+      const key = `dir:${parts[index]}`;
+      let directory = parent.children.get(key);
+      if (!directory) {
+        directory = {
           id: `dir:${currentPath}`,
           name: parts[index],
           path: currentPath,
+          parent: parent.path || null,
           depth: index,
           directory: true,
-        });
-        seenDirectories.add(currentPath);
+          fileCount: 0,
+          children: new Map(),
+        };
+        parent.children.set(key, directory);
       }
+      directory.fileCount = (directory.fileCount ?? 0) + 1;
+      parent = directory;
     }
 
     const fileName = parts.length > 0 ? parts[parts.length - 1] : file.path;
-    rows.push({
+    parent.children.set(`file:${file.path}`, {
       id: `file:${file.status}:${file.oldPath ?? ""}:${file.path}`,
       name: fileName,
       path: file.path,
+      parent: parent.path || null,
       depth: Math.max(0, parts.length - 1),
       directory: false,
       status: file.status,
       oldPath: file.oldPath,
+      children: new Map(),
     });
   }
 
+  const appendRows = (parent: LogFileTreeNode) => {
+    const children = [...parent.children.values()].sort(compareLogFileTreeNodes);
+    for (const child of children) {
+      rows.push({
+        id: child.id,
+        name: child.name,
+        path: child.path,
+        parent: child.parent,
+        depth: child.depth,
+        directory: child.directory,
+        fileCount: child.fileCount,
+        status: child.status,
+        oldPath: child.oldPath,
+      });
+      if (child.directory) appendRows(child);
+    }
+  };
+
+  appendRows(root);
   return rows;
+}
+
+function compareLogFileTreeNodes(left: LogFileTreeRow, right: LogFileTreeRow) {
+  if (left.directory !== right.directory) {
+    return left.directory ? -1 : 1;
+  }
+  return left.name.toLocaleLowerCase().localeCompare(right.name.toLocaleLowerCase());
+}
+
+function isCommitFileDirectoryExpanded(path: string) {
+  return expandedCommitFileDirectories.value[path] ?? true;
+}
+
+function toggleCommitFileDirectory(path: string) {
+  expandedCommitFileDirectories.value = {
+    ...expandedCommitFileDirectories.value,
+    [path]: !isCommitFileDirectoryExpanded(path),
+  };
 }
 
 function logGraphStyle(row: LogGraphRow) {
@@ -1464,6 +2229,36 @@ function logNodeStyle(row: LogGraphRow) {
   };
 }
 
+function commitFileStatusTone(status = "") {
+  const code = status.charAt(0);
+  const tones: Record<string, string> = {
+    A: "added",
+    C: "copied",
+    D: "deleted",
+    M: "modified",
+    R: "renamed",
+    T: "typechange",
+    U: "conflicted",
+  };
+  return tones[code] ?? "unknown";
+}
+
+function logFileTreeRowClass(row: LogFileTreeRow) {
+  const statusTone = row.directory ? "" : commitFileStatusTone(row.status);
+  return {
+    directory: row.directory,
+    expanded: row.directory && isCommitFileDirectoryExpanded(row.path),
+    selected: !row.directory && selectedCommitFilePaths.value.includes(row.path),
+    [`status-${statusTone}`]: Boolean(statusTone),
+  };
+}
+
+function logFileTreeRowTitle(row: LogFileTreeRow) {
+  if (row.directory) return `${row.path} · ${row.fileCount ?? 0} 个文件`;
+  const status = formatCommitFileStatusCode(row.status);
+  return row.oldPath ? `${row.oldPath} -> ${row.path} · ${status}` : `${row.path} · ${status}`;
+}
+
 function formatCommitFileStatusCode(status = "") {
   const code = status.charAt(0);
   const labels: Record<string, string> = {
@@ -1476,6 +2271,22 @@ function formatCommitFileStatusCode(status = "") {
     U: "冲突",
   };
   return labels[code] ?? status;
+}
+
+function buildDiffLines(text: string): DiffLineView[] {
+  return text.split("\n").map((content, index) => ({
+    index,
+    content,
+    type: content.startsWith("+")
+      ? "add"
+      : content.startsWith("-")
+        ? "delete"
+        : content.startsWith("@@")
+          ? "hunk"
+          : content.startsWith("diff --git")
+            ? "file"
+            : "context",
+  }));
 }
 
 function formatOperationName(name?: string | null) {
@@ -1701,6 +2512,159 @@ function toggleCommitFile(path: string) {
   }
 }
 
+function selectedLogFilePaths(row: LogFileTreeRow) {
+  return selectedCommitFilePaths.value.includes(row.path) ? selectedCommitFilePaths.value : [row.path];
+}
+
+function logDiffTabId(oid: string, path: string, mode: CommitFileDiffMode) {
+  return `log-diff:${oid}:${mode}:${path}`;
+}
+
+function fileBaseName(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+function logDiffTabTitle(path: string, mode: CommitFileDiffMode) {
+  return `${commitFileDiffModeLabels[mode]}: ${fileBaseName(path)}`;
+}
+
+function updateLogDiffTab(id: string, patch: Partial<LogDiffTab>) {
+  let updated: LogDiffTab | null = null;
+  logDiffTabs.value = logDiffTabs.value.map((tab) => {
+    if (tab.id !== id) return tab;
+    updated = { ...tab, ...patch };
+    return updated;
+  });
+  return updated;
+}
+
+function selectLogRootTab() {
+  activeLogTabId.value = LOG_TAB_ID;
+}
+
+function logDiffTabClass(tab: LogDiffTab) {
+  return {
+    active: activeLogTabId.value === tab.id,
+    loading: tab.loading,
+    error: Boolean(tab.error),
+  };
+}
+
+function closeLogDiffTab(id: string) {
+  const index = logDiffTabs.value.findIndex((tab) => tab.id === id);
+  if (index < 0) return;
+
+  const nextTabs = logDiffTabs.value.filter((tab) => tab.id !== id);
+  logDiffTabs.value = nextTabs;
+  if (activeLogTabId.value !== id) return;
+
+  activeLogTabId.value = nextTabs[index]?.id ?? nextTabs[index - 1]?.id ?? LOG_TAB_ID;
+}
+
+function clearLogDiffTabs() {
+  logDiffTabs.value = [];
+  activeLogTabId.value = LOG_TAB_ID;
+}
+
+function openLogFileContextMenu(row: LogFileTreeRow, event: MouseEvent) {
+  if (row.directory) return;
+  if (!selectedCommitFilePaths.value.includes(row.path)) {
+    selectedCommitFilePaths.value = [row.path];
+  }
+  const menuWidth = 260;
+  const menuHeight = 384;
+  logFileContextMenu.value = {
+    row,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function closeLogFileContextMenu() {
+  logFileContextMenu.value = null;
+}
+
+async function showCommitFileDiff(row: LogFileTreeRow, mode: CommitFileDiffMode = "commit") {
+  if (row.directory || !history.selectedOid || !repos.path) return null;
+
+  const oid = history.selectedOid;
+  const id = logDiffTabId(oid, row.path, mode);
+  const existing = logDiffTabs.value.find((tab) => tab.id === id);
+  activeLogTabId.value = id;
+  closeLogFileContextMenu();
+
+  if (existing?.diff || existing?.loading) return existing;
+
+  const tab: LogDiffTab =
+    existing ??
+    {
+      id,
+      oid,
+      shortOid: oid.slice(0, 10),
+      path: row.path,
+      mode,
+      title: logDiffTabTitle(row.path, mode),
+      subtitle: selectedCommitTitle.value,
+      diff: null,
+      loading: true,
+      error: "",
+    };
+
+  if (!existing) {
+    logDiffTabs.value = [...logDiffTabs.value, tab];
+  } else {
+    updateLogDiffTab(id, { loading: true, error: "" });
+  }
+
+  try {
+    const response = await commitFileDiff(repos.path, oid, row.path, mode);
+    history.error = "";
+    return updateLogDiffTab(id, { diff: response, loading: false, error: "" });
+  } catch (error) {
+    const message = String(error);
+    history.error = message;
+    updateLogDiffTab(id, { loading: false, error: message });
+    return null;
+  }
+}
+
+async function cherryPickLogFile(row: LogFileTreeRow) {
+  const oid = history.selectedOid;
+  if (!oid || row.directory) return;
+  const paths = selectedLogFilePaths(row);
+  await operations.cherryPickFiles(oid, paths);
+  workbenchMode.value = "changes";
+  closeLogFileContextMenu();
+  await reloadAfterGitOperation();
+}
+
+async function revertLogFileChange(row: LogFileTreeRow) {
+  const oid = history.selectedOid;
+  if (!oid || row.directory) return;
+  const paths = selectedLogFilePaths(row);
+  if (!window.confirm(`还原 ${oid.slice(0, 10)} 的 ${paths.length} 个文件变更到工作区？`)) return;
+  await operations.revertFiles(oid, paths);
+  workbenchMode.value = "changes";
+  closeLogFileContextMenu();
+  await reloadAfterGitOperation();
+}
+
+async function createPatchFromLogFile(row: LogFileTreeRow) {
+  if (row.directory) return;
+  const tab = await showCommitFileDiff(row, "commit");
+  if (!tab?.diff) return;
+  advanced.generatedPatch = tab?.diff?.text ?? "";
+  advanced.notice = `已生成 ${row.path} 的补丁`;
+}
+
+function showLogFileHistory(row: LogFileTreeRow) {
+  if (row.directory) return;
+  history.pathFilters = [row.path];
+  closeLogFileContextMenu();
+  history.refresh().catch(() => undefined);
+}
+
 function setConflictResultFromEvent(event: Event) {
   operations.setResultDraft((event.target as HTMLTextAreaElement).value);
 }
@@ -1758,7 +2722,7 @@ function deleteChangelist(id: string) {
 </script>
 
 <template>
-  <div class="app-shell" :data-theme="effectiveTheme">
+  <div class="app-shell" :data-theme="effectiveTheme" @click="closeContextMenus">
     <AppTopbar
       :brand-subtitle="brandSubtitle"
       :has-repository="Boolean(repos.current)"
@@ -2459,65 +3423,104 @@ function deleteChangelist(id: string) {
             </span>
           </button>
 
-          <div class="branch-group-label">本地</div>
-          <button
-            v-for="branchItem in branches.sortedLocalBranches"
-            :key="`log-local-${branchItem.fullName}`"
-            class="log-ref-row"
-            :class="{ active: isLogRefActive(branchItem.name), current: branchItem.current }"
-            :title="branchItem.fullName"
-            @click="selectLogRef(branchItem.name)"
-          >
-            <span class="branch-dot" />
-            <span>
-              <strong>{{ branchItem.name }}</strong>
-              <small v-if="branchItem.upstream">
-                {{ formatRefName(branchItem.upstream) }} · +{{ branchItem.ahead }} / -{{ branchItem.behind }}
-              </small>
-              <small v-else>{{ branchItem.current ? "当前分支" : "未设置上游" }}</small>
-            </span>
-            <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+          <button class="log-ref-toggle" type="button" @click="toggleLogRefGroup('local')">
+            <ChevronDown v-if="isLogRefGroupExpanded('local')" :size="13" />
+            <ChevronRight v-else :size="13" />
+            <span>本地</span>
+            <small>{{ branches.sortedLocalBranches.length }}</small>
           </button>
-
-          <div v-if="logRemoteGroups.length" class="branch-group-label">远端</div>
-          <section v-for="group in logRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
-            <div class="log-ref-group-title">
-              <Folder :size="13" />
-              <span>{{ group.name }}</span>
-              <small>{{ group.branches.length }}</small>
-            </div>
+          <div v-if="isLogRefGroupExpanded('local')" class="log-ref-children">
             <button
-              v-for="branchItem in group.branches"
-              :key="`log-remote-${branchItem.fullName}`"
-              class="log-ref-row remote"
-              :class="{ active: isLogRefActive(branchItem.name) }"
+              v-for="branchItem in branches.sortedLocalBranches"
+              :key="`log-local-${branchItem.fullName}`"
+              class="log-ref-row local"
+              :class="{ active: isLogRefActive(branchItem.name), current: branchItem.current }"
               :title="branchItem.fullName"
               @click="selectLogRef(branchItem.name)"
             >
               <GitBranch :size="13" />
               <span>
-                <strong>{{ shortRemoteBranchName(branchItem.name, group.name) }}</strong>
-                <small>{{ shortHash(branchItem.target) }}</small>
+                <strong>{{ branchItem.name }}</strong>
+                <small v-if="branchItem.upstream">
+                  {{ formatRefName(branchItem.upstream) }} · +{{ branchItem.ahead }} / -{{ branchItem.behind }}
+                </small>
+                <small v-else>{{ branchItem.current ? "当前分支" : "未设置上游" }}</small>
               </span>
               <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
             </button>
-          </section>
+          </div>
 
-          <div v-if="branches.list?.tags.length" class="branch-group-label">标签</div>
           <button
-            v-for="tag in branches.list?.tags ?? []"
-            :key="`log-tag-${tag.name}`"
-            class="log-ref-row remote"
-            :class="{ active: isLogRefActive(tag.name) }"
-            :title="tag.name"
-            @click="selectLogRef(tag.name)"
+            v-if="logRemoteGroups.length"
+            class="log-ref-toggle"
+            type="button"
+            @click="toggleLogRefGroup('remote')"
           >
-            <span class="tag-dot" />
-            <span>
-              <strong>{{ tag.name }}</strong>
-              <small>{{ shortHash(tag.target) }}</small>
-            </span>
+            <ChevronDown v-if="isLogRefGroupExpanded('remote')" :size="13" />
+            <ChevronRight v-else :size="13" />
+            <span>远端</span>
+            <small>{{ logRemoteGroups.length }}</small>
           </button>
+          <div v-if="logRemoteGroups.length && isLogRefGroupExpanded('remote')" class="log-ref-children">
+            <section v-for="group in logRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
+              <button
+                class="log-ref-toggle remote-root"
+                type="button"
+                @click="toggleLogRefGroup(logRemoteGroupKey(group.name))"
+              >
+                <ChevronDown v-if="isLogRefGroupExpanded(logRemoteGroupKey(group.name))" :size="13" />
+                <ChevronRight v-else :size="13" />
+                <Folder :size="13" />
+                <span>{{ group.name }}</span>
+                <small>{{ group.branches.length }}</small>
+              </button>
+              <div v-if="isLogRefGroupExpanded(logRemoteGroupKey(group.name))" class="log-ref-children remote-branch-list">
+                <button
+                  v-for="branchItem in group.branches"
+                  :key="`log-remote-${branchItem.fullName}`"
+                  class="log-ref-row remote"
+                  :class="{ active: isLogRefActive(branchItem.name) }"
+                  :title="branchItem.fullName"
+                  @click="selectLogRef(branchItem.name)"
+                >
+                  <GitBranch :size="13" />
+                  <span>
+                    <strong>{{ shortRemoteBranchName(branchItem.name, group.name) }}</strong>
+                    <small>{{ shortHash(branchItem.target) }}</small>
+                  </span>
+                  <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+                </button>
+              </div>
+            </section>
+          </div>
+
+          <button
+            v-if="branches.list?.tags.length"
+            class="log-ref-toggle"
+            type="button"
+            @click="toggleLogRefGroup('tags')"
+          >
+            <ChevronDown v-if="isLogRefGroupExpanded('tags')" :size="13" />
+            <ChevronRight v-else :size="13" />
+            <span>标签</span>
+            <small>{{ branches.list?.tags.length ?? 0 }}</small>
+          </button>
+          <div v-if="branches.list?.tags.length && isLogRefGroupExpanded('tags')" class="log-ref-children">
+            <button
+              v-for="tag in branches.list?.tags ?? []"
+              :key="`log-tag-${tag.name}`"
+              class="log-ref-row tag-ref"
+              :class="{ active: isLogRefActive(tag.name) }"
+              :title="tag.name"
+              @click="selectLogRef(tag.name)"
+            >
+              <span class="tag-dot" />
+              <span>
+                <strong>{{ tag.name }}</strong>
+                <small>{{ shortHash(tag.target) }}</small>
+              </span>
+            </button>
+          </div>
         </div>
       </section>
 
@@ -2533,7 +3536,7 @@ function deleteChangelist(id: string) {
         </div>
 
         <div class="project-file-browser">
-          <div class="project-file-list">
+          <div class="project-file-list" @contextmenu.prevent="openProjectFileContextMenu(null, $event)">
             <button
               v-for="file in visibleProjectFiles"
               :key="file.path"
@@ -2543,6 +3546,7 @@ function deleteChangelist(id: string) {
               :title="projectFileTitle(file)"
               :aria-expanded="file.directory ? project.isExpanded(file.path) : undefined"
               @click="openProjectEntry(file)"
+              @contextmenu.prevent.stop="openProjectFileContextMenu(file, $event)"
             >
               <span class="project-file-disclosure">
                 <ChevronDown v-if="file.directory && project.isExpanded(file.path)" :size="13" />
@@ -2689,22 +3693,23 @@ function deleteChangelist(id: string) {
           >
             <button
               class="project-tab-select"
+              :class="{ dirty: project.isPathDirty(tab.path) }"
               role="tab"
               :aria-selected="project.selectedPath === tab.path"
               :title="projectFileTitle(tab)"
               @click="project.selectTab(tab.path)"
             >
               <FileIcon :size="14" />
-              <span>{{ tab.name }}</span>
+              <span v-if="project.isPathDirty(tab.path)" class="project-tab-dirty" aria-label="未保存" title="未保存" />
+              <span class="project-tab-title">{{ tab.name }}</span>
             </button>
-            <button class="project-tab-close" title="关闭文件" @click.stop="project.closeTab(tab.path)">
+            <button class="project-tab-close" title="关闭文件" @click.stop="closeProjectEditorTab(tab.path)">
               <X :size="13" />
             </button>
           </div>
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="project-editor">
           <div v-if="project.contentLoading || project.loading" class="diff-empty">加载中</div>
@@ -2712,65 +3717,88 @@ function deleteChangelist(id: string) {
             二进制文件，大小 {{ formatBytes(project.content.size) }}
           </div>
           <div v-else-if="!project.content" class="diff-empty">选择一个项目文件</div>
-          <div v-else class="project-lines" role="code" :aria-label="project.selectedPath || '项目文件'">
-            <template v-for="line in projectContentLines" :key="line.index">
-              <div
-                class="project-line"
-                :class="projectCodeLineClass(line)"
-                :title="line.change ? '查看原本代码' : undefined"
-                :tabindex="line.change ? 0 : undefined"
-                @click="toggleProjectChange(line.change)"
-                @keydown.enter.prevent="toggleProjectChange(line.change)"
-                @keydown.space.prevent="toggleProjectChange(line.change)"
+          <div v-else class="project-edit-pane">
+            <div class="project-editor-render" :style="projectEditorRenderStyle" aria-hidden="true"><div class="project-editor-render-content">
+              <span
+                v-for="line in projectEditorLines"
+                :key="line.index"
+                class="project-render-line"
+              ><span class="line-number">{{ line.number }}</span><span class="project-render-code"><template
+                v-for="(token, tokenIndex) in line.tokens"
+                :key="tokenIndex"
+              ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span></span>
+            </div></div>
+            <div v-if="projectEditorHunks.length" class="project-editor-change-layer">
+              <button
+                v-for="hunk in projectEditorHunks"
+                :key="hunk.index"
+                class="project-change-marker"
+                :class="[hunk.tone, { expanded: expandedProjectHunk?.index === hunk.index }]"
+                :style="projectEditorHunkMarkerStyle(hunk)"
+                type="button"
+                :title="projectEditorHunkTitle(hunk)"
+                @click="toggleProjectEditorHunk(hunk.index)"
               >
-                <span class="line-number">{{ line.number }}</span>
-                <span class="line-content">
-                  <span
-                    v-for="(token, tokenIndex) in line.tokens"
-                    :key="tokenIndex"
-                    :class="token.kind ? `syntax-${token.kind}` : undefined"
-                  >{{ token.text }}</span>
-                </span>
-              </div>
-              <div v-if="line.reveal" class="project-original-panel">
-                <div class="project-original-gutter">↳</div>
+                <ChevronDown v-if="expandedProjectHunk?.index === hunk.index" :size="12" />
+                <ChevronRight v-else :size="12" />
+              </button>
+
+              <div
+                v-if="expandedProjectHunk"
+                class="project-original-panel project-original-popover"
+                :style="projectEditorOriginalPanelStyle(expandedProjectHunk)"
+                @mousedown.stop
+              >
+                <div class="project-original-gutter">{{ expandedProjectHunk.oldStart }}</div>
                 <div class="project-original-card">
                   <div class="project-original-toolbar">
-                    <span>原本代码 · {{ line.reveal.header }}</span>
+                    <span>{{ projectEditorHunkTitle(expandedProjectHunk) }}</span>
                     <div class="project-original-actions">
-                      <button class="tool-button" :disabled="project.contentLoading" @click.stop="stageProjectChange(line.reveal)">
-                        <Check :size="14" />
-                        <span>暂存此块</span>
-                      </button>
-                      <button class="tool-button" :disabled="project.contentLoading" @click.stop="discardProjectChange(line.reveal)">
+                      <button
+                        class="icon-button danger"
+                        type="button"
+                        :disabled="project.contentLoading || project.contentSaving"
+                        @click="discardProjectEditorHunk(expandedProjectHunk.index)"
+                      >
                         <RotateCcw :size="14" />
                         <span>撤回此块</span>
                       </button>
+                      <button class="icon-button" type="button" title="关闭" @click="expandedProjectHunkIndex = null">
+                        <X :size="14" />
+                      </button>
                     </div>
                   </div>
-                  <div v-if="line.reveal.originalLines.length" class="project-original-code">
+                  <div v-if="expandedProjectHunk.originalLines.length" class="project-original-code">
                     <div
-                      v-for="original in line.reveal.originalLines"
-                      :key="original.number"
+                      v-for="line in expandedProjectHunk.originalLines"
+                      :key="line.index"
                       class="project-original-line"
                     >
-                      <span class="line-number">{{ original.number }}</span>
-                      <span class="line-content">
-                        <span
-                          v-for="(token, tokenIndex) in original.tokens"
-                          :key="tokenIndex"
-                          :class="token.kind ? `syntax-${token.kind}` : undefined"
-                        >{{ token.text }}</span>
-                      </span>
+                      <span class="line-number">{{ line.lineNumber }}</span>
+                      <span class="line-content"><template
+                        v-for="(token, tokenIndex) in line.tokens"
+                        :key="tokenIndex"
+                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
                     </div>
                   </div>
-                  <div v-else class="project-original-empty">此处原本没有这些行</div>
+                  <div v-else class="project-original-empty">原本没有内容，这一块是新增行</div>
                 </div>
               </div>
-            </template>
+            </div>
+            <textarea
+              ref="projectEditorTextarea"
+              v-model="projectEditorText"
+              class="project-editor-textarea"
+              spellcheck="false"
+              :aria-label="project.selectedPath || '项目文件'"
+              :disabled="project.contentSaving"
+              @scroll="syncProjectEditorScroll"
+              @keydown.meta.s.prevent="saveProjectEditor"
+              @keydown.ctrl.s.prevent="saveProjectEditor"
+            />
           </div>
         </div>
-        </template>
+      </template>
 
         <template v-else-if="workbenchMode === 'changes'">
         <div class="diff-header">
@@ -3045,15 +4073,98 @@ function deleteChangelist(id: string) {
         </template>
 
         <template v-else-if="workbenchMode === 'log'">
-        <div class="log-workbench">
+        <div class="log-tab-workspace">
+          <div class="log-workspace-tabs" role="tablist" aria-label="日志标签页">
+            <button
+              class="log-root-tab"
+              :class="{ active: activeLogTabId === LOG_TAB_ID }"
+              role="tab"
+              :aria-selected="activeLogTabId === LOG_TAB_ID"
+              title="日志"
+              @click="selectLogRootTab"
+            >
+              <GitBranch :size="14" />
+              <span>日志</span>
+            </button>
+            <div
+              v-for="tab in logDiffTabs"
+              :key="tab.id"
+              class="log-workspace-tab"
+              :class="logDiffTabClass(tab)"
+            >
+              <button
+                class="log-workspace-tab-select"
+                role="tab"
+                :aria-selected="activeLogTabId === tab.id"
+                :title="`${tab.title} · ${tab.subtitle}`"
+                @click="activeLogTabId = tab.id"
+              >
+                <FileIcon :size="14" />
+                <span>{{ tab.title }}</span>
+                <small>{{ tab.shortOid }}</small>
+              </button>
+              <button class="log-workspace-tab-close" title="关闭标签页" @click.stop="closeLogDiffTab(tab.id)">
+                <X :size="13" />
+              </button>
+            </div>
+          </div>
+
+        <div v-if="activeLogTabId === LOG_TAB_ID" class="log-workbench">
           <section class="log-commit-panel">
             <div class="log-topbar">
               <label class="log-search-field">
                 <Search :size="14" />
                 <input v-model="history.query" placeholder="文字或哈希" @keydown.enter="history.refresh" />
               </label>
-              <input v-model="history.authorFilter" class="log-mini-filter" placeholder="作者" @keydown.enter="history.refresh" />
-              <input v-model="history.pathFilter" class="log-mini-filter" placeholder="路径" @keydown.enter="history.refresh" />
+              <div class="log-filter-picker">
+                <button
+                  class="log-filter-button"
+                  :class="{ active: history.authorFilters.length > 0 }"
+                  title="筛选作者"
+                  @click="toggleLogAuthorPicker"
+                >
+                  <UserRound :size="14" />
+                  <span>{{ logAuthorFilterLabel }}</span>
+                  <ChevronDown :size="13" />
+                </button>
+                <div v-if="logAuthorPickerOpen" class="log-filter-popover author" @click.stop>
+                  <div class="log-filter-popover-head">
+                    <strong>作者</strong>
+                    <button class="project-remove" title="清空作者" :disabled="history.authorFilters.length === 0" @click="clearLogAuthorFilters">
+                      <X :size="13" />
+                    </button>
+                  </div>
+                  <div class="log-filter-options">
+                    <button
+                      v-for="option in logAuthorOptions"
+                      :key="option.value"
+                      class="log-check-row"
+                      :class="{ selected: isLogAuthorSelected(option.value) }"
+                      @click="toggleLogAuthorFilter(option.value)"
+                    >
+                      <span class="log-checkmark">
+                        <Check v-if="isLogAuthorSelected(option.value)" :size="12" />
+                      </span>
+                      <span class="log-check-label">
+                        <strong>{{ option.label }}</strong>
+                        <small>{{ option.meta || `${option.count} 个提交` }}</small>
+                      </span>
+                      <small>{{ option.count }}</small>
+                    </button>
+                    <div v-if="logAuthorOptions.length === 0" class="log-picker-empty">暂无作者</div>
+                  </div>
+                </div>
+              </div>
+              <button
+                class="log-filter-button"
+                :class="{ active: history.pathFilters.length > 0 }"
+                title="选择文件"
+                @click="openLogFilePicker"
+              >
+                <FileSearch :size="14" />
+                <span>{{ logFileFilterLabel }}</span>
+                <ChevronDown :size="13" />
+              </button>
               <span class="log-filter-chip" :class="{ active: logFilterActive }">
                 分支: {{ activeLogRefLabel }}
                 <button v-if="history.branchFilter" title="清除分支过滤" @click="clearLogRef">
@@ -3124,18 +4235,29 @@ function deleteChangelist(id: string) {
                 <div v-else-if="commitFileTreeRows.length === 0" class="diff-empty">没有文件变更</div>
                 <template v-else>
                   <button
-                    v-for="row in commitFileTreeRows"
+                    v-for="row in visibleCommitFileTreeRows"
                     :key="row.id"
                     class="log-file-tree-row"
-                    :class="{ directory: row.directory, selected: !row.directory && selectedCommitFilePaths.includes(row.path) }"
+                    :class="logFileTreeRowClass(row)"
                     :style="logFileIndent(row.depth)"
-                    :title="row.path"
-                    @click="!row.directory && toggleCommitFile(row.path)"
+                    :title="logFileTreeRowTitle(row)"
+                    :aria-expanded="row.directory ? isCommitFileDirectoryExpanded(row.path) : undefined"
+                    @click="row.directory ? toggleCommitFileDirectory(row.path) : toggleCommitFile(row.path)"
+                    @dblclick.stop="!row.directory && showCommitFileDiff(row)"
+                    @contextmenu.prevent.stop="openLogFileContextMenu(row, $event)"
                   >
-                    <Folder v-if="row.directory" :size="14" />
+                    <span class="log-file-disclosure">
+                      <ChevronDown v-if="row.directory && isCommitFileDirectoryExpanded(row.path)" :size="13" />
+                      <ChevronRight v-else-if="row.directory" :size="13" />
+                    </span>
+                    <FolderOpen v-if="row.directory && isCommitFileDirectoryExpanded(row.path)" :size="14" />
+                    <Folder v-else-if="row.directory" :size="14" />
                     <FileIcon v-else :size="14" />
-                    <span>{{ row.name }}</span>
-                    <small v-if="!row.directory">{{ formatCommitFileStatusCode(row.status) }}</small>
+                    <span class="log-file-name">
+                      <strong>{{ row.name }}</strong>
+                      <small v-if="!row.directory && row.oldPath">{{ row.oldPath }}</small>
+                    </span>
+                    <small>{{ row.directory ? `${row.fileCount ?? 0} 个文件` : formatCommitFileStatusCode(row.status) }}</small>
                   </button>
                 </template>
               </div>
@@ -3210,20 +4332,58 @@ function deleteChangelist(id: string) {
                 </select>
               </div>
 
-              <details v-if="history.details" class="log-diff-preview">
-                <summary>补丁</summary>
-                <div class="diff-scroller">
-                  <pre class="diff-lines"><code
-                    v-for="line in commitDiffLines"
-                    :key="line.index"
-                    class="diff-line"
-                    :class="line.type"
-                  ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
-</code></pre>
-                </div>
-              </details>
             </section>
           </aside>
+        </div>
+          <section v-else-if="activeLogDiffTab" class="log-diff-tab-pane">
+            <div class="diff-header">
+              <div>
+                <span class="eyebrow">{{ activeLogDiffTab ? commitFileDiffModeLabels[activeLogDiffTab.mode] : "差异" }}</span>
+                <h2 :title="activeLogDiffTab?.path">{{ activeLogDiffTab?.path }}</h2>
+              </div>
+              <div class="log-actions">
+                <button class="tool-button" @click="selectLogRootTab">
+                  <GitBranch :size="14" />
+                  <span>返回日志</span>
+                </button>
+                <button
+                  class="icon-only-button"
+                  title="关闭标签页"
+                  @click="activeLogDiffTab && closeLogDiffTab(activeLogDiffTab.id)"
+                >
+                  <X :size="14" />
+                </button>
+              </div>
+            </div>
+
+            <div class="commit-detail-strip">
+              <div>
+                <span>提交</span>
+                <strong>{{ activeLogDiffTab?.shortOid }}</strong>
+              </div>
+              <div>
+                <span>来源</span>
+                <strong>{{ activeLogDiffTab?.subtitle }}</strong>
+              </div>
+              <div>
+                <span>文件</span>
+                <strong>{{ activeLogDiffTab?.path }}</strong>
+              </div>
+            </div>
+
+            <div class="diff-scroller">
+              <div v-if="activeLogDiffTab?.loading" class="diff-empty">加载中</div>
+              <div v-else-if="activeLogDiffTab?.error" class="diff-empty">{{ activeLogDiffTab?.error }}</div>
+              <div v-else-if="!activeLogDiffHasContent" class="diff-empty">没有差异</div>
+              <pre v-else class="diff-lines"><code
+                v-for="line in activeLogDiffLines"
+                :key="line.index"
+                class="diff-line"
+                :class="line.type"
+              ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
+</code></pre>
+            </div>
+          </section>
         </div>
         </template>
 
@@ -3422,6 +4582,238 @@ function deleteChangelist(id: string) {
       </main>
       </template>
     </section>
+
+    <div v-if="logFilePickerOpen" class="modal-backdrop" @click.self="closeLogFilePicker">
+      <section class="log-file-picker-modal" role="dialog" aria-modal="true" aria-label="选择日志文件">
+        <header class="log-file-picker-head">
+          <div class="section-title">
+            <FileSearch :size="16" />
+            <span>文件</span>
+          </div>
+          <button class="icon-only-button" title="关闭" @click="closeLogFilePicker">
+            <X :size="14" />
+          </button>
+        </header>
+
+        <label class="log-search-field log-file-picker-search">
+          <Search :size="14" />
+          <input v-model="logFilePickerSearch" placeholder="搜索文件" />
+        </label>
+
+        <div class="log-file-picker-tree">
+          <div v-if="project.loading" class="diff-empty">加载中</div>
+          <div v-else-if="project.error" class="message error">{{ project.error }}</div>
+          <div v-else-if="visibleLogFilePickerRows.length <= 1" class="diff-empty">没有文件</div>
+          <template v-else>
+            <button
+              v-for="file in visibleLogFilePickerRows"
+              :key="`log-file-picker-${file.path}`"
+              class="log-file-picker-row"
+              :class="logFilePickerRowClass(file)"
+              :style="logFilePickerIndent(file)"
+              :title="projectFileTitle(file)"
+              @click="file.directory ? toggleLogFilePickerDirectory(file.path) : toggleLogFileFilter(file.path)"
+            >
+              <span class="project-file-disclosure">
+                <ChevronDown v-if="file.directory && isLogFilePickerDirectoryExpanded(file.path)" :size="13" />
+                <ChevronRight v-else-if="file.directory" :size="13" />
+              </span>
+              <FolderOpen v-if="file.directory && isLogFilePickerDirectoryExpanded(file.path)" :size="14" />
+              <Folder v-else-if="file.directory" :size="14" />
+              <FileIcon v-else :size="14" />
+              <span class="project-file-name" :class="{ root: file.path === PROJECT_ROOT_PATH }">
+                <template v-if="file.path === PROJECT_ROOT_PATH">
+                  <strong>{{ repos.name }}</strong>
+                  <small>{{ repos.path }}</small>
+                </template>
+                <template v-else>{{ file.name }}</template>
+              </span>
+              <span v-if="!file.directory" class="log-file-picker-check">
+                <Check v-if="!file.directory && isLogFileFilterSelected(file.path)" :size="13" />
+              </span>
+              <span v-else />
+            </button>
+          </template>
+        </div>
+
+        <footer class="log-file-picker-footer">
+          <span>{{ logFilePickerDraft.length }} 个文件</span>
+          <button class="mini-button" :disabled="logFilePickerDraft.length === 0" @click="clearLogFilePickerDraft">清空</button>
+          <button class="icon-button" @click="closeLogFilePicker">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button class="icon-button primary" @click="applyLogFileFilters">
+            <Check :size="14" />
+            <span>应用</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="projectNameDialog" class="modal-backdrop" @click.self="cancelProjectNameDialog">
+      <form class="project-name-modal" role="dialog" aria-modal="true" :aria-label="projectNameDialog.title" @submit.prevent="submitProjectNameDialog">
+        <header>
+          <h2>{{ projectNameDialog.title }}</h2>
+          <button class="icon-only-button" type="button" title="关闭" @click="cancelProjectNameDialog">
+            <X :size="14" />
+          </button>
+        </header>
+        <input
+          v-model="projectNameDialog.value"
+          autofocus
+          placeholder="输入名称"
+          @input="projectNameDialog.error = ''"
+          @keydown.esc.prevent="cancelProjectNameDialog"
+        />
+        <p v-if="projectNameDialog.error" class="project-name-error">{{ projectNameDialog.error }}</p>
+        <footer>
+          <button class="icon-button" type="button" @click="cancelProjectNameDialog">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button class="icon-button primary" type="submit">
+            <Check :size="14" />
+            <span>确认</span>
+          </button>
+        </footer>
+      </form>
+    </div>
+
+    <div v-if="projectCloseDialog" class="modal-backdrop" @click.self="cancelProjectCloseDialog">
+      <section class="project-unsaved-modal" role="dialog" aria-modal="true" aria-label="保存未保存的文件">
+        <header>
+          <h2>保存未保存的文件？</h2>
+          <button
+            class="icon-only-button"
+            type="button"
+            title="关闭"
+            :disabled="projectCloseDialog.saving"
+            @click="cancelProjectCloseDialog"
+          >
+            <X :size="14" />
+          </button>
+        </header>
+        <p>
+          <strong>{{ projectCloseDialog.name }}</strong> 有未保存的修改。关闭前要保存吗？
+        </p>
+        <p class="project-unsaved-path">{{ projectCloseDialog.path }}</p>
+        <p v-if="projectCloseDialog.error" class="project-name-error">{{ projectCloseDialog.error }}</p>
+        <footer>
+          <button class="icon-button danger" type="button" :disabled="projectCloseDialog.saving" @click="discardAndCloseProjectFile">
+            <Trash2 :size="14" />
+            <span>不保存</span>
+          </button>
+          <button class="icon-button" type="button" :disabled="projectCloseDialog.saving" @click="cancelProjectCloseDialog">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button class="icon-button primary" type="button" :disabled="projectCloseDialog.saving" @click="saveAndCloseProjectFile">
+            <Check :size="14" />
+            <span>{{ projectCloseDialog.saving ? "保存中" : "保存文件" }}</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div
+      v-if="projectFileContextMenu"
+      class="context-menu project-file-menu"
+      :style="{ left: `${projectFileContextMenu.x}px`, top: `${projectFileContextMenu.y}px` }"
+      @click.stop
+    >
+      <button v-if="canCreateInProjectContext(projectFileContextMenu.file)" @click="createProjectFileFromContext(projectFileContextMenu.file)">
+        <span>新建文件</span>
+      </button>
+      <button v-if="canCreateInProjectContext(projectFileContextMenu.file)" @click="createProjectDirectoryFromContext(projectFileContextMenu.file)">
+        <span>新建文件夹</span>
+      </button>
+      <div v-if="canCreateInProjectContext(projectFileContextMenu.file) || canModifyProjectEntry(projectFileContextMenu.file)" class="context-menu-separator" />
+      <button v-if="canModifyProjectEntry(projectFileContextMenu.file) && projectFileContextMenu.file" @click="cutProjectEntry(projectFileContextMenu.file)">
+        <span>剪切</span>
+      </button>
+      <button v-if="canModifyProjectEntry(projectFileContextMenu.file) && projectFileContextMenu.file" @click="copyProjectEntryToInternalClipboard(projectFileContextMenu.file)">
+        <span>复制</span>
+      </button>
+      <button v-if="canCreateInProjectContext(projectFileContextMenu.file)" :disabled="!canPasteProjectEntry(projectFileContextMenu.file)" @click="pasteProjectEntryToContext(projectFileContextMenu.file)">
+        <span>粘贴</span>
+        <small>{{ projectFileClipboard ? (projectFileClipboard.mode === "cut" ? "移动" : "复制") : "无内容" }}</small>
+      </button>
+      <div v-if="projectFileContextMenu.file && (canModifyProjectEntry(projectFileContextMenu.file) || canPasteProjectEntry(projectFileContextMenu.file))" class="context-menu-separator" />
+      <button v-if="projectFileContextMenu.file" @click="copyProjectAbsolutePath(projectFileContextMenu.file)">
+        <span>复制路径</span>
+      </button>
+      <button v-if="projectFileContextMenu.file" @click="copyProjectRelativePath(projectFileContextMenu.file)">
+        <span>复制相对路径</span>
+      </button>
+      <div v-if="canModifyProjectEntry(projectFileContextMenu.file)" class="context-menu-separator" />
+      <button v-if="canModifyProjectEntry(projectFileContextMenu.file) && projectFileContextMenu.file" @click="renameProjectEntryFromContext(projectFileContextMenu.file)">
+        <span>重命名</span>
+      </button>
+      <button v-if="canModifyProjectEntry(projectFileContextMenu.file) && projectFileContextMenu.file" @click="deleteProjectEntryFromContext(projectFileContextMenu.file)">
+        <span>删除</span>
+      </button>
+      <div v-if="projectFileContextMenu.file && !projectFileContextMenu.file.directory" class="context-menu-separator" />
+      <button v-if="projectFileContextMenu.file && !projectFileContextMenu.file.directory" @click="openProjectEntryLog(projectFileContextMenu.file)">
+        <span>查看变更日志</span>
+      </button>
+    </div>
+
+    <div
+      v-if="logFileContextMenu"
+      class="context-menu log-file-menu"
+      :style="{ left: `${logFileContextMenu.x}px`, top: `${logFileContextMenu.y}px` }"
+      @click.stop
+    >
+      <button @click="showCommitFileDiff(logFileContextMenu.row)">
+        <span>显示差异</span>
+        <small>⌘D</small>
+      </button>
+      <button @click="showCommitFileDiff(logFileContextMenu.row)">
+        <span>在新标签页中显示差异</span>
+      </button>
+      <div class="context-menu-separator" />
+      <button @click="showCommitFileDiff(logFileContextMenu.row, 'worktree')">
+        <span>与本地比较</span>
+      </button>
+      <button @click="showCommitFileDiff(logFileContextMenu.row, 'parent-worktree')">
+        <span>将之前版本与本地端比较</span>
+      </button>
+      <div class="context-menu-separator" />
+      <button disabled>
+        <span>编辑来源</span>
+        <small>⌘↓</small>
+      </button>
+      <button disabled>
+        <span>开启储存库版本</span>
+      </button>
+      <div class="context-menu-separator" />
+      <button @click="revertLogFileChange(logFileContextMenu.row)">
+        <span>还原选取的变更</span>
+      </button>
+      <button @click="cherryPickLogFile(logFileContextMenu.row)">
+        <span>Cherry-pick 所选变更</span>
+      </button>
+      <button disabled>
+        <span>将选取的变更提取到个别提交...</span>
+      </button>
+      <button disabled>
+        <span>搁弃所选变更</span>
+      </button>
+      <div class="context-menu-separator" />
+      <button @click="createPatchFromLogFile(logFileContextMenu.row)">
+        <span>建立修补程式...</span>
+      </button>
+      <button @click="cherryPickLogFile(logFileContextMenu.row)">
+        <span>从修订版本获取</span>
+      </button>
+      <button @click="showLogFileHistory(logFileContextMenu.row)">
+        <span>截至此处的历程记录</span>
+      </button>
+      <button @click="showCommitFileDiff(logFileContextMenu.row)">
+        <span>显示对父项的变更</span>
+      </button>
+    </div>
   </div>
 </template>
 
@@ -3652,6 +5044,67 @@ button:disabled {
   background: #f6f7f3;
 }
 
+.context-menu {
+  position: fixed;
+  z-index: 80;
+  display: grid;
+  gap: 2px;
+  width: 260px;
+  padding: 6px;
+  border: 1px solid #bdc8c1;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 18px 48px rgba(34, 48, 42, 0.2);
+}
+
+.context-menu button {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 26px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 6px;
+  color: #25312b;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+}
+
+.context-menu button:hover:not(:disabled) {
+  color: #ffffff;
+  background: #3f6ea5;
+}
+
+.context-menu button:disabled {
+  color: #a0aaa4;
+  cursor: default;
+}
+
+.context-menu button span,
+.context-menu button small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.context-menu button small {
+  color: #7a867d;
+  font-size: 11px;
+}
+
+.context-menu button:hover:not(:disabled) small {
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 3px;
+  background: #e3e8e4;
+}
+
 .tool-button,
 .icon-button,
 .commit-button,
@@ -3676,6 +5129,7 @@ button:disabled {
 }
 
 .tool-button.primary,
+.icon-button.primary,
 .commit-button {
   border-color: #5b8fd7;
   color: #ffffff;
@@ -5085,24 +6539,83 @@ button:disabled {
 }
 
 .log-ref-list {
+  display: grid;
+  align-content: start;
+  gap: 2px;
   min-height: 0;
   overflow: auto;
   padding: 8px;
 }
 
+.log-ref-toggle {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: #627168;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.log-ref-toggle.remote-root {
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
+  padding-left: 20px;
+}
+
+.log-ref-toggle:hover {
+  background: #f0f4f1;
+}
+
+.log-ref-toggle span,
+.log-ref-toggle small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-ref-toggle small {
+  color: #7a867d;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.log-ref-children,
 .log-ref-row {
   display: grid;
+}
+
+.log-ref-children {
+  gap: 1px;
+}
+
+.log-ref-row {
   grid-template-columns: 18px minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   width: 100%;
-  min-height: 34px;
+  min-height: 28px;
   padding: 4px 8px;
   border: 1px solid transparent;
   border-radius: 7px;
   color: #25312b;
   background: transparent;
   text-align: left;
+}
+
+.log-ref-row.local,
+.log-ref-row.tag-ref {
+  padding-left: 26px;
+}
+
+.log-ref-row.remote {
+  padding-left: 44px;
 }
 
 .log-ref-row:hover,
@@ -5116,6 +6629,14 @@ button:disabled {
 
 .log-ref-row.current .branch-dot {
   background: #d0a044;
+}
+
+.log-ref-row.current:not(.active) {
+  background: #f0f2f4;
+}
+
+.log-ref-row.current > svg {
+  color: #d0a044;
 }
 
 .log-ref-row span {
@@ -5165,6 +6686,294 @@ button:disabled {
   transform: rotate(45deg);
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  padding: 28px;
+  background: rgba(24, 31, 27, 0.28);
+}
+
+.log-file-picker-modal {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  gap: 10px;
+  width: min(680px, calc(100vw - 56px));
+  height: min(720px, calc(100vh - 56px));
+  min-height: 420px;
+  padding: 14px;
+  border: 1px solid #cbd5cf;
+  border-radius: 8px;
+  box-shadow: 0 24px 64px rgba(31, 47, 39, 0.24);
+  background: #fbfcfa;
+}
+
+.project-name-modal,
+.project-unsaved-modal {
+  display: grid;
+  gap: 12px;
+  width: min(420px, calc(100vw - 56px));
+  padding: 14px;
+  border: 1px solid #cbd5cf;
+  border-radius: 8px;
+  box-shadow: 0 24px 64px rgba(31, 47, 39, 0.24);
+  background: #fbfcfa;
+}
+
+.project-name-modal header,
+.project-name-modal footer,
+.project-unsaved-modal header,
+.project-unsaved-modal footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-name-modal h2,
+.project-unsaved-modal h2 {
+  margin: 0;
+  color: #26312b;
+  font-size: 15px;
+}
+
+.project-name-modal input {
+  width: 100%;
+}
+
+.project-name-error {
+  margin: -4px 0 0;
+  color: #b64242;
+  font-size: 12px;
+}
+
+.project-name-modal footer {
+  justify-content: flex-end;
+}
+
+.project-unsaved-modal p {
+  margin: 0;
+  color: #4b574f;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.project-unsaved-modal strong {
+  color: #25312b;
+}
+
+.project-unsaved-path {
+  overflow: hidden;
+  padding: 8px 10px;
+  border: 1px solid #dce2dd;
+  border-radius: 6px;
+  color: #68756d;
+  background: #f3f6f2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-unsaved-modal footer {
+  justify-content: flex-end;
+}
+
+.log-file-picker-head,
+.log-file-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.log-file-picker-search {
+  width: 100%;
+}
+
+.log-file-picker-tree {
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid #dce2dd;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.log-file-picker-row {
+  display: grid;
+  grid-template-columns: 14px 16px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px 0 6px;
+  border: 0;
+  border-radius: 6px;
+  color: #26312c;
+  background: transparent;
+  text-align: left;
+}
+
+.log-file-picker-row:hover,
+.log-file-picker-row.selected {
+  background: #e8f0fb;
+}
+
+.log-file-picker-row.directory {
+  color: #4f5e56;
+  font-weight: 700;
+}
+
+.log-file-picker-row.root {
+  min-height: 30px;
+  margin-bottom: 2px;
+  color: #233228;
+  background: #e7edf8;
+  font-weight: 800;
+}
+
+.log-file-picker-footer {
+  justify-content: flex-end;
+}
+
+.log-file-picker-footer > span {
+  margin-right: auto;
+  color: #627168;
+  font-size: 12px;
+}
+
+.log-tab-workspace {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: #ffffff;
+}
+
+.log-workspace-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  min-height: 38px;
+  overflow-x: auto;
+  border-bottom: 1px solid #dce2dd;
+  background: #f3f5f2;
+}
+
+.log-root-tab,
+.log-workspace-tab {
+  position: relative;
+  flex: 0 0 auto;
+  min-width: 118px;
+  max-width: 260px;
+  border-right: 1px solid #dce2dd;
+  color: #445149;
+  background: #edf1ec;
+}
+
+.log-root-tab {
+  display: inline-grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border-top: 0;
+  border-bottom: 0;
+  border-left: 0;
+  text-align: left;
+}
+
+.log-root-tab::before,
+.log-workspace-tab::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  bottom: 0;
+  width: 42px;
+  height: 2px;
+  background: transparent;
+}
+
+.log-root-tab.active,
+.log-workspace-tab.active {
+  color: #202b26;
+  background: #fbfcfa;
+}
+
+.log-root-tab.active::before,
+.log-workspace-tab.active::before {
+  background: #4c82d9;
+}
+
+.log-workspace-tab {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: stretch;
+}
+
+.log-workspace-tab.loading::before {
+  background: #b89445;
+}
+
+.log-workspace-tab.error::before {
+  background: #d94f43;
+}
+
+.log-workspace-tab-select,
+.log-workspace-tab-close {
+  min-width: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+}
+
+.log-workspace-tab-select {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 10px;
+  text-align: left;
+}
+
+.log-root-tab span,
+.log-workspace-tab-select span,
+.log-workspace-tab-select small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.log-workspace-tab-select small {
+  color: #728078;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 10px;
+}
+
+.log-workspace-tab-close {
+  display: grid;
+  place-items: center;
+  color: #7a877f;
+}
+
+.log-root-tab:hover,
+.log-workspace-tab:hover,
+.log-workspace-tab-close:hover {
+  background: #e4e9e3;
+}
+
+.log-diff-tab-pane {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: #ffffff;
+}
+
 .log-workbench {
   display: grid;
   grid-template-columns: minmax(440px, 1fr) minmax(280px, 330px);
@@ -5184,7 +6993,7 @@ button:disabled {
 
 .log-topbar {
   display: grid;
-  grid-template-columns: minmax(160px, 1.2fr) minmax(82px, 0.55fr) minmax(82px, 0.55fr) auto 34px;
+  grid-template-columns: minmax(160px, 1.2fr) minmax(112px, 0.62fr) minmax(112px, 0.62fr) auto 34px;
   align-items: center;
   gap: 7px;
   flex: 0 0 48px;
@@ -5225,6 +7034,144 @@ button:disabled {
   border: 1px solid #c5cec8;
   border-radius: 7px;
   background: #ffffff;
+}
+
+.log-filter-picker {
+  position: relative;
+  min-width: 0;
+}
+
+.log-filter-button {
+  display: inline-grid;
+  grid-template-columns: 16px minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 32px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid #c5cec8;
+  border-radius: 7px;
+  color: #627168;
+  background: #ffffff;
+  text-align: left;
+}
+
+.log-filter-button.active {
+  border-color: #9db8dc;
+  color: #365f91;
+  background: #e9f0f7;
+}
+
+.log-filter-button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.log-filter-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 25;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  width: min(300px, 62vw);
+  max-height: 320px;
+  border: 1px solid #cbd5cf;
+  border-radius: 8px;
+  box-shadow: 0 18px 38px rgba(31, 47, 39, 0.16);
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.log-filter-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 38px;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid #e6ebe7;
+  color: #25312b;
+}
+
+.log-filter-popover-head strong {
+  font-size: 12px;
+}
+
+.log-filter-options {
+  display: grid;
+  align-content: start;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+
+.log-check-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 3px 7px;
+  border: 0;
+  border-radius: 6px;
+  color: #26312c;
+  background: transparent;
+  text-align: left;
+}
+
+.log-check-row:hover,
+.log-check-row.selected {
+  background: #eef4ef;
+}
+
+.log-checkmark,
+.log-file-picker-check {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  border: 1px solid #c5cec8;
+  border-radius: 4px;
+  color: #ffffff;
+}
+
+.log-check-row.selected .log-checkmark,
+.log-file-picker-row.selected .log-file-picker-check {
+  border-color: #3f6ea5;
+  background: #3f6ea5;
+}
+
+.log-check-label {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.log-check-label strong,
+.log-check-label small,
+.log-check-row > small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-check-label strong {
+  font-size: 12px;
+}
+
+.log-check-label small,
+.log-check-row > small,
+.log-picker-empty {
+  color: #728078;
+  font-size: 11px;
+}
+
+.log-picker-empty {
+  padding: 10px 8px;
 }
 
 .log-filter-chip {
@@ -5420,13 +7367,14 @@ button:disabled {
 
 .log-file-tree-row {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 14px 18px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   width: 100%;
-  min-height: 25px;
-  padding: 0 10px;
+  min-height: 26px;
+  padding: 0 8px 0 6px;
   border: 0;
+  border-radius: 6px;
   color: #25312b;
   background: transparent;
   text-align: left;
@@ -5439,18 +7387,75 @@ button:disabled {
 
 .log-file-tree-row.directory {
   color: #4c5a52;
-  cursor: default;
+  font-weight: 700;
 }
 
-.log-file-tree-row span {
+.log-file-disclosure {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  color: #7a877f;
+}
+
+.log-file-name {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.log-file-name strong,
+.log-file-name small,
+.log-file-tree-row > small {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.log-file-name strong {
+  color: inherit;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.log-file-name small {
+  color: #7a867d;
+  font-size: 10px;
+}
+
+.log-file-tree-row.directory .log-file-name strong {
+  font-family: inherit;
+  font-size: 12px;
+}
+
 .log-file-tree-row small {
   color: #6b766f;
   font-size: 10px;
+}
+
+.log-file-tree-row.status-added .log-file-name strong {
+  color: #237044;
+}
+
+.log-file-tree-row.status-modified .log-file-name strong,
+.log-file-tree-row.status-typechange .log-file-name strong {
+  color: #8b6500;
+}
+
+.log-file-tree-row.status-deleted .log-file-name strong {
+  color: #b7332c;
+}
+
+.log-file-tree-row.status-renamed .log-file-name strong {
+  color: #3463a6;
+}
+
+.log-file-tree-row.status-copied .log-file-name strong {
+  color: #28736c;
+}
+
+.log-file-tree-row.status-conflicted .log-file-name strong {
+  color: #b64200;
 }
 
 .log-info-panel {
@@ -6248,7 +8253,19 @@ button:disabled {
   text-align: left;
 }
 
-.project-tab-select span {
+.project-tab-select.dirty {
+  grid-template-columns: 16px 8px minmax(0, 1fr);
+}
+
+.project-tab-dirty {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #3f7fdb;
+  box-shadow: 0 0 0 2px rgba(63, 127, 219, 0.12);
+}
+
+.project-tab-title {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -6288,6 +8305,129 @@ button:disabled {
   font-size: 12px;
   line-height: 18px;
   tab-size: 2;
+}
+
+.project-edit-pane {
+  position: relative;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.project-editor-render {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  color: #25312b;
+  background: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 2;
+  pointer-events: none;
+}
+
+.project-editor-render-content {
+  display: block;
+  min-width: max-content;
+  padding: 12px 0;
+  transform: translateY(var(--project-editor-scroll-top-offset));
+}
+
+.project-render-line {
+  display: grid;
+  grid-template-columns: 46px max-content;
+  min-height: 18px;
+  white-space: pre;
+}
+
+.project-render-line .line-number {
+  position: relative;
+  z-index: 1;
+  background: #ffffff;
+}
+
+.project-render-code {
+  display: inline-block;
+  min-width: 100%;
+  padding: 0 18px 0 0;
+  white-space: pre;
+  transform: translateX(var(--project-editor-scroll-left-offset));
+}
+
+.project-editor-textarea {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 12px 14px 12px 46px;
+  border: 0;
+  border-radius: 0;
+  outline: none;
+  resize: none;
+  color: transparent;
+  caret-color: #25312b;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 2;
+  white-space: pre;
+  overflow: auto;
+  -webkit-text-fill-color: transparent;
+}
+
+.project-editor-change-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.project-change-marker {
+  position: absolute;
+  left: 13px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  min-height: 10px;
+  padding: 0;
+  border: 0;
+  border-left: 3px solid #4c82d9;
+  border-radius: 3px;
+  color: #2f5f9f;
+  background: rgba(76, 130, 217, 0.16);
+  pointer-events: auto;
+}
+
+.project-change-marker:hover,
+.project-change-marker.expanded {
+  background: rgba(76, 130, 217, 0.28);
+}
+
+.project-change-marker.added {
+  border-left-color: #3d8f55;
+  color: #2f7b43;
+  background: rgba(61, 143, 85, 0.16);
+}
+
+.project-change-marker.added:hover,
+.project-change-marker.added.expanded {
+  background: rgba(61, 143, 85, 0.28);
+}
+
+.project-change-marker.deleted {
+  border-left-color: #df3f36;
+  color: #b13029;
+  background: rgba(223, 63, 54, 0.16);
+}
+
+.project-change-marker.deleted:hover,
+.project-change-marker.deleted.expanded {
+  background: rgba(223, 63, 54, 0.28);
 }
 
 .diff-line,
@@ -6390,6 +8530,19 @@ button:disabled {
   border-top: 1px solid #f0b5ae;
   border-bottom: 1px solid #f0b5ae;
   background: #fffaf8;
+}
+
+.project-original-popover {
+  position: absolute;
+  right: 16px;
+  left: 38px;
+  z-index: 4;
+  grid-template-columns: 58px minmax(0, 1fr);
+  max-height: min(280px, calc(100% - 16px));
+  overflow: auto;
+  border: 1px solid #f0b5ae;
+  box-shadow: 0 14px 34px rgba(35, 28, 24, 0.18);
+  pointer-events: auto;
 }
 
 .project-original-gutter {
@@ -6624,6 +8777,33 @@ html[data-theme="dark"] .layout-reset:hover {
   background: #313335;
 }
 
+html[data-theme="dark"] .context-menu {
+  border-color: #4e5258;
+  background: #2b2d30;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+}
+
+html[data-theme="dark"] .context-menu button {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .context-menu button:hover:not(:disabled) {
+  color: #ffffff;
+  background: #3f6ea5;
+}
+
+html[data-theme="dark"] .context-menu button:disabled {
+  color: #696e77;
+}
+
+html[data-theme="dark"] .context-menu button small {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .context-menu-separator {
+  background: #3c3f41;
+}
+
 html[data-theme="dark"] .tool-button,
 html[data-theme="dark"] .icon-button,
 html[data-theme="dark"] .commit-button,
@@ -6648,6 +8828,7 @@ html[data-theme="dark"] .add-project-empty:hover:not(:disabled) {
 }
 
 html[data-theme="dark"] .tool-button.primary,
+html[data-theme="dark"] .icon-button.primary,
 html[data-theme="dark"] .commit-button,
 html[data-theme="dark"] .segmented button.active {
   border-color: #5b8fd7;
@@ -6656,6 +8837,7 @@ html[data-theme="dark"] .segmented button.active {
 }
 
 html[data-theme="dark"] .tool-button.primary:hover:not(:disabled),
+html[data-theme="dark"] .icon-button.primary:hover:not(:disabled),
 html[data-theme="dark"] .commit-button:hover:not(:disabled),
 html[data-theme="dark"] .segmented button.active:hover:not(:disabled) {
   border-color: #75a7f0;
@@ -6859,6 +9041,11 @@ html[data-theme="dark"] .project-tab {
 html[data-theme="dark"] .project-tab.active {
   color: #dfe1e5;
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-tab-dirty {
+  background: #78a8ff;
+  box-shadow: 0 0 0 2px rgba(120, 168, 255, 0.16);
 }
 
 html[data-theme="dark"] .project-tab:hover,
@@ -7210,9 +9397,40 @@ html[data-theme="dark"] .commit-refs em {
   background: #28354b;
 }
 
+html[data-theme="dark"] .log-tab-workspace,
+html[data-theme="dark"] .log-diff-tab-pane,
 html[data-theme="dark"] .log-workbench,
 html[data-theme="dark"] .log-commit-list {
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-workspace-tabs {
+  border-bottom-color: #3c3f41;
+  background: #252629;
+}
+
+html[data-theme="dark"] .log-root-tab,
+html[data-theme="dark"] .log-workspace-tab {
+  border-right-color: #3c3f41;
+  color: #a9b7c6;
+  background: #2b2d30;
+}
+
+html[data-theme="dark"] .log-root-tab.active,
+html[data-theme="dark"] .log-workspace-tab.active {
+  color: #dfe1e5;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-root-tab:hover,
+html[data-theme="dark"] .log-workspace-tab:hover,
+html[data-theme="dark"] .log-workspace-tab-close:hover {
+  background: #313335;
+}
+
+html[data-theme="dark"] .log-workspace-tab-select small,
+html[data-theme="dark"] .log-workspace-tab-close {
+  color: #8f949b;
 }
 
 html[data-theme="dark"] .log-commit-panel,
@@ -7229,8 +9447,47 @@ html[data-theme="dark"] .log-detail-panel {
   background: #2b2d30;
 }
 
+html[data-theme="dark"] .modal-backdrop {
+  background: rgba(0, 0, 0, 0.46);
+}
+
+html[data-theme="dark"] .log-file-picker-modal,
+html[data-theme="dark"] .project-name-modal,
+html[data-theme="dark"] .project-unsaved-modal,
+html[data-theme="dark"] .log-filter-popover {
+  border-color: #4e5258;
+  background: #2b2d30;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.46);
+}
+
+html[data-theme="dark"] .project-name-modal h2,
+html[data-theme="dark"] .project-unsaved-modal h2,
+html[data-theme="dark"] .project-unsaved-modal strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .project-unsaved-modal p {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .project-unsaved-path {
+  border-color: #3c3f41;
+  color: #8f949b;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-name-error {
+  color: #ff8a8a;
+}
+
+html[data-theme="dark"] .log-file-picker-tree {
+  border-color: #3c3f41;
+  background: #1e1f22;
+}
+
 html[data-theme="dark"] .log-search-field,
 html[data-theme="dark"] .log-mini-filter,
+html[data-theme="dark"] .log-filter-button,
 html[data-theme="dark"] .log-filter-chip,
 html[data-theme="dark"] .log-diff-preview .diff-scroller {
   border-color: #4e5258;
@@ -7243,6 +9500,12 @@ html[data-theme="dark"] .log-mini-filter {
   color: #dfe1e5;
 }
 
+html[data-theme="dark"] .log-filter-button.active {
+  border-color: #4c82d9;
+  color: #a9c7ff;
+  background: #28354b;
+}
+
 html[data-theme="dark"] .log-filter-chip.active {
   border-color: #4c82d9;
   color: #a9c7ff;
@@ -7250,16 +9513,27 @@ html[data-theme="dark"] .log-filter-chip.active {
 }
 
 html[data-theme="dark"] .log-ref-row,
+html[data-theme="dark"] .log-ref-toggle,
 html[data-theme="dark"] .log-file-tree-row,
+html[data-theme="dark"] .log-file-picker-row,
+html[data-theme="dark"] .log-check-row,
 html[data-theme="dark"] .log-commit-row {
   color: #c9d1d9;
+}
+
+html[data-theme="dark"] .log-ref-toggle:hover {
+  background: #313335;
 }
 
 html[data-theme="dark"] .log-ref-row:hover,
 html[data-theme="dark"] .log-ref-row.active,
 html[data-theme="dark"] .log-commit-row:hover,
 html[data-theme="dark"] .log-file-tree-row:hover,
-html[data-theme="dark"] .log-file-tree-row.selected {
+html[data-theme="dark"] .log-file-tree-row.selected,
+html[data-theme="dark"] .log-file-picker-row:hover,
+html[data-theme="dark"] .log-file-picker-row.selected,
+html[data-theme="dark"] .log-check-row:hover,
+html[data-theme="dark"] .log-check-row.selected {
   background: #313335;
 }
 
@@ -7268,30 +9542,87 @@ html[data-theme="dark"] .log-diff-preview .diff-scroller {
   border-color: #4c82d9;
 }
 
+html[data-theme="dark"] .log-ref-row.current:not(.active) {
+  background: #33363a;
+}
+
 html[data-theme="dark"] .log-commit-row.active {
   background: #3a3f47;
 }
 
 html[data-theme="dark"] .log-subject strong,
 html[data-theme="dark"] .log-info-body h2,
-html[data-theme="dark"] .log-info-body p strong {
+html[data-theme="dark"] .log-info-body p strong,
+html[data-theme="dark"] .log-check-label strong,
+html[data-theme="dark"] .log-filter-popover-head {
   color: #f0f2f5;
 }
 
 html[data-theme="dark"] .log-author,
 html[data-theme="dark"] .log-date,
 html[data-theme="dark"] .log-ref-row small,
+html[data-theme="dark"] .log-ref-toggle,
+html[data-theme="dark"] .log-ref-toggle small,
 html[data-theme="dark"] .log-ref-group-title,
 html[data-theme="dark"] .log-ref-group-title small,
 html[data-theme="dark"] .log-panel-header small,
 html[data-theme="dark"] .log-file-tree-row small,
+html[data-theme="dark"] .log-file-picker-footer > span,
+html[data-theme="dark"] .log-check-label small,
+html[data-theme="dark"] .log-check-row > small,
+html[data-theme="dark"] .log-picker-empty,
 html[data-theme="dark"] .log-info-body p,
 html[data-theme="dark"] .log-diff-preview summary {
   color: #8f949b;
 }
 
-html[data-theme="dark"] .log-file-tree-row.directory {
+html[data-theme="dark"] .log-file-tree-row.directory,
+html[data-theme="dark"] .log-file-picker-row.directory {
   color: #dfe1e5;
+}
+
+html[data-theme="dark"] .log-file-disclosure,
+html[data-theme="dark"] .log-file-name small {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .log-filter-popover-head {
+  border-bottom-color: #3c3f41;
+}
+
+html[data-theme="dark"] .log-checkmark,
+html[data-theme="dark"] .log-file-picker-check {
+  border-color: #4e5258;
+}
+
+html[data-theme="dark"] .log-file-picker-row.root {
+  color: #dfe1e5;
+  background: #28354b;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-added .log-file-name strong {
+  color: #6dcc8e;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-modified .log-file-name strong,
+html[data-theme="dark"] .log-file-tree-row.status-typechange .log-file-name strong {
+  color: #d7b25f;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-deleted .log-file-name strong {
+  color: #ef8379;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-renamed .log-file-name strong {
+  color: #8fb7ff;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-copied .log-file-name strong {
+  color: #65c7bd;
+}
+
+html[data-theme="dark"] .log-file-tree-row.status-conflicted .log-file-name strong {
+  color: #ee9c5a;
 }
 
 html[data-theme="dark"] .log-graph-node {
@@ -7433,6 +9764,55 @@ html[data-theme="dark"] .project-lines {
   background: #1e1f22;
 }
 
+html[data-theme="dark"] .project-editor-render {
+  color: #c9d1d9;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-render-line .line-number {
+  background: #252629;
+}
+
+html[data-theme="dark"] .project-editor-textarea {
+  color: transparent;
+  caret-color: #dfe1e5;
+  background: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+html[data-theme="dark"] .project-change-marker {
+  border-left-color: #6ea2f2;
+  color: #a9c7ff;
+  background: rgba(76, 130, 217, 0.22);
+}
+
+html[data-theme="dark"] .project-change-marker:hover,
+html[data-theme="dark"] .project-change-marker.expanded {
+  background: rgba(76, 130, 217, 0.36);
+}
+
+html[data-theme="dark"] .project-change-marker.added {
+  border-left-color: #6a8759;
+  color: #9bc27c;
+  background: rgba(106, 135, 89, 0.22);
+}
+
+html[data-theme="dark"] .project-change-marker.added:hover,
+html[data-theme="dark"] .project-change-marker.added.expanded {
+  background: rgba(106, 135, 89, 0.36);
+}
+
+html[data-theme="dark"] .project-change-marker.deleted {
+  border-left-color: #e05b55;
+  color: #ee8a84;
+  background: rgba(224, 91, 85, 0.22);
+}
+
+html[data-theme="dark"] .project-change-marker.deleted:hover,
+html[data-theme="dark"] .project-change-marker.deleted.expanded {
+  background: rgba(224, 91, 85, 0.36);
+}
+
 html[data-theme="dark"] .diff-line,
 html[data-theme="dark"] .project-line,
 html[data-theme="dark"] .project-original-line {
@@ -7515,6 +9895,10 @@ html[data-theme="dark"] .project-original-panel {
   grid-template-columns: 66px minmax(460px, 1fr);
   border-color: #5b3634;
   background: #251f1f;
+}
+
+html[data-theme="dark"] .project-original-popover {
+  grid-template-columns: 66px minmax(0, 1fr);
 }
 
 html[data-theme="dark"] .project-original-gutter {

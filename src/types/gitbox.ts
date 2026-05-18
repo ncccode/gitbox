@@ -116,6 +116,8 @@ export interface CommitDetails {
   diff: string;
 }
 
+export type CommitFileDiffMode = "commit" | "worktree" | "parent-worktree";
+
 export interface BranchInfo {
   name: string;
   fullName: string;
@@ -228,6 +230,12 @@ export interface ProjectFileEntry {
   depth: number;
   directory: boolean;
   size?: number | null;
+}
+
+export interface ProjectFileMutation {
+  path: string;
+  directory: boolean;
+  message: string;
 }
 
 export interface ProjectFileContent {

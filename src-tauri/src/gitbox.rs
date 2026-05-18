@@ -2,7 +2,7 @@ use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusO
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -327,6 +327,14 @@ pub struct ProjectFileEntry {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectFileMutation {
+    pub path: String,
+    pub directory: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectFileContent {
     pub path: String,
     pub content: Option<String>,
@@ -420,6 +428,204 @@ pub fn read_project_file_core(
         content,
         size: metadata.len(),
     })
+}
+
+pub fn save_project_file_core(
+    path: &str,
+    file_path: String,
+    content: String,
+) -> Result<ProjectFileContent, GitboxError> {
+    let repo = Repository::discover(path)?;
+    let root = fs::canonicalize(repo_workdir(&repo)?)?;
+    let relative = clean_project_relative_path(file_path)?;
+    let target = fs::canonicalize(root.join(&relative))?;
+
+    if !target.starts_with(&root) {
+        return Err(GitboxError::Message("文件不在当前项目内".to_string()));
+    }
+    if fs::metadata(&target)?.is_dir() {
+        return Err(GitboxError::Message("请选择文件而不是目录".to_string()));
+    }
+
+    fs::write(&target, content.as_bytes())?;
+    let metadata = fs::metadata(&target)?;
+    Ok(ProjectFileContent {
+        path: repo_path_string(&relative),
+        binary: false,
+        content: Some(content),
+        size: metadata.len(),
+    })
+}
+
+pub fn create_project_file_core(
+    path: &str,
+    directory_path: Option<String>,
+    name: String,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let parent = resolve_project_directory(&root, directory_path)?;
+    let relative = clean_project_child_path(name, "请输入文件名")?;
+    let target = parent.join(&relative);
+    if target.exists() {
+        return Err(GitboxError::Message("同名文件或文件夹已存在".to_string()));
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::File::create(&target)?;
+    project_file_mutation(
+        &root,
+        &target,
+        false,
+        format!("已新建文件 {}", repo_path_string(&relative)),
+    )
+}
+
+pub fn create_project_directory_core(
+    path: &str,
+    directory_path: Option<String>,
+    name: String,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let parent = resolve_project_directory(&root, directory_path)?;
+    let relative = clean_project_child_path(name, "请输入文件夹名")?;
+    let target = parent.join(&relative);
+    if target.exists() {
+        return Err(GitboxError::Message("同名文件或文件夹已存在".to_string()));
+    }
+
+    fs::create_dir_all(&target)?;
+    project_file_mutation(
+        &root,
+        &target,
+        true,
+        format!("已新建文件夹 {}", repo_path_string(&relative)),
+    )
+}
+
+pub fn rename_project_entry_core(
+    path: &str,
+    file_path: String,
+    new_name: String,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let source = resolve_project_entry(&root, file_path)?;
+    let metadata = fs::metadata(&source)?;
+    let name = clean_project_entry_name(new_name)?;
+    let current_name = source
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .ok_or_else(|| GitboxError::Message("无法重命名项目根目录".to_string()))?;
+    if name == current_name {
+        return project_file_mutation(&root, &source, metadata.is_dir(), "名称未变化".to_string());
+    }
+
+    let parent = source
+        .parent()
+        .ok_or_else(|| GitboxError::Message("无法读取项目文件路径".to_string()))?;
+    let target = parent.join(&name);
+    if target.exists() {
+        return Err(GitboxError::Message("同名文件或文件夹已存在".to_string()));
+    }
+
+    fs::rename(&source, &target)?;
+    project_file_mutation(
+        &root,
+        &target,
+        metadata.is_dir(),
+        format!("已重命名为 {name}"),
+    )
+}
+
+pub fn delete_project_entry_core(
+    path: &str,
+    file_path: String,
+) -> Result<CommandResult, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let source = resolve_project_entry(&root, file_path)?;
+    let name = source
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "项目文件".to_string());
+    let metadata = fs::metadata(&source)?;
+
+    if metadata.is_dir() {
+        fs::remove_dir_all(&source)?;
+    } else {
+        fs::remove_file(&source)?;
+    }
+
+    Ok(CommandResult {
+        ok: true,
+        message: format!("已删除 {name}"),
+        output: String::new(),
+    })
+}
+
+pub fn copy_project_entry_core(
+    path: &str,
+    source_path: String,
+    target_directory_path: Option<String>,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let source = resolve_project_entry(&root, source_path)?;
+    let target_parent = resolve_project_directory(&root, target_directory_path)?;
+    let metadata = fs::metadata(&source)?;
+
+    if metadata.is_dir() && target_parent.starts_with(&source) {
+        return Err(GitboxError::Message(
+            "不能将文件夹复制到自身或子文件夹内".to_string(),
+        ));
+    }
+
+    let name = source
+        .file_name()
+        .ok_or_else(|| GitboxError::Message("无法复制项目根目录".to_string()))?;
+    let target = unique_project_copy_path(&target_parent.join(name), metadata.is_dir());
+    copy_project_entry_recursive(&source, &target)?;
+    project_file_mutation(
+        &root,
+        &target,
+        metadata.is_dir(),
+        format!("已复制 {}", name.to_string_lossy()),
+    )
+}
+
+pub fn move_project_entry_core(
+    path: &str,
+    source_path: String,
+    target_directory_path: Option<String>,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let root = project_workdir_root(path)?;
+    let source = resolve_project_entry(&root, source_path)?;
+    let target_parent = resolve_project_directory(&root, target_directory_path)?;
+    let metadata = fs::metadata(&source)?;
+
+    if metadata.is_dir() && target_parent.starts_with(&source) {
+        return Err(GitboxError::Message(
+            "不能将文件夹移动到自身或子文件夹内".to_string(),
+        ));
+    }
+
+    let name = source
+        .file_name()
+        .ok_or_else(|| GitboxError::Message("无法移动项目根目录".to_string()))?;
+    let target = target_parent.join(name);
+    if target == source {
+        return project_file_mutation(&root, &source, metadata.is_dir(), "位置未变化".to_string());
+    }
+    if target.exists() {
+        return Err(GitboxError::Message("目标位置已有同名项目".to_string()));
+    }
+
+    fs::rename(&source, &target)?;
+    project_file_mutation(
+        &root,
+        &target,
+        metadata.is_dir(),
+        format!("已移动 {}", name.to_string_lossy()),
+    )
 }
 
 pub fn init_repository_core(
@@ -1132,9 +1338,10 @@ pub fn list_commits_core(
     path: &str,
     limit: Option<usize>,
 ) -> Result<Vec<CommitSummary>, GitboxError> {
-    list_commits_filtered_core(path, limit, None, None, None, None)
+    list_commits_filtered_multi_core(path, limit, None, None, Vec::new(), Vec::new())
 }
 
+#[allow(dead_code)]
 pub fn list_commits_filtered_core(
     path: &str,
     limit: Option<usize>,
@@ -1143,15 +1350,28 @@ pub fn list_commits_filtered_core(
     author: Option<String>,
     path_filter: Option<String>,
 ) -> Result<Vec<CommitSummary>, GitboxError> {
+    let authors = clean_optional_args(author.into_iter());
+    let path_filters = clean_optional_args(path_filter.into_iter());
+    list_commits_filtered_multi_core(path, limit, branch, query, authors, path_filters)
+}
+
+pub fn list_commits_filtered_multi_core(
+    path: &str,
+    limit: Option<usize>,
+    branch: Option<String>,
+    query: Option<String>,
+    authors: Vec<String>,
+    path_filters: Vec<String>,
+) -> Result<Vec<CommitSummary>, GitboxError> {
     let repo = Repository::discover(path)?;
     let workdir = repo_workdir(&repo)?;
     let refs_by_oid = reference_labels(&repo)?;
     let max = limit.unwrap_or(80).clamp(1, 500);
     let query = clean_optional_arg(query);
-    let author = clean_optional_arg(author);
+    let authors = clean_optional_args(authors);
     let branch = clean_optional_arg(branch);
-    let path_filter = clean_optional_arg(path_filter);
-    let scan_limit = if query.is_some() || author.is_some() {
+    let path_filters = clean_optional_args(path_filters);
+    let scan_limit = if query.is_some() || !authors.is_empty() {
         (max * 8).clamp(max, 2500)
     } else {
         max
@@ -1171,10 +1391,12 @@ pub fn list_commits_filtered_core(
         args.push("--all".to_string());
     }
 
-    if let Some(path_filter) = path_filter.as_deref() {
-        let rel = normalize_repo_path(&repo, path_filter)?;
+    if !path_filters.is_empty() {
         args.push("--".to_string());
-        args.push(repo_path_string(&rel));
+        for path_filter in &path_filters {
+            let rel = normalize_repo_path(&repo, path_filter)?;
+            args.push(repo_path_string(&rel));
+        }
     }
 
     let raw = run_git_raw(&workdir, args, None)?;
@@ -1201,16 +1423,13 @@ pub fn list_commits_filtered_core(
         }
         let commit = repo.find_commit(oid)?;
         let refs = refs_by_oid.get(&oid).cloned().unwrap_or_default();
-        if !commit_matches_author(&commit, author.as_deref()) {
+        if !commit_matches_any_author(&commit, &authors) {
             continue;
         }
         if !commit_matches_query(&commit, &refs, query.as_deref()) {
             continue;
         }
-        commits.push(commit_summary(
-            &commit,
-            refs,
-        ));
+        commits.push(commit_summary(&commit, refs));
         if commits.len() >= max {
             break;
         }
@@ -1256,6 +1475,63 @@ pub fn commit_details_core(path: &str, oid: String) -> Result<CommitDetails, Git
         commit: commit_summary(&commit, refs_by_oid.get(&oid).cloned().unwrap_or_default()),
         files: parse_name_status(&files_output),
         diff,
+    })
+}
+
+pub fn commit_file_diff_core(
+    path: &str,
+    oid: String,
+    file_path: String,
+    mode: Option<String>,
+) -> Result<DiffResponse, GitboxError> {
+    let oid = clean_ref_input(oid, "请选择提交")?;
+    let repo = Repository::discover(path)?;
+    let workdir = repo_workdir(&repo)?;
+    let rel = normalize_repo_path(&repo, &file_path)?;
+    let pathspec = repo_path_string(&rel);
+    let diff_mode = mode.unwrap_or_else(|| "commit".to_string());
+
+    let args = match diff_mode.as_str() {
+        "commit" => vec![
+            "show".to_string(),
+            "--format=".to_string(),
+            "--find-renames".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            oid.clone(),
+            "--".to_string(),
+            pathspec.clone(),
+        ],
+        "worktree" => vec![
+            "diff".to_string(),
+            "--find-renames".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            oid.clone(),
+            "--".to_string(),
+            pathspec.clone(),
+        ],
+        "parent-worktree" => vec![
+            "diff".to_string(),
+            "--find-renames".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-color".to_string(),
+            parent_or_empty_tree(&repo, &oid)?,
+            "--".to_string(),
+            pathspec.clone(),
+        ],
+        _ => return Err(GitboxError::Message("不支持的文件差异比较方式".to_string())),
+    };
+
+    let text = run_git(&workdir, args, None)?;
+    Ok(DiffResponse {
+        path: Some(pathspec),
+        staged: false,
+        hunks: parse_diff_hunks(&text),
+        text,
     })
 }
 
@@ -1845,10 +2121,14 @@ pub fn rebase_advanced_core(
     let source_branch = clean_optional_arg(source_branch);
     let onto = clean_optional_arg(onto);
     if !root && target.is_none() {
-        return Err(GitboxError::Message("请选择变基目标或启用“从根提交”".to_string()));
+        return Err(GitboxError::Message(
+            "请选择变基目标或启用“从根提交”".to_string(),
+        ));
     }
     if onto.is_some() && target.is_none() {
-        return Err(GitboxError::Message("指定新基线时需要同时指定上游起点".to_string()));
+        return Err(GitboxError::Message(
+            "指定新基线时需要同时指定上游起点".to_string(),
+        ));
     }
 
     let mut args = vec!["rebase".to_string()];
@@ -2240,6 +2520,63 @@ pub fn cherry_pick_files_core(
     } else {
         Err(GitboxError::Message(raw.failure_message()))
     }
+}
+
+pub fn revert_commit_files_core(
+    path: &str,
+    oid: String,
+    files: Vec<String>,
+) -> Result<CommandResult, GitboxError> {
+    let oid = clean_ref_input(oid, "请选择要还原的提交")?;
+    if files.is_empty() {
+        return Err(GitboxError::Message("请选择要还原的文件".to_string()));
+    }
+
+    let repo = Repository::discover(path)?;
+    let workdir = repo_workdir(&repo)?;
+    let normalized_files = files
+        .iter()
+        .map(|file| normalize_repo_path(&repo, file).map(|path| repo_path_string(&path)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut show_args = vec![
+        "show".to_string(),
+        "--format=".to_string(),
+        "--find-renames".to_string(),
+        "--patch".to_string(),
+        "--no-ext-diff".to_string(),
+        "--no-color".to_string(),
+        oid.clone(),
+        "--".to_string(),
+    ];
+    show_args.extend(normalized_files);
+    let patch = run_git(&workdir, show_args, None)?;
+    if patch.trim().is_empty() {
+        return Err(GitboxError::Message(
+            "所选文件在该提交中没有可还原的变更".to_string(),
+        ));
+    }
+
+    let raw = run_git_raw(
+        &workdir,
+        vec![
+            "apply".to_string(),
+            "-R".to_string(),
+            "--3way".to_string(),
+            "--whitespace=nowarn".to_string(),
+            "-".to_string(),
+        ],
+        Some(&patch),
+    )?;
+    if raw.success {
+        return Ok(CommandResult {
+            ok: true,
+            message: format!("已还原 {} 的所选文件变更", short_ref(&oid)),
+            output: raw.combined_output(),
+        });
+    }
+
+    Err(GitboxError::Message(raw.failure_message()))
 }
 
 pub fn operation_state_core(path: &str) -> Result<GitOperationState, GitboxError> {
@@ -3185,79 +3522,74 @@ fn collect_project_entries(
     max_entries: usize,
     entries: &mut Vec<ProjectFileEntry>,
 ) -> Result<(), GitboxError> {
-    if entries.len() >= max_entries {
-        return Ok(());
-    }
-
-    let mut children = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            !is_skipped_project_entry(name.to_string_lossy().as_ref())
-        })
-        .collect::<Vec<_>>();
-
-    children.sort_by(|left, right| {
-        let left_type = left.file_type().ok();
-        let right_type = right.file_type().ok();
-        let left_is_dir = left_type
-            .as_ref()
-            .map(|kind| kind.is_dir())
-            .unwrap_or(false);
-        let right_is_dir = right_type
-            .as_ref()
-            .map(|kind| kind.is_dir())
-            .unwrap_or(false);
-
-        right_is_dir.cmp(&left_is_dir).then_with(|| {
-            left.file_name()
-                .to_string_lossy()
-                .to_lowercase()
-                .cmp(&right.file_name().to_string_lossy().to_lowercase())
-        })
-    });
-
-    let mut directories = Vec::new();
-    for child in children {
+    let mut directories = VecDeque::from([(directory.to_path_buf(), depth)]);
+    while let Some((current_directory, current_depth)) = directories.pop_front() {
         if entries.len() >= max_entries {
             break;
         }
 
-        let file_type = child.file_type()?;
-        let metadata = child.metadata()?;
-        let child_path = child.path();
-        let relative = child_path
-            .strip_prefix(root)
-            .map_err(|_| GitboxError::Message("无法读取项目文件路径".to_string()))?;
-        let parent = relative
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .map(repo_path_string);
-        let directory = file_type.is_dir();
+        let mut children = fs::read_dir(&current_directory)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                !is_skipped_project_entry(name.to_string_lossy().as_ref())
+            })
+            .collect::<Vec<_>>();
 
-        entries.push(ProjectFileEntry {
-            path: repo_path_string(relative),
-            name: child.file_name().to_string_lossy().to_string(),
-            parent,
-            depth,
-            directory,
-            size: if directory {
-                None
-            } else {
-                Some(metadata.len())
-            },
+        children.sort_by(|left, right| {
+            let left_type = left.file_type().ok();
+            let right_type = right.file_type().ok();
+            let left_is_dir = left_type
+                .as_ref()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false);
+            let right_is_dir = right_type
+                .as_ref()
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false);
+
+            right_is_dir.cmp(&left_is_dir).then_with(|| {
+                left.file_name()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .cmp(&right.file_name().to_string_lossy().to_lowercase())
+            })
         });
 
-        if directory {
-            directories.push(child_path);
-        }
-    }
+        for child in children {
+            if entries.len() >= max_entries {
+                break;
+            }
 
-    for child_path in directories {
-        if entries.len() >= max_entries {
-            break;
+            let file_type = child.file_type()?;
+            let metadata = child.metadata()?;
+            let child_path = child.path();
+            let relative = child_path
+                .strip_prefix(root)
+                .map_err(|_| GitboxError::Message("无法读取项目文件路径".to_string()))?;
+            let parent = relative
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(repo_path_string);
+            let directory = file_type.is_dir();
+
+            entries.push(ProjectFileEntry {
+                path: repo_path_string(relative),
+                name: child.file_name().to_string_lossy().to_string(),
+                parent,
+                depth: current_depth,
+                directory,
+                size: if directory {
+                    None
+                } else {
+                    Some(metadata.len())
+                },
+            });
+
+            if directory {
+                directories.push_back((child_path, current_depth + 1));
+            }
         }
-        collect_project_entries(root, &child_path, depth + 1, max_entries, entries)?;
     }
 
     Ok(())
@@ -3265,6 +3597,174 @@ fn collect_project_entries(
 
 fn is_skipped_project_entry(name: &str) -> bool {
     matches!(name, ".git" | "node_modules" | "target")
+}
+
+fn project_workdir_root(path: &str) -> Result<PathBuf, GitboxError> {
+    let repo = Repository::discover(path)?;
+    fs::canonicalize(repo_workdir(&repo)?).map_err(Into::into)
+}
+
+fn project_file_mutation(
+    root: &Path,
+    target: &Path,
+    directory: bool,
+    message: String,
+) -> Result<ProjectFileMutation, GitboxError> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| GitboxError::Message("无法读取项目文件路径".to_string()))?;
+    Ok(ProjectFileMutation {
+        path: repo_path_string(relative),
+        directory,
+        message,
+    })
+}
+
+fn clean_optional_project_relative_path(
+    value: Option<String>,
+) -> Result<Option<PathBuf>, GitboxError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "__gitbox_project_root__" {
+        return Ok(None);
+    }
+    clean_project_relative_path(trimmed.to_string()).map(Some)
+}
+
+fn resolve_project_directory(
+    root: &Path,
+    directory_path: Option<String>,
+) -> Result<PathBuf, GitboxError> {
+    let Some(relative) = clean_optional_project_relative_path(directory_path)? else {
+        return Ok(root.to_path_buf());
+    };
+    let target = fs::canonicalize(root.join(relative))?;
+    if !target.starts_with(root) {
+        return Err(GitboxError::Message("文件夹不在当前项目内".to_string()));
+    }
+    if !fs::metadata(&target)?.is_dir() {
+        return Err(GitboxError::Message("目标不是文件夹".to_string()));
+    }
+    Ok(target)
+}
+
+fn resolve_project_entry(root: &Path, file_path: String) -> Result<PathBuf, GitboxError> {
+    let relative = clean_project_relative_path(file_path)?;
+    let target = fs::canonicalize(root.join(relative))?;
+    if !target.starts_with(root) {
+        return Err(GitboxError::Message("文件不在当前项目内".to_string()));
+    }
+    Ok(target)
+}
+
+fn clean_project_entry_name(value: String) -> Result<String, GitboxError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(GitboxError::Message("请输入名称".to_string()));
+    }
+    if trimmed == "." || trimmed == ".." || trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(GitboxError::Message("名称不能包含路径分隔符".to_string()));
+    }
+
+    let path = PathBuf::from(trimmed);
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(GitboxError::Message("名称无效".to_string()));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn clean_project_child_path(value: String, empty_message: &str) -> Result<PathBuf, GitboxError> {
+    let trimmed = clean_ref_input(value, empty_message)?;
+    if trimmed.contains('\\') {
+        return Err(GitboxError::Message("名称不能包含反斜杠".to_string()));
+    }
+    if trimmed
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(GitboxError::Message(
+            "名称不能包含空路径、. 或 ..".to_string(),
+        ));
+    }
+
+    let path = PathBuf::from(trimmed);
+    let invalid = path.components().any(|component| {
+        matches!(
+            component,
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+
+    if path.is_absolute() || invalid {
+        return Err(GitboxError::Message(
+            "名称不能包含空路径、. 或 ..".to_string(),
+        ));
+    }
+
+    Ok(path)
+}
+
+fn unique_project_copy_path(target: &Path, directory: bool) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+
+    let parent = target.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = target
+        .file_name()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_else(|| "副本".to_string());
+    let (stem, extension) = if directory {
+        (file_name, None)
+    } else {
+        (
+            target
+                .file_stem()
+                .map(|value| value.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_name.clone()),
+            target
+                .extension()
+                .map(|value| value.to_string_lossy().to_string()),
+        )
+    };
+
+    for index in 1..1000 {
+        let suffix = if index == 1 {
+            " 副本".to_string()
+        } else {
+            format!(" 副本 {index}")
+        };
+        let candidate_name = match extension.as_deref() {
+            Some(extension) if !extension.is_empty() => format!("{stem}{suffix}.{extension}"),
+            _ => format!("{stem}{suffix}"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    target.to_path_buf()
+}
+
+fn copy_project_entry_recursive(source: &Path, target: &Path) -> Result<(), GitboxError> {
+    let metadata = fs::metadata(source)?;
+    if metadata.is_dir() {
+        fs::create_dir(target)?;
+        for child in fs::read_dir(source)? {
+            let child = child?;
+            copy_project_entry_recursive(&child.path(), &target.join(child.file_name()))?;
+        }
+    } else {
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, target)?;
+    }
+    Ok(())
 }
 
 fn clean_project_relative_path(value: String) -> Result<PathBuf, GitboxError> {
@@ -3298,22 +3798,51 @@ fn clean_optional_arg(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty() && value != "ALL")
 }
 
+fn clean_optional_args(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || value == "ALL" || cleaned.iter().any(|item| item == value) {
+            continue;
+        }
+        cleaned.push(value.to_string());
+    }
+    cleaned
+}
+
+fn parent_or_empty_tree(repo: &Repository, oid: &str) -> Result<String, GitboxError> {
+    let object = repo.revparse_single(oid)?;
+    let commit = object.peel_to_commit()?;
+    if commit.parent_count() > 0 {
+        Ok(format!("{oid}^"))
+    } else {
+        Ok("4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string())
+    }
+}
+
 fn commit_matches_author(commit: &git2::Commit<'_>, author: Option<&str>) -> bool {
     let Some(author) = author else {
         return true;
     };
     let needle = author.to_lowercase();
     let signature = commit.author();
-    signature
-        .name()
-        .unwrap_or_default()
-        .to_lowercase()
-        .contains(&needle)
-        || signature
-            .email()
-            .unwrap_or_default()
-            .to_lowercase()
-            .contains(&needle)
+    let name = signature.name().unwrap_or_default();
+    let email = signature.email().unwrap_or_default();
+    let display = if email.is_empty() {
+        name.to_string()
+    } else {
+        format!("{name} <{email}>")
+    };
+    [name, email, display.as_str()]
+        .iter()
+        .any(|value| value.to_lowercase().contains(&needle))
+}
+
+fn commit_matches_any_author(commit: &git2::Commit<'_>, authors: &[String]) -> bool {
+    authors.is_empty()
+        || authors
+            .iter()
+            .any(|author| commit_matches_author(commit, Some(author.as_str())))
 }
 
 fn commit_matches_query(commit: &git2::Commit<'_>, refs: &[String], query: Option<&str>) -> bool {
@@ -3919,6 +4448,90 @@ mod tests {
     }
 
     #[test]
+    fn project_file_listing_keeps_later_directory_children_before_deep_descendants() {
+        let (dir, _repo) = test_repo();
+        write_file(dir.path(), "aaa/deep/one.txt", "one\n");
+        write_file(dir.path(), "zzz/child.txt", "child\n");
+
+        let files =
+            list_project_files_core(dir.path().to_str().unwrap(), Some(4)).expect("project files");
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["aaa", "zzz", "aaa/deep", "zzz/child.txt"]);
+        assert_eq!(files[3].parent.as_deref(), Some("zzz"));
+        assert!(!files[3].directory);
+    }
+
+    #[test]
+    fn project_file_operations_create_copy_move_rename_and_delete() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+
+        let docs =
+            create_project_directory_core(path, None, "docs".to_string()).expect("create dir");
+        assert_eq!(docs.path, "docs");
+        assert!(docs.directory);
+
+        let file =
+            create_project_file_core(path, Some("docs".to_string()), "notes.txt".to_string())
+                .expect("create file");
+        assert_eq!(file.path, "docs/notes.txt");
+        assert!(dir.path().join("docs/notes.txt").is_file());
+
+        let nested =
+            create_project_file_core(path, Some("docs".to_string()), "drafts/one.txt".to_string())
+                .expect("create nested file");
+        assert_eq!(nested.path, "docs/drafts/one.txt");
+        assert!(dir.path().join("docs/drafts/one.txt").is_file());
+
+        let nested_dir =
+            create_project_directory_core(path, Some("docs".to_string()), "images/raw".to_string())
+                .expect("create nested dir");
+        assert_eq!(nested_dir.path, "docs/images/raw");
+        assert!(dir.path().join("docs/images/raw").is_dir());
+
+        let renamed =
+            rename_project_entry_core(path, "docs/notes.txt".to_string(), "guide.md".to_string())
+                .expect("rename file");
+        assert_eq!(renamed.path, "docs/guide.md");
+
+        let saved = save_project_file_core(
+            path,
+            "docs/guide.md".to_string(),
+            "updated notes\n".to_string(),
+        )
+        .expect("save file");
+        assert_eq!(saved.content.as_deref(), Some("updated notes\n"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("docs/guide.md")).unwrap(),
+            "updated notes\n"
+        );
+
+        let copied =
+            copy_project_entry_core(path, "docs/guide.md".to_string(), Some("docs".to_string()))
+                .expect("copy file");
+        assert_eq!(copied.path, "docs/guide 副本.md");
+        assert!(dir.path().join("docs/guide 副本.md").is_file());
+
+        create_project_directory_core(path, None, "archive".to_string()).expect("create archive");
+        let moved = move_project_entry_core(
+            path,
+            "docs/guide.md".to_string(),
+            Some("archive".to_string()),
+        )
+        .expect("move file");
+        assert_eq!(moved.path, "archive/guide.md");
+        assert!(dir.path().join("archive/guide.md").is_file());
+        assert!(!dir.path().join("docs/guide.md").exists());
+
+        delete_project_entry_core(path, "docs/guide 副本.md".to_string()).expect("delete copy");
+        assert!(!dir.path().join("docs/guide 副本.md").exists());
+    }
+
+    #[test]
     fn status_stage_and_commit_lifecycle() {
         let (dir, _repo) = test_repo();
         write_file(dir.path(), "src/main.rs", "fn main() {}\n");
@@ -4041,6 +4654,74 @@ mod tests {
             .refs
             .iter()
             .any(|reference| reference == "feature/search"));
+    }
+
+    #[test]
+    fn commit_log_can_filter_multiple_authors_and_paths() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+
+        write_file(dir.path(), "src/one.rs", "pub fn one() {}\n");
+        stage_paths_core(dir.path().to_str().unwrap(), vec!["src/one.rs".to_string()])
+            .expect("stage one");
+        commit_with_full_options_core(
+            dir.path().to_str().unwrap(),
+            "ada path work".to_string(),
+            false,
+            false,
+            false,
+            Some("Ada Lovelace <ada@example.test>".to_string()),
+        )
+        .expect("commit ada");
+
+        write_file(dir.path(), "docs/two.md", "two\n");
+        stage_paths_core(
+            dir.path().to_str().unwrap(),
+            vec!["docs/two.md".to_string()],
+        )
+        .expect("stage two");
+        commit_with_full_options_core(
+            dir.path().to_str().unwrap(),
+            "grace docs work".to_string(),
+            false,
+            false,
+            false,
+            Some("Grace Hopper <grace@example.test>".to_string()),
+        )
+        .expect("commit grace");
+
+        write_file(dir.path(), "README.md", "ignored\n");
+        stage_paths_core(dir.path().to_str().unwrap(), vec!["README.md".to_string()])
+            .expect("stage readme");
+        commit_with_full_options_core(
+            dir.path().to_str().unwrap(),
+            "other work".to_string(),
+            false,
+            false,
+            false,
+            Some("Linus Torvalds <linus@example.test>".to_string()),
+        )
+        .expect("commit other");
+
+        let commits = list_commits_filtered_multi_core(
+            dir.path().to_str().unwrap(),
+            Some(20),
+            None,
+            None,
+            vec![
+                "Ada Lovelace <ada@example.test>".to_string(),
+                "Grace Hopper <grace@example.test>".to_string(),
+            ],
+            vec!["src/one.rs".to_string(), "docs/two.md".to_string()],
+        )
+        .expect("multi filtered commits");
+        let summaries = commits
+            .iter()
+            .map(|commit| commit.summary.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.contains(&"ada path work"));
+        assert!(summaries.contains(&"grace docs work"));
     }
 
     #[test]

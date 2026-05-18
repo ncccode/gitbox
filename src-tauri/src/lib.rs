@@ -4,30 +4,45 @@ use gitbox::{
     add_remote_core, apply_patch_core, blame_file_core, branch_summary_core, checkout_branch_core,
     checkout_remote_branch_core, checkout_revision_core, cherry_pick_commit_core,
     cherry_pick_files_core, cleanup_merged_branches_core, clear_stashes_core,
-    clone_repository_core, commit_details_core, commit_message_history_core,
-    commit_with_full_options_core, compare_refs_core, conflict_details_core, create_branch_core,
-    create_patch_core, create_tag_core, create_worktree_core, delete_branch_core,
-    delete_remote_branch_core, delete_remote_core, delete_remote_tag_core, delete_shelf_core,
-    delete_tag_core, discard_changes_core, drop_commit_core, fetch_core, file_history_core,
-    fixup_commit_core, get_diff_core, init_repository_core, lfs_status_core, list_branches_core,
-    list_commits_filtered_core, list_project_files_core, list_shelves_core, list_stashes_core,
-    list_submodules_core, list_worktrees_core, mark_conflict_resolved_core, mark_shelf_applied,
-    merge_branch_core, open_repo_core, operation_control_core, operation_state_core, pull_core,
-    push_commit_core, push_tag_core, push_with_options_core, read_project_file_core,
+    clone_repository_core, commit_details_core, commit_file_diff_core, commit_message_history_core,
+    commit_with_full_options_core, compare_refs_core, conflict_details_core,
+    copy_project_entry_core, create_branch_core, create_patch_core, create_project_directory_core,
+    create_project_file_core, create_tag_core, create_worktree_core, delete_branch_core,
+    delete_project_entry_core, delete_remote_branch_core, delete_remote_core,
+    delete_remote_tag_core, delete_shelf_core, delete_tag_core, discard_changes_core,
+    drop_commit_core, fetch_core, file_history_core, fixup_commit_core, get_diff_core,
+    init_repository_core, lfs_status_core, list_branches_core, list_commits_filtered_multi_core,
+    list_project_files_core, list_shelves_core, list_stashes_core, list_submodules_core,
+    list_worktrees_core, mark_conflict_resolved_core, mark_shelf_applied, merge_branch_core,
+    move_project_entry_core, open_repo_core, operation_control_core, operation_state_core,
+    pull_core, push_commit_core, push_tag_core, push_with_options_core, read_project_file_core,
     rebase_advanced_core, rebase_branch_core, record_recent_repo, record_shelf,
-    remove_worktree_core, rename_branch_core, repo_status_core, reset_to_commit_core,
-    resolve_conflict_block_core, resolve_conflict_file_core, revert_commit_core,
-    save_conflict_result_core, set_branch_upstream_core, shelve_changes_core, stage_hunks_core,
+    remove_worktree_core, rename_branch_core, rename_project_entry_core, repo_status_core,
+    reset_to_commit_core, resolve_conflict_block_core, resolve_conflict_file_core,
+    revert_commit_core, revert_commit_files_core, save_conflict_result_core,
+    save_project_file_core, set_branch_upstream_core, shelve_changes_core, stage_hunks_core,
     stage_paths_core, stash_action_core, undo_last_commit_core, unshallow_repository_core,
     unshelve_core, unstage_paths_core, update_remote_core, update_submodules_core, BlameLine,
     BranchList, BranchSummary, CommandResult, CommitDetails, CommitResult, CommitSummary,
     ConflictDetails, DiffResponse, FileHistoryEntry, GitOperationState, ProjectFileContent,
-    ProjectFileEntry, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo, StashInfo,
-    SubmoduleInfo, WorktreeInfo,
+    ProjectFileEntry, ProjectFileMutation, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo,
+    StashInfo, SubmoduleInfo, WorktreeInfo,
 };
 use tauri::AppHandle;
 
 type CommandResponse<T> = Result<T, String>;
+
+fn merge_optional_filters(primary: Option<String>, extra: Option<Vec<String>>) -> Vec<String> {
+    let mut values = Vec::new();
+    for value in primary.into_iter().chain(extra.unwrap_or_default()) {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed == "ALL" || values.iter().any(|item| item == trimmed) {
+            continue;
+        }
+        values.push(trimmed.to_string());
+    }
+    values
+}
 
 #[tauri::command]
 fn open_repo(app: AppHandle, path: String) -> CommandResponse<RepositoryInfo> {
@@ -90,6 +105,65 @@ fn list_project_files(
 #[tauri::command]
 fn read_project_file(path: String, file_path: String) -> CommandResponse<ProjectFileContent> {
     read_project_file_core(&path, file_path).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn save_project_file(
+    path: String,
+    file_path: String,
+    content: String,
+) -> CommandResponse<ProjectFileContent> {
+    save_project_file_core(&path, file_path, content).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn create_project_file(
+    path: String,
+    directory_path: Option<String>,
+    name: String,
+) -> CommandResponse<ProjectFileMutation> {
+    create_project_file_core(&path, directory_path, name).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn create_project_directory(
+    path: String,
+    directory_path: Option<String>,
+    name: String,
+) -> CommandResponse<ProjectFileMutation> {
+    create_project_directory_core(&path, directory_path, name).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn rename_project_entry(
+    path: String,
+    file_path: String,
+    new_name: String,
+) -> CommandResponse<ProjectFileMutation> {
+    rename_project_entry_core(&path, file_path, new_name).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn delete_project_entry(path: String, file_path: String) -> CommandResponse<CommandResult> {
+    delete_project_entry_core(&path, file_path).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn copy_project_entry(
+    path: String,
+    source_path: String,
+    target_directory_path: Option<String>,
+) -> CommandResponse<ProjectFileMutation> {
+    copy_project_entry_core(&path, source_path, target_directory_path).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn move_project_entry(
+    path: String,
+    source_path: String,
+    target_directory_path: Option<String>,
+) -> CommandResponse<ProjectFileMutation> {
+    move_project_entry_core(&path, source_path, target_directory_path).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -236,15 +310,34 @@ fn list_commits(
     branch: Option<String>,
     query: Option<String>,
     author: Option<String>,
+    authors: Option<Vec<String>>,
     path_filter: Option<String>,
+    path_filters: Option<Vec<String>>,
 ) -> CommandResponse<Vec<CommitSummary>> {
-    list_commits_filtered_core(&path, limit, branch, query, author, path_filter)
-        .map_err(|err| err.command())
+    list_commits_filtered_multi_core(
+        &path,
+        limit,
+        branch,
+        query,
+        merge_optional_filters(author, authors),
+        merge_optional_filters(path_filter, path_filters),
+    )
+    .map_err(|err| err.command())
 }
 
 #[tauri::command]
 fn commit_details(path: String, oid: String) -> CommandResponse<CommitDetails> {
     commit_details_core(&path, oid).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn commit_file_diff(
+    path: String,
+    oid: String,
+    file_path: String,
+    mode: Option<String>,
+) -> CommandResponse<DiffResponse> {
+    commit_file_diff_core(&path, oid, file_path, mode).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -442,6 +535,15 @@ fn cherry_pick_files(
     files: Vec<String>,
 ) -> CommandResponse<CommandResult> {
     cherry_pick_files_core(&path, oid, files).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn revert_commit_files(
+    path: String,
+    oid: String,
+    files: Vec<String>,
+) -> CommandResponse<CommandResult> {
+    revert_commit_files_core(&path, oid, files).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -643,6 +745,13 @@ pub fn run() {
             repo_status,
             list_project_files,
             read_project_file,
+            save_project_file,
+            create_project_file,
+            create_project_directory,
+            rename_project_entry,
+            delete_project_entry,
+            copy_project_entry,
+            move_project_entry,
             get_diff,
             stage_paths,
             unstage_paths,
@@ -662,6 +771,7 @@ pub fn run() {
             branch_summary,
             list_commits,
             commit_details,
+            commit_file_diff,
             file_history,
             blame_file,
             compare_refs,
@@ -684,6 +794,7 @@ pub fn run() {
             rebase_advanced,
             cherry_pick_commit,
             cherry_pick_files,
+            revert_commit_files,
             revert_commit,
             reset_to_commit,
             undo_last_commit,

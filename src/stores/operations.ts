@@ -11,6 +11,7 @@ import {
   rebaseBranch,
   resetToCommit,
   revertCommit,
+  revertCommitFiles,
   resolveConflictBlock,
   resolveConflictFile,
   saveConflictResult,
@@ -185,6 +186,10 @@ export const useOperationsStore = defineStore("operations", {
     async cherryPickFiles(oid: string, files: string[]) {
       if (!oid || files.length === 0) return;
       await this.runOperation((repoPath) => cherryPickFiles(repoPath, oid, files));
+    },
+    async revertFiles(oid: string, files: string[]) {
+      if (!oid || files.length === 0) return;
+      await this.runOperation((repoPath) => revertCommitFiles(repoPath, oid, files));
     },
     async revert(oid: string) {
       if (!oid) return;

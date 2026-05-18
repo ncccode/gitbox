@@ -5,6 +5,7 @@ import type {
   CommandResult,
   ConflictDetails,
   CommitDetails,
+  CommitFileDiffMode,
   CommitResult,
   CommitSummary,
   DiffResponse,
@@ -13,6 +14,7 @@ import type {
   GitOperationState,
   ProjectFileContent,
   ProjectFileEntry,
+  ProjectFileMutation,
   RefComparison,
   RepoStatus,
   RepositoryInfo,
@@ -59,6 +61,34 @@ export function listProjectFiles(path: string, limit = 1400) {
 
 export function readProjectFile(path: string, filePath: string) {
   return invoke<ProjectFileContent>("read_project_file", { path, filePath });
+}
+
+export function saveProjectFile(path: string, filePath: string, content: string) {
+  return invoke<ProjectFileContent>("save_project_file", { path, filePath, content });
+}
+
+export function createProjectFile(path: string, directoryPath: string | null | undefined, name: string) {
+  return invoke<ProjectFileMutation>("create_project_file", { path, directoryPath, name });
+}
+
+export function createProjectDirectory(path: string, directoryPath: string | null | undefined, name: string) {
+  return invoke<ProjectFileMutation>("create_project_directory", { path, directoryPath, name });
+}
+
+export function renameProjectEntry(path: string, filePath: string, newName: string) {
+  return invoke<ProjectFileMutation>("rename_project_entry", { path, filePath, newName });
+}
+
+export function deleteProjectEntry(path: string, filePath: string) {
+  return invoke<CommandResult>("delete_project_entry", { path, filePath });
+}
+
+export function copyProjectEntry(path: string, sourcePath: string, targetDirectoryPath: string | null | undefined) {
+  return invoke<ProjectFileMutation>("copy_project_entry", { path, sourcePath, targetDirectoryPath });
+}
+
+export function moveProjectEntry(path: string, sourcePath: string, targetDirectoryPath: string | null | undefined) {
+  return invoke<ProjectFileMutation>("move_project_entry", { path, sourcePath, targetDirectoryPath });
 }
 
 export function getDiff(path: string, filePath?: string | null, staged = false) {
@@ -163,7 +193,9 @@ export function listCommits(
     branch?: string;
     query?: string;
     author?: string;
+    authors?: string[];
     pathFilter?: string;
+    pathFilters?: string[];
   } = {},
 ) {
   return invoke<CommitSummary[]>("list_commits", {
@@ -172,12 +204,18 @@ export function listCommits(
     branch: options.branch,
     query: options.query,
     author: options.author,
+    authors: options.authors,
     pathFilter: options.pathFilter,
+    pathFilters: options.pathFilters,
   });
 }
 
 export function commitDetails(path: string, oid: string) {
   return invoke<CommitDetails>("commit_details", { path, oid });
+}
+
+export function commitFileDiff(path: string, oid: string, filePath: string, mode: CommitFileDiffMode = "commit") {
+  return invoke<DiffResponse>("commit_file_diff", { path, oid, filePath, mode });
 }
 
 export function fileHistory(path: string, filePath: string, limit = 80) {
@@ -312,6 +350,10 @@ export function cherryPickCommit(path: string, oid: string) {
 
 export function cherryPickFiles(path: string, oid: string, files: string[]) {
   return invoke<CommandResult>("cherry_pick_files", { path, oid, files });
+}
+
+export function revertCommitFiles(path: string, oid: string, files: string[]) {
+  return invoke<CommandResult>("revert_commit_files", { path, oid, files });
 }
 
 export function revertCommit(path: string, oid: string, noCommit = false) {
