@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="GitBox logo">
+  <defs>
+    <linearGradient id="bg" x1="170" y1="110" x2="854" y2="910" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#153C32" />
+      <stop offset="0.55" stop-color="#255E48" />
+      <stop offset="1" stop-color="#0F2424" />
+    </linearGradient>
+    <linearGradient id="box" x1="245" y1="276" x2="782" y2="770" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" />
+      <stop offset="1" stop-color="#DCE7DB" />
+    </linearGradient>
+    <linearGradient id="branch" x1="300" y1="330" x2="744" y2="718" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFB34D" />
+      <stop offset="1" stop-color="#4ED7B1" />
+    </linearGradient>
+    <filter id="shadow" x="60" y="60" width="904" height="904" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="36" stdDeviation="36" flood-color="#051312" flood-opacity="0.28" />
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="none" />
+  <rect x="96" y="96" width="832" height="832" rx="190" fill="url(#bg)" filter="url(#shadow)" />
+  <path
+    d="M216 326C216 292.9 242.9 266 276 266h472c33.1 0 60 26.9 60 60v76H216v-76Z"
+    fill="#F5B84B"
+  />
+  <path
+    d="M216 392h592v310c0 33.1-26.9 60-60 60H276c-33.1 0-60-26.9-60-60V392Z"
+    fill="url(#box)"
+  />
+  <path
+    d="M276 266h472c33.1 0 60 26.9 60 60v376c0 33.1-26.9 60-60 60H276c-33.1 0-60-26.9-60-60V326c0-33.1 26.9-60 60-60Z"
+    fill="none"
+    stroke="#0B211C"
+    stroke-opacity="0.2"
+    stroke-width="28"
+  />
+  <path d="M310 392h404" stroke="#16352C" stroke-opacity="0.18" stroke-width="28" stroke-linecap="round" />
+  <path
+    d="M346 566h136c42 0 76-34 76-76v-44m0 44c0 42 34 76 76 76h48m-200 0v116"
+    fill="none"
+    stroke="#173B31"
+    stroke-width="52"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    opacity="0.96"
+  />
+  <path
+    d="M346 566h136c42 0 76-34 76-76v-44m0 44c0 42 34 76 76 76h48m-200 0v116"
+    fill="none"
+    stroke="url(#branch)"
+    stroke-width="28"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+  <circle cx="346" cy="566" r="54" fill="#173B31" />
+  <circle cx="346" cy="566" r="28" fill="#FFB34D" />
+  <circle cx="558" cy="446" r="54" fill="#173B31" />
+  <circle cx="558" cy="446" r="28" fill="#F7F8F4" />
+  <circle cx="682" cy="566" r="54" fill="#173B31" />
+  <circle cx="682" cy="566" r="28" fill="#4ED7B1" />
+  <circle cx="482" cy="682" r="54" fill="#173B31" />
+  <circle cx="482" cy="682" r="28" fill="#F7F8F4" />
+  <path
+    d="M302 820h420"
+    stroke="#C7D4C8"
+    stroke-width="36"
+    stroke-linecap="round"
+    opacity="0.35"
+  />
+</svg>
