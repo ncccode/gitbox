@@ -4,9 +4,13 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive,
   ArchiveRestore,
+  ChevronDown,
+  ChevronRight,
   Check,
   Columns3,
   Download,
+  File as FileIcon,
+  Folder,
   FolderOpen,
   GitBranch,
   GitCommitVertical,
@@ -32,6 +36,7 @@ import { useCommitStore } from "./stores/commit";
 import { useDiffStore } from "./stores/diff";
 import { useHistoryStore } from "./stores/history";
 import { useOperationsStore } from "./stores/operations";
+import { PROJECT_ROOT_PATH, useProjectStore } from "./stores/project";
 import { useRemoteStore } from "./stores/remote";
 import { useRepositoriesStore } from "./stores/repositories";
 import { useSettingsStore } from "./stores/settings";
@@ -41,6 +46,8 @@ import type {
   ChangeSide,
   ChangedFile,
   CommitFileChange,
+  CommitSummary,
+  ProjectFileEntry,
   ShelfInfo,
   TagInfo,
 } from "./types/gitbox";
@@ -54,6 +61,7 @@ const commit = useCommitStore();
 const diff = useDiffStore();
 const history = useHistoryStore();
 const operations = useOperationsStore();
+const project = useProjectStore();
 const remote = useRemoteStore();
 const settings = useSettingsStore();
 const shelveMessage = ref("");
@@ -63,7 +71,35 @@ const newTagTarget = ref("");
 const annotatedTag = ref(false);
 const tagMessage = ref("");
 const selectedCommitFilePaths = ref<string[]>([]);
-type WorkbenchMode = "changes" | "log" | "branches" | "remote" | "operations" | "advanced";
+const expandedProjectChangeId = ref<string | null>(null);
+type WorkbenchMode = "changes" | "log" | "project" | "branches" | "remote" | "operations" | "advanced";
+type ProjectCodeToken = {
+  text: string;
+  kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
+};
+type ProjectOriginalLine = {
+  number: number;
+  content: string;
+  tokens: ProjectCodeToken[];
+};
+type ProjectChangeBlock = {
+  id: string;
+  hunkIndex: number;
+  header: string;
+  patch: string;
+  startLine: number;
+  endLine: number;
+  originalStart: number;
+  originalLines: ProjectOriginalLine[];
+};
+type ProjectCodeLine = {
+  index: number;
+  number: number;
+  content: string;
+  tokens: ProjectCodeToken[];
+  change: ProjectChangeBlock | null;
+  reveal: ProjectChangeBlock | null;
+};
 
 const workbenchMode = ref<WorkbenchMode>("changes");
 const activeResizePanel = ref<LayoutPanelKey | null>(null);
@@ -75,7 +111,7 @@ const systemPrefersDark = ref(
 let stopSystemThemeWatch: (() => void) | null = null;
 let autoFetchTimer: number | null = null;
 const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
-const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "advanced"]);
+const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 
 const activeFiles = computed(() => {
   const files = changes.filesForSide(settings.selectedSide);
@@ -86,7 +122,11 @@ const usesWorkbenchContext = computed(() => workbenchContextModes.has(workbenchM
 const counts = computed(() => changes.status?.counts);
 const branch = computed(() => changes.branch);
 const brandSubtitle = computed(() =>
-  repos.current ? repos.name : `${repos.items.length} 个项目`,
+  repos.current
+    ? repos.name
+    : repos.selectedPath
+      ? `${repos.projectName(repos.selectedPath)} · 未初始化`
+      : `${repos.items.length} 个项目`,
 );
 const activeError = computed(
   () =>
@@ -97,6 +137,7 @@ const activeError = computed(
     commit.error ||
     history.error ||
     operations.error ||
+    (workbenchMode.value === "project" ? project.error : "") ||
     remote.error ||
     advanced.error,
 );
@@ -135,6 +176,106 @@ const commitDiffLines = computed(() =>
       : "context",
   })),
 );
+const projectLanguage = computed(() => projectLanguageForPath(project.selectedPath));
+const projectChangeBlocks = computed(() => buildProjectChangeBlocks(project.diff?.hunks ?? [], projectLanguage.value));
+const projectChangeByLine = computed(() => {
+  const changesByLine = new Map<number, ProjectChangeBlock>();
+  for (const block of projectChangeBlocks.value) {
+    for (let line = block.startLine; line <= block.endLine; line += 1) {
+      changesByLine.set(line, block);
+    }
+  }
+  return changesByLine;
+});
+const projectContentLines = computed<ProjectCodeLine[]>(() =>
+  (project.content?.content ?? "").split("\n").map((content, index) => {
+    const number = index + 1;
+    const change = projectChangeByLine.value.get(number) ?? null;
+    return {
+      index,
+      number,
+      content,
+      tokens: tokenizeProjectLine(content || " ", projectLanguage.value),
+      change,
+      reveal: change && expandedProjectChangeId.value === change.id && number === change.endLine ? change : null,
+    };
+  }),
+);
+const projectRootEntry = computed<ProjectFileEntry | null>(() => {
+  if (!repos.current) return null;
+  return {
+    path: PROJECT_ROOT_PATH,
+    name: repos.name,
+    parent: null,
+    depth: 0,
+    directory: true,
+    size: null,
+  };
+});
+const projectChildrenByParent = computed(() => {
+  const groups = new Map<string, ProjectFileEntry[]>();
+  for (const file of project.files) {
+    const parent = file.parent ?? PROJECT_ROOT_PATH;
+    const children = groups.get(parent) ?? [];
+    children.push(file);
+    groups.set(parent, children);
+  }
+
+  for (const children of groups.values()) {
+    children.sort(compareProjectTreeEntries);
+  }
+  return groups;
+});
+const expandedProjectDirectories = computed(() => new Set(project.expandedPaths));
+const visibleProjectFiles = computed(() => {
+  if (!projectRootEntry.value) return project.files;
+
+  const rows: ProjectFileEntry[] = [projectRootEntry.value];
+  const appendChildren = (parentPath: string) => {
+    if (!expandedProjectDirectories.value.has(parentPath)) return;
+    for (const child of projectChildrenByParent.value.get(parentPath) ?? []) {
+      rows.push(child);
+      if (child.directory) {
+        appendChildren(child.path);
+      }
+    }
+  };
+  appendChildren(PROJECT_ROOT_PATH);
+  return rows;
+});
+type ProjectGitStatus =
+  | "conflicted"
+  | "deleted"
+  | "added"
+  | "modified"
+  | "renamed"
+  | "typechange"
+  | "ignored"
+  | "unknown";
+const projectStatusPriority: Record<ProjectGitStatus, number> = {
+  unknown: 0,
+  ignored: 1,
+  renamed: 2,
+  typechange: 3,
+  modified: 4,
+  added: 5,
+  deleted: 6,
+  conflicted: 7,
+};
+const projectStatusByPath = computed(() => {
+  const statuses = new Map<string, ProjectGitStatus>();
+  for (const file of changes.files) {
+    const status = normalizeProjectGitStatus(file);
+    setProjectGitStatus(statuses, PROJECT_ROOT_PATH, status);
+    setProjectGitStatus(statuses, file.path, status);
+
+    const segments = file.path.split("/").filter(Boolean);
+    for (let index = 1; index < segments.length; index += 1) {
+      setProjectGitStatus(statuses, segments.slice(0, index).join("/"), status);
+    }
+  }
+  return statuses;
+});
 const selectableBranchTargets = computed(() =>
   (branches.list?.branches ?? []).filter((item) => !item.current).map((item) => item.name),
 );
@@ -170,7 +311,7 @@ const workspaceGridStyle = computed(() => {
     columns.push(`${settings.panelWidths.project}px`, "6px");
   }
 
-  if (repos.current) {
+  if (repos.current || repos.selectedPath) {
     columns.push("68px");
   }
 
@@ -208,6 +349,43 @@ const resetModeLabels: Record<string, string> = {
   mixed: "混合重置",
   hard: "硬重置",
 };
+const graphLaneWidth = 14;
+const graphLaneInset = 10;
+const graphRowHeight = 30;
+const graphRowMid = graphRowHeight / 2;
+const graphMaxVisibleLanes = 6;
+const graphPalette = ["#b89445", "#8e63c8", "#4f9d76", "#4f82c9", "#c86d56", "#70a6a1"];
+type LogGraphPath = {
+  key: string;
+  d: string;
+  color: string;
+};
+type LogGraphActiveLane = {
+  oid: string;
+  color: string;
+};
+type LogGraphRow = {
+  item: CommitSummary;
+  paths: LogGraphPath[];
+  laneIndex: number;
+  color: string;
+  nodeLeft: number;
+  graphWidth: number;
+  hasMerge: boolean;
+};
+type LogRemoteGroup = {
+  name: string;
+  branches: BranchInfo[];
+};
+type LogFileTreeRow = {
+  id: string;
+  name: string;
+  path: string;
+  depth: number;
+  directory: boolean;
+  status?: string;
+  oldPath?: string | null;
+};
 const hostedRemoteLinks = computed(() =>
   (repos.current?.remotes ?? [])
     .map((item) => {
@@ -223,11 +401,37 @@ const hostedRemoteLinks = computed(() =>
       Boolean(item),
     ),
 );
+const logHeadLabel = computed(() => `HEAD (${branchNameLabel(branch.value?.currentBranch)})`);
+const logRemoteGroups = computed<LogRemoteGroup[]>(() => {
+  const groups = new Map<string, BranchInfo[]>();
+  for (const item of branches.sortedRemoteBranches) {
+    const parts = item.name.split("/");
+    const remoteName = parts[0] || "remote";
+    const group = groups.get(remoteName) ?? [];
+    group.push(item);
+    groups.set(remoteName, group);
+  }
+  return [...groups.entries()].map(([name, groupBranches]) => ({ name, branches: groupBranches }));
+});
+const logGraphRows = computed<LogGraphRow[]>(() => buildLogGraphRows(history.commits));
+const commitFileTreeRows = computed<LogFileTreeRow[]>(() => buildCommitFileTreeRows(history.details?.files ?? []));
+const selectedCommitRefs = computed(() => history.details?.commit.refs.map(formatRefName) ?? []);
+const activeLogRefLabel = computed(() => history.branchFilter || "全部引用");
+const logFilterActive = computed(() =>
+  Boolean(history.branchFilter || history.query.trim() || history.authorFilter.trim() || history.pathFilter.trim()),
+);
 
 watch(
   () => [changes.selectedFile, changes.selectedSide],
   () => {
     diff.loadSelected().catch(() => undefined);
+  },
+);
+
+watch(
+  () => project.selectedPath,
+  () => {
+    expandedProjectChangeId.value = null;
   },
 );
 
@@ -256,6 +460,8 @@ watch(
 watch(workbenchMode, (mode) => {
   if (mode === "advanced") {
     loadAdvancedSnapshots().catch(() => undefined);
+  } else if (mode === "project") {
+    project.refresh().catch(() => undefined);
   }
 });
 
@@ -273,6 +479,8 @@ onMounted(() => {
 
   if (repos.current) {
     loadCurrentRepository().catch(() => undefined);
+  } else if (repos.selectedPath) {
+    prepareUninitializedProject();
   }
   scheduleAutoFetch();
 });
@@ -322,22 +530,13 @@ async function chooseRepository() {
   const paths = normalizeSelectedPaths(selected);
   if (paths.length === 0) return;
 
-  const opened = await repos.openMany(paths);
-  if (opened.length > 0) {
-    await loadCurrentRepository();
-  }
+  await repos.openMany(paths);
+  await loadSelectedProject();
 }
 
-async function cloneRepositoryFromInput() {
-  const repo = await advanced.cloneInto();
-  if (!repo) return;
-  repos.setCurrent(repo);
-  advanced.cloneUrl = "";
-  advanced.cloneDirectory = "";
-  await loadCurrentRepository();
-}
-
-async function initRepositoryFromInput() {
+async function initSelectedProject() {
+  if (!repos.selectedPath) return;
+  advanced.initDirectory = repos.selectedPath;
   const repo = await advanced.initAt();
   if (!repo) return;
   repos.setCurrent(repo);
@@ -345,20 +544,24 @@ async function initRepositoryFromInput() {
 }
 
 async function switchRepository(path: string) {
-  if (repos.path === path) return;
+  if (repos.selectedPath === path) return;
   await repos.select(path);
-  await loadCurrentRepository();
+  await loadSelectedProject();
 }
 
 async function removeRepository(path: string) {
-  const wasCurrent = repos.path === path;
+  const wasCurrent = repos.selectedPath === path;
   repos.remove(path);
   if (!wasCurrent) return;
 
+  await loadSelectedProject();
+}
+
+async function loadSelectedProject() {
   if (repos.current) {
     await loadCurrentRepository();
   } else {
-    clearProjectView();
+    prepareUninitializedProject();
   }
 }
 
@@ -374,6 +577,9 @@ async function loadCurrentRepository() {
   syncSelectedRemote(true);
   pickFirstAvailable(settings.selectedSide);
   await diff.loadSelected();
+  if (workbenchMode.value === "project") {
+    await project.refresh();
+  }
 }
 
 function clearProjectView() {
@@ -383,12 +589,19 @@ function clearProjectView() {
   changes.resetForRepositorySwitch();
   history.resetForRepositorySwitch();
   operations.resetForRepositorySwitch();
+  project.resetForRepositorySwitch();
   diff.current = null;
   diff.error = "";
   remote.error = "";
   remote.notice = "";
   commit.error = "";
   commit.lastCommit = "";
+}
+
+function prepareUninitializedProject() {
+  clearProjectView();
+  advanced.initDirectory = repos.selectedPath;
+  workbenchMode.value = "project";
 }
 
 function syncSelectedRemote(forceTarget = false) {
@@ -430,6 +643,9 @@ async function refreshAll() {
   syncSelectedRemote();
   pickFirstAvailable(settings.selectedSide);
   await diff.loadSelected();
+  if (workbenchMode.value === "project") {
+    await project.refresh();
+  }
 }
 
 async function reloadAfterGitOperation() {
@@ -443,6 +659,8 @@ async function reloadAfterGitOperation() {
   await diff.loadSelected();
   if (workbenchMode.value === "advanced") {
     await loadAdvancedSnapshots();
+  } else if (workbenchMode.value === "project") {
+    await project.refresh();
   }
 }
 
@@ -698,6 +916,340 @@ function formatTime(seconds: number) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function formatBytes(bytes?: number | null) {
+  if (!bytes) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fileIndent(depth: number) {
+  return { paddingLeft: `${6 + depth * 14}px` };
+}
+
+function projectFileIndent(file: ProjectFileEntry) {
+  return fileIndent(file.path === PROJECT_ROOT_PATH ? 0 : file.depth + 1);
+}
+
+function projectLanguageForPath(path?: string | null) {
+  const extension = path?.split(".").pop()?.toLowerCase() ?? "";
+  if (["js", "jsx", "mjs", "cjs"].includes(extension)) return "javascript";
+  if (["ts", "tsx"].includes(extension)) return "typescript";
+  if (extension === "vue") return "vue";
+  if (["json", "jsonc"].includes(extension)) return "json";
+  if (["css", "scss", "sass", "less"].includes(extension)) return "css";
+  if (["html", "xml", "svg"].includes(extension)) return "markup";
+  if (["rs"].includes(extension)) return "rust";
+  if (["toml"].includes(extension)) return "toml";
+  if (["md", "markdown"].includes(extension)) return "markdown";
+  if (["sh", "zsh", "bash"].includes(extension)) return "shell";
+  return "plain";
+}
+
+function buildProjectChangeBlocks(hunks: { index: number; header: string; patch: string; oldStart: number; newStart: number }[], language: string) {
+  const blocks: ProjectChangeBlock[] = [];
+
+  for (const hunk of hunks) {
+    let oldLine = hunk.oldStart;
+    let newLine = hunk.newStart;
+    let inBody = false;
+    let blockStartLine: number | null = null;
+    let blockEndLine: number | null = null;
+    let blockOriginalStart: number | null = null;
+    let originalLines: string[] = [];
+
+    const flushBlock = () => {
+      if (originalLines.length === 0 && blockStartLine === null) return;
+      const startLine = Math.max(1, blockStartLine ?? newLine);
+      const endLine = Math.max(startLine, blockEndLine ?? startLine);
+      const originalStart = Math.max(1, blockOriginalStart ?? oldLine);
+      blocks.push({
+        id: `${hunk.index}:${blocks.length}`,
+        hunkIndex: hunk.index,
+        header: hunk.header,
+        patch: hunk.patch,
+        startLine,
+        endLine,
+        originalStart,
+        originalLines: originalLines.map((content, index) => ({
+          number: originalStart + index,
+          content,
+          tokens: tokenizeProjectLine(content || " ", language),
+        })),
+      });
+      blockStartLine = null;
+      blockEndLine = null;
+      blockOriginalStart = null;
+      originalLines = [];
+    };
+
+    for (const rawLine of hunk.patch.split("\n")) {
+      if (rawLine.startsWith("@@ ")) {
+        inBody = true;
+        continue;
+      }
+      if (!inBody || rawLine.startsWith("\\ No newline")) continue;
+
+      const origin = rawLine[0];
+      const content = rawLine.slice(1);
+      if (origin === " ") {
+        flushBlock();
+        oldLine += 1;
+        newLine += 1;
+      } else if (origin === "-") {
+        if (blockOriginalStart === null) blockOriginalStart = oldLine;
+        if (blockStartLine === null) blockStartLine = Math.max(1, newLine);
+        originalLines.push(content);
+        oldLine += 1;
+      } else if (origin === "+") {
+        if (blockStartLine === null) blockStartLine = Math.max(1, newLine);
+        blockEndLine = Math.max(1, newLine);
+        newLine += 1;
+      }
+    }
+
+    flushBlock();
+  }
+
+  return blocks;
+}
+
+function tokenizeProjectLine(content: string, language: string): ProjectCodeToken[] {
+  const tokens: ProjectCodeToken[] = [];
+  const keywords = projectKeywords(language);
+  let index = 0;
+
+  const push = (text: string, kind?: ProjectCodeToken["kind"]) => {
+    if (text) tokens.push(kind ? { text, kind } : { text });
+  };
+
+  while (index < content.length) {
+    const rest = content.slice(index);
+    const char = content[index];
+
+    if (rest.startsWith("//") || (rest.startsWith("#") && ["shell", "toml"].includes(language))) {
+      push(rest, "comment");
+      break;
+    }
+
+    if (rest.startsWith("/*")) {
+      push(rest, "comment");
+      break;
+    }
+
+    if (char === "\"" || char === "'" || char === "`") {
+      let cursor = index + 1;
+      while (cursor < content.length) {
+        if (content[cursor] === "\\") {
+          cursor += 2;
+          continue;
+        }
+        if (content[cursor] === char) {
+          cursor += 1;
+          break;
+        }
+        cursor += 1;
+      }
+      push(content.slice(index, cursor), "string");
+      index = cursor;
+      continue;
+    }
+
+    const numberMatch = rest.match(/^\b\d+(?:\.\d+)?\b/);
+    if (numberMatch) {
+      push(numberMatch[0], "number");
+      index += numberMatch[0].length;
+      continue;
+    }
+
+    const wordMatch = rest.match(/^[A-Za-z_$][\w$-]*/);
+    if (wordMatch) {
+      const word = wordMatch[0];
+      const before = content.slice(0, index).trimEnd();
+      const after = content.slice(index + word.length).trimStart();
+      if (keywords.has(word)) {
+        push(word, "keyword");
+      } else if (before.endsWith(".")) {
+        push(word, "property");
+      } else if (after.startsWith("(")) {
+        push(word, "function");
+      } else {
+        push(word);
+      }
+      index += word.length;
+      continue;
+    }
+
+    if (/^[{}()[\].,;:+\-*/%=!&|<>?@]/.test(char)) {
+      push(char, "operator");
+      index += 1;
+      continue;
+    }
+
+    push(char);
+    index += 1;
+  }
+
+  return tokens.length ? tokens : [{ text: " " }];
+}
+
+function projectKeywords(language: string) {
+  const shared = [
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "let",
+    "new",
+    "null",
+    "return",
+    "static",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "while",
+  ];
+  const byLanguage: Record<string, string[]> = {
+    rust: ["fn", "impl", "let", "match", "mod", "mut", "pub", "self", "struct", "trait", "use", "where"],
+    css: ["important", "media", "supports"],
+    json: ["false", "null", "true"],
+    markup: ["DOCTYPE"],
+    markdown: [],
+    shell: ["do", "done", "elif", "fi", "for", "function", "if", "in", "then"],
+    toml: ["false", "true"],
+  };
+  return new Set([...(byLanguage[language] ?? shared), ...(language === "plain" ? [] : shared)]);
+}
+
+function logFileIndent(depth: number) {
+  return { paddingLeft: `${10 + depth * 15}px` };
+}
+
+function compareProjectTreeEntries(left: ProjectFileEntry, right: ProjectFileEntry) {
+  if (left.directory !== right.directory) {
+    return left.directory ? -1 : 1;
+  }
+  return left.name.toLocaleLowerCase().localeCompare(right.name.toLocaleLowerCase());
+}
+
+function projectCodeLineClass(line: ProjectCodeLine) {
+  const change = line.change;
+  return {
+    changed: Boolean(change),
+    expanded: Boolean(change && expandedProjectChangeId.value === change.id),
+    "change-start": Boolean(change && line.number === change.startLine),
+    "change-end": Boolean(change && line.number === change.endLine),
+  };
+}
+
+function toggleProjectChange(change: ProjectChangeBlock | null) {
+  if (!change) return;
+  expandedProjectChangeId.value = expandedProjectChangeId.value === change.id ? null : change.id;
+}
+
+async function discardProjectChange(change: ProjectChangeBlock) {
+  if (!window.confirm("撤回此差异块并恢复为原本代码？")) return;
+  await project.discardHunk(change.hunkIndex);
+  expandedProjectChangeId.value = null;
+}
+
+async function stageProjectChange(change: ProjectChangeBlock) {
+  await project.stageHunk(change.hunkIndex);
+  expandedProjectChangeId.value = null;
+}
+
+function openProjectEntry(file: ProjectFileEntry) {
+  if (file.directory) {
+    project.toggleDirectory(file.path);
+    return;
+  }
+  project.openFile(file.path).catch(() => undefined);
+}
+
+function normalizeProjectGitStatus(file: ChangedFile): ProjectGitStatus {
+  let status: ProjectGitStatus = "unknown";
+  for (const part of file.kind.split("|")) {
+    if (isProjectGitStatus(part) && projectStatusPriority[part] > projectStatusPriority[status]) {
+      status = part;
+    }
+  }
+  if (file.conflicted) return "conflicted";
+  if (file.ignored) return "ignored";
+  return status;
+}
+
+function isProjectGitStatus(value: string): value is ProjectGitStatus {
+  return value in projectStatusPriority;
+}
+
+function setProjectGitStatus(
+  statuses: Map<string, ProjectGitStatus>,
+  path: string,
+  status: ProjectGitStatus,
+) {
+  const current = statuses.get(path);
+  if (!current || projectStatusPriority[status] > projectStatusPriority[current]) {
+    statuses.set(path, status);
+  }
+}
+
+function projectStatusForPath(path: string) {
+  return projectStatusByPath.value.get(path) ?? "";
+}
+
+function projectStatusLabel(status: ProjectGitStatus | "") {
+  if (!status) return "";
+  return statusKindLabels[status] ?? status;
+}
+
+function projectFileTitle(file: ProjectFileEntry) {
+  const label = projectStatusLabel(projectStatusForPath(file.path));
+  if (file.path === PROJECT_ROOT_PATH) {
+    return label ? `${repos.path} · ${label}` : repos.path;
+  }
+  return label ? `${file.path} · ${label}` : file.path;
+}
+
+function projectFileClass(file: ProjectFileEntry) {
+  const status = projectStatusForPath(file.path);
+  return {
+    active: project.selectedPath === file.path,
+    directory: file.directory,
+    expanded: file.directory && project.isExpanded(file.path),
+    root: file.path === PROJECT_ROOT_PATH,
+    [`status-${status}`]: Boolean(status),
+  };
+}
+
+function projectTabClass(file: ProjectFileEntry) {
+  const status = projectStatusForPath(file.path);
+  return {
+    active: project.selectedPath === file.path,
+    [`status-${status}`]: Boolean(status),
+  };
+}
+
 function branchNameLabel(name?: string | null) {
   return name || "游离 HEAD";
 }
@@ -713,12 +1265,207 @@ function formatCommitTime(seconds: number) {
   return new Date(seconds * 1000).toLocaleString();
 }
 
+function formatCompactCommitTime(seconds: number) {
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(seconds * 1000));
+}
+
 function formatRefName(ref: string) {
   return ref.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\//, "").replace(/^refs\/tags\//, "");
 }
 
-function formatCommitFileStatus(file: CommitFileChange) {
-  const code = file.status.charAt(0);
+function shortRemoteBranchName(name: string, remoteName: string) {
+  return name.startsWith(`${remoteName}/`) ? name.slice(remoteName.length + 1) : name;
+}
+
+function isLogRefActive(refName: string) {
+  return history.branchFilter === refName;
+}
+
+function clearLogRef() {
+  history.branchFilter = "";
+  history.refresh().catch(() => undefined);
+}
+
+function selectLogRef(refName: string) {
+  history.branchFilter = refName;
+  history.refresh().catch(() => undefined);
+}
+
+function graphLaneX(index: number) {
+  return graphLaneInset + index * graphLaneWidth;
+}
+
+function graphPathBetween(x1: number, y1: number, x2: number, y2: number) {
+  if (x1 === x2) {
+    return `M ${x1} ${y1} L ${x2} ${y2}`;
+  }
+
+  const controlOffset = Math.max(5, Math.min(9, Math.abs(y2 - y1) * 0.45));
+  return `M ${x1} ${y1} C ${x1} ${y1 + controlOffset}, ${x2} ${y2 - controlOffset}, ${x2} ${y2}`;
+}
+
+function buildLogGraphRows(commits: CommitSummary[]): LogGraphRow[] {
+  const rows: LogGraphRow[] = [];
+  let lanes: LogGraphActiveLane[] = [];
+  let colorCursor = 0;
+
+  const nextColor = () => {
+    const color = graphPalette[colorCursor % graphPalette.length];
+    colorCursor += 1;
+    return color;
+  };
+
+  for (const item of commits) {
+    let laneIndex = lanes.findIndex((lane) => lane.oid === item.oid);
+    if (laneIndex === -1) {
+      laneIndex = Math.min(lanes.length, graphMaxVisibleLanes - 1);
+      lanes.splice(laneIndex, 0, { oid: item.oid, color: nextColor() });
+    }
+
+    const topLanes = lanes.map((lane) => ({ ...lane }));
+    const currentLane = topLanes[laneIndex];
+    const nextLanes = topLanes.filter((_lane, index) => index !== laneIndex);
+    const [firstParent, ...mergeParents] = item.parents;
+
+    if (firstParent) {
+      const existingParentIndex = nextLanes.findIndex((lane) => lane.oid === firstParent);
+      if (existingParentIndex === -1) {
+        nextLanes.splice(Math.min(laneIndex, nextLanes.length), 0, {
+          oid: firstParent,
+          color: currentLane.color,
+        });
+      }
+    }
+
+    mergeParents.forEach((parent, parentIndex) => {
+      if (nextLanes.some((lane) => lane.oid === parent)) return;
+      nextLanes.splice(Math.min(laneIndex + parentIndex + 1, nextLanes.length), 0, {
+        oid: parent,
+        color: nextColor(),
+      });
+    });
+
+    const visibleTopLanes = topLanes.slice(0, graphMaxVisibleLanes);
+    const visibleNextLanes = nextLanes.slice(0, graphMaxVisibleLanes);
+    const bottomIndexByOid = new Map(visibleNextLanes.map((lane, index) => [lane.oid, index]));
+    const paths: LogGraphPath[] = [];
+
+    visibleTopLanes.forEach((lane, index) => {
+      if (index === laneIndex && lane.oid === item.oid) return;
+      const x = graphLaneX(index);
+      const bottomIndex = bottomIndexByOid.get(lane.oid);
+      const d =
+        bottomIndex === undefined
+          ? graphPathBetween(x, 0, x, graphRowMid)
+          : graphPathBetween(x, 0, graphLaneX(bottomIndex), graphRowHeight);
+      paths.push({
+        key: `${item.oid}-lane-${lane.oid}-${index}`,
+        d,
+        color: lane.color,
+      });
+    });
+
+    if (laneIndex < graphMaxVisibleLanes) {
+      const nodeX = graphLaneX(laneIndex);
+      paths.push({
+        key: `${item.oid}-node-in`,
+        d: graphPathBetween(nodeX, 0, nodeX, graphRowMid),
+        color: currentLane.color,
+      });
+
+      item.parents.forEach((parent, parentIndex) => {
+        const bottomIndex = bottomIndexByOid.get(parent);
+        if (bottomIndex === undefined) return;
+        const parentLane = visibleNextLanes[bottomIndex];
+        paths.push({
+          key: `${item.oid}-parent-${parent}-${parentIndex}`,
+          d: graphPathBetween(nodeX, graphRowMid, graphLaneX(bottomIndex), graphRowHeight),
+          color: parentIndex === 0 ? currentLane.color : parentLane.color,
+        });
+      });
+    }
+
+    const laneCount = Math.max(
+      1,
+      Math.min(graphMaxVisibleLanes, Math.max(visibleTopLanes.length, visibleNextLanes.length, laneIndex + 1)),
+    );
+
+    rows.push({
+      item,
+      paths,
+      laneIndex,
+      color: currentLane.color,
+      nodeLeft: graphLaneX(laneIndex),
+      graphWidth: Math.max(42, graphLaneX(laneCount - 1) + 12),
+      hasMerge: item.parents.length > 1,
+    });
+
+    lanes = nextLanes.slice(0, graphMaxVisibleLanes);
+  }
+
+  return rows;
+}
+
+function buildCommitFileTreeRows(files: CommitFileChange[]): LogFileTreeRow[] {
+  const rows: LogFileTreeRow[] = [];
+  const seenDirectories = new Set<string>();
+  const sortedFiles = [...files].sort((left, right) => left.path.localeCompare(right.path));
+
+  for (const file of sortedFiles) {
+    const parts = file.path.split("/").filter(Boolean);
+    let currentPath = "";
+    for (let index = 0; index < parts.length - 1; index += 1) {
+      currentPath = currentPath ? `${currentPath}/${parts[index]}` : parts[index];
+      if (!seenDirectories.has(currentPath)) {
+        rows.push({
+          id: `dir:${currentPath}`,
+          name: parts[index],
+          path: currentPath,
+          depth: index,
+          directory: true,
+        });
+        seenDirectories.add(currentPath);
+      }
+    }
+
+    const fileName = parts.length > 0 ? parts[parts.length - 1] : file.path;
+    rows.push({
+      id: `file:${file.status}:${file.oldPath ?? ""}:${file.path}`,
+      name: fileName,
+      path: file.path,
+      depth: Math.max(0, parts.length - 1),
+      directory: false,
+      status: file.status,
+      oldPath: file.oldPath,
+    });
+  }
+
+  return rows;
+}
+
+function logGraphStyle(row: LogGraphRow) {
+  return { width: `${row.graphWidth}px` };
+}
+
+function logGraphViewBox(row: LogGraphRow) {
+  return `0 0 ${row.graphWidth} ${graphRowHeight}`;
+}
+
+function logNodeStyle(row: LogGraphRow) {
+  return {
+    left: `${row.nodeLeft}px`,
+    backgroundColor: row.color,
+  };
+}
+
+function formatCommitFileStatusCode(status = "") {
+  const code = status.charAt(0);
   const labels: Record<string, string> = {
     A: "新增",
     C: "复制",
@@ -728,7 +1475,7 @@ function formatCommitFileStatus(file: CommitFileChange) {
     T: "类型变更",
     U: "冲突",
   };
-  return labels[code] ?? file.status;
+  return labels[code] ?? status;
 }
 
 function formatOperationName(name?: string | null) {
@@ -1030,8 +1777,6 @@ function deleteChangelist(id: string) {
       <ProjectPane
         v-if="settings.panelVisibility.project"
         @choose-repository="chooseRepository"
-        @clone-repository="cloneRepositoryFromInput"
-        @init-repository="initRepositoryFromInput"
         @remove-repository="removeRepository"
         @switch-repository="switchRepository"
       />
@@ -1050,7 +1795,7 @@ function deleteChangelist(id: string) {
       />
 
       <WorkbenchRail
-        v-if="repos.current"
+        v-if="repos.current || repos.selectedPath"
         v-model:mode="workbenchMode"
         :conflict-count="conflictedFiles.length"
       />
@@ -1436,7 +2181,20 @@ function deleteChangelist(id: string) {
       />
 
       <section v-if="!repos.current" class="empty-workbench">
-        <div class="empty-panel">
+        <div v-if="repos.selectedPath" class="empty-panel project-init-panel">
+          <ListChecks :size="40" />
+          <h1>项目尚未初始化</h1>
+          <p>{{ repos.selectedPath }}</p>
+          <button
+            class="tool-button primary large"
+            :disabled="advanced.loading || !repos.selectedPath"
+            @click="initSelectedProject"
+          >
+            <Plus :size="18" />
+            <span>{{ advanced.loading ? "初始化中" : "初始化仓库" }}</span>
+          </button>
+        </div>
+        <div v-else class="empty-panel">
           <ListChecks :size="40" />
           <h1>选择本地 Git 仓库</h1>
           <button class="tool-button primary large" @click="chooseRepository">
@@ -1681,52 +2439,130 @@ function deleteChangelist(id: string) {
         </form>
       </section>
 
-      <section v-else-if="settings.panelVisibility.changes && workbenchMode === 'log'" class="history-pane">
+      <section v-else-if="settings.panelVisibility.changes && workbenchMode === 'log'" class="history-pane log-ref-pane">
         <div class="history-header">
           <div class="section-title">
-            <GitCommitVertical :size="16" />
-            <span>提交日志</span>
+            <GitBranch :size="16" />
+            <span>引用</span>
           </div>
-          <span>{{ history.commits.length }} 条</span>
-        </div>
-
-        <div class="log-filter-panel">
-          <label>
-            <Search :size="13" />
-            <input v-model="history.query" placeholder="搜索提交、哈希、引用" @keydown.enter="history.refresh" />
-          </label>
-          <select v-model="history.branchFilter" class="remote-select" @change="history.refresh">
-            <option value="">全部引用</option>
-            <option v-for="target in allRefTargets" :key="`log-filter-${target}`" :value="target">
-              {{ target }}
-            </option>
-          </select>
-          <input v-model="history.authorFilter" placeholder="作者" @keydown.enter="history.refresh" />
-          <input v-model="history.pathFilter" placeholder="路径" @keydown.enter="history.refresh" />
-          <button class="icon-button" :disabled="history.loading" @click="history.refresh">
+          <button class="icon-only-button" title="刷新引用和日志" :disabled="history.loading || branches.loading" @click="refreshAll">
             <RefreshCw :size="14" />
-            <span>过滤</span>
           </button>
         </div>
 
-        <div class="commit-list">
-          <button
-            v-for="item in history.commits"
-            :key="item.oid"
-            class="commit-row"
-            :class="{ active: history.selectedOid === item.oid }"
-            @click="selectCommit(item.oid)"
-          >
-            <span class="commit-node" />
-            <span class="commit-copy">
-              <strong>{{ item.summary }}</strong>
-              <small>{{ item.authorName }} · {{ formatCommitTime(item.authorTime) }}</small>
-              <span v-if="item.refs.length" class="commit-refs">
-                <em v-for="refName in item.refs" :key="refName">{{ formatRefName(refName) }}</em>
-              </span>
+        <div class="log-ref-list">
+          <button class="log-ref-row head" :class="{ active: !history.branchFilter }" @click="clearLogRef">
+            <GitCommitVertical :size="15" />
+            <span>
+              <strong>{{ logHeadLabel }}</strong>
+              <small>{{ shortHash(branch?.head) }}</small>
             </span>
-            <code>{{ item.shortOid }}</code>
           </button>
+
+          <div class="branch-group-label">本地</div>
+          <button
+            v-for="branchItem in branches.sortedLocalBranches"
+            :key="`log-local-${branchItem.fullName}`"
+            class="log-ref-row"
+            :class="{ active: isLogRefActive(branchItem.name), current: branchItem.current }"
+            :title="branchItem.fullName"
+            @click="selectLogRef(branchItem.name)"
+          >
+            <span class="branch-dot" />
+            <span>
+              <strong>{{ branchItem.name }}</strong>
+              <small v-if="branchItem.upstream">
+                {{ formatRefName(branchItem.upstream) }} · +{{ branchItem.ahead }} / -{{ branchItem.behind }}
+              </small>
+              <small v-else>{{ branchItem.current ? "当前分支" : "未设置上游" }}</small>
+            </span>
+            <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+          </button>
+
+          <div v-if="logRemoteGroups.length" class="branch-group-label">远端</div>
+          <section v-for="group in logRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
+            <div class="log-ref-group-title">
+              <Folder :size="13" />
+              <span>{{ group.name }}</span>
+              <small>{{ group.branches.length }}</small>
+            </div>
+            <button
+              v-for="branchItem in group.branches"
+              :key="`log-remote-${branchItem.fullName}`"
+              class="log-ref-row remote"
+              :class="{ active: isLogRefActive(branchItem.name) }"
+              :title="branchItem.fullName"
+              @click="selectLogRef(branchItem.name)"
+            >
+              <GitBranch :size="13" />
+              <span>
+                <strong>{{ shortRemoteBranchName(branchItem.name, group.name) }}</strong>
+                <small>{{ shortHash(branchItem.target) }}</small>
+              </span>
+              <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+            </button>
+          </section>
+
+          <div v-if="branches.list?.tags.length" class="branch-group-label">标签</div>
+          <button
+            v-for="tag in branches.list?.tags ?? []"
+            :key="`log-tag-${tag.name}`"
+            class="log-ref-row remote"
+            :class="{ active: isLogRefActive(tag.name) }"
+            :title="tag.name"
+            @click="selectLogRef(tag.name)"
+          >
+            <span class="tag-dot" />
+            <span>
+              <strong>{{ tag.name }}</strong>
+              <small>{{ shortHash(tag.target) }}</small>
+            </span>
+          </button>
+        </div>
+      </section>
+
+      <section v-else-if="settings.panelVisibility.changes && workbenchMode === 'project'" class="project-tree-pane">
+        <div class="history-header">
+          <div class="section-title">
+            <FolderOpen :size="16" />
+            <span>项目文件</span>
+          </div>
+          <button class="icon-only-button" title="刷新项目文件" :disabled="project.loading" @click="project.refresh()">
+            <RefreshCw :size="14" />
+          </button>
+        </div>
+
+        <div class="project-file-browser">
+          <div class="project-file-list">
+            <button
+              v-for="file in visibleProjectFiles"
+              :key="file.path"
+              class="project-file-row"
+              :class="projectFileClass(file)"
+              :style="projectFileIndent(file)"
+              :title="projectFileTitle(file)"
+              :aria-expanded="file.directory ? project.isExpanded(file.path) : undefined"
+              @click="openProjectEntry(file)"
+            >
+              <span class="project-file-disclosure">
+                <ChevronDown v-if="file.directory && project.isExpanded(file.path)" :size="13" />
+                <ChevronRight v-else-if="file.directory" :size="13" />
+              </span>
+              <FolderOpen v-if="file.directory && project.isExpanded(file.path)" :size="14" />
+              <Folder v-else-if="file.directory" :size="14" />
+              <FileIcon v-else :size="14" />
+              <span class="project-file-name" :class="{ root: file.path === PROJECT_ROOT_PATH }">
+                <template v-if="file.path === PROJECT_ROOT_PATH">
+                  <strong>{{ file.name }}</strong>
+                  <small>{{ repos.path }}</small>
+                </template>
+                <template v-else>{{ file.name }}</template>
+              </span>
+              <span class="project-status-marker" :title="projectStatusLabel(projectStatusForPath(file.path))" />
+            </button>
+            <div v-if="project.loading" class="project-file-empty">加载中</div>
+            <div v-else-if="project.files.length === 0" class="project-file-empty">暂无文件</div>
+          </div>
         </div>
       </section>
 
@@ -1841,6 +2677,99 @@ function deleteChangelist(id: string) {
           <summary>基线版本</summary>
           <pre>{{ operations.conflict.base }}</pre>
         </details>
+        </template>
+
+        <template v-else-if="workbenchMode === 'project'">
+        <div v-if="project.openTabs.length" class="project-tabs" role="tablist" aria-label="打开的项目文件">
+          <div
+            v-for="tab in project.openTabs"
+            :key="tab.path"
+            class="project-tab"
+            :class="projectTabClass(tab)"
+          >
+            <button
+              class="project-tab-select"
+              role="tab"
+              :aria-selected="project.selectedPath === tab.path"
+              :title="projectFileTitle(tab)"
+              @click="project.selectTab(tab.path)"
+            >
+              <FileIcon :size="14" />
+              <span>{{ tab.name }}</span>
+            </button>
+            <button class="project-tab-close" title="关闭文件" @click.stop="project.closeTab(tab.path)">
+              <X :size="13" />
+            </button>
+          </div>
+        </div>
+
+        <div v-if="activeError" class="message error">{{ activeError }}</div>
+        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
+
+        <div class="project-editor">
+          <div v-if="project.contentLoading || project.loading" class="diff-empty">加载中</div>
+          <div v-else-if="project.content?.binary" class="diff-empty">
+            二进制文件，大小 {{ formatBytes(project.content.size) }}
+          </div>
+          <div v-else-if="!project.content" class="diff-empty">选择一个项目文件</div>
+          <div v-else class="project-lines" role="code" :aria-label="project.selectedPath || '项目文件'">
+            <template v-for="line in projectContentLines" :key="line.index">
+              <div
+                class="project-line"
+                :class="projectCodeLineClass(line)"
+                :title="line.change ? '查看原本代码' : undefined"
+                :tabindex="line.change ? 0 : undefined"
+                @click="toggleProjectChange(line.change)"
+                @keydown.enter.prevent="toggleProjectChange(line.change)"
+                @keydown.space.prevent="toggleProjectChange(line.change)"
+              >
+                <span class="line-number">{{ line.number }}</span>
+                <span class="line-content">
+                  <span
+                    v-for="(token, tokenIndex) in line.tokens"
+                    :key="tokenIndex"
+                    :class="token.kind ? `syntax-${token.kind}` : undefined"
+                  >{{ token.text }}</span>
+                </span>
+              </div>
+              <div v-if="line.reveal" class="project-original-panel">
+                <div class="project-original-gutter">↳</div>
+                <div class="project-original-card">
+                  <div class="project-original-toolbar">
+                    <span>原本代码 · {{ line.reveal.header }}</span>
+                    <div class="project-original-actions">
+                      <button class="tool-button" :disabled="project.contentLoading" @click.stop="stageProjectChange(line.reveal)">
+                        <Check :size="14" />
+                        <span>暂存此块</span>
+                      </button>
+                      <button class="tool-button" :disabled="project.contentLoading" @click.stop="discardProjectChange(line.reveal)">
+                        <RotateCcw :size="14" />
+                        <span>撤回此块</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div v-if="line.reveal.originalLines.length" class="project-original-code">
+                    <div
+                      v-for="original in line.reveal.originalLines"
+                      :key="original.number"
+                      class="project-original-line"
+                    >
+                      <span class="line-number">{{ original.number }}</span>
+                      <span class="line-content">
+                        <span
+                          v-for="(token, tokenIndex) in original.tokens"
+                          :key="tokenIndex"
+                          :class="token.kind ? `syntax-${token.kind}` : undefined"
+                        >{{ token.text }}</span>
+                      </span>
+                    </div>
+                  </div>
+                  <div v-else class="project-original-empty">此处原本没有这些行</div>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
         </template>
 
         <template v-else-if="workbenchMode === 'changes'">
@@ -2116,121 +3045,185 @@ function deleteChangelist(id: string) {
         </template>
 
         <template v-else-if="workbenchMode === 'log'">
-        <div class="diff-header">
-          <div>
-            <span class="eyebrow">提交详情</span>
-            <h2>{{ selectedCommitTitle }}</h2>
-          </div>
-          <div class="log-actions">
-            <button class="tool-button" :disabled="!history.selectedOid || operations.loading" @click="cherryPickSelectedCommit">
-              <GitCommitVertical :size="14" />
-              <span>挑选提交</span>
-            </button>
-            <button class="tool-button" :disabled="!history.selectedOid || advanced.loading" @click="checkoutSelectedRevision">
-              <GitBranch :size="14" />
-              <span>检出</span>
-            </button>
-            <button class="tool-button" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(false)">
-              <Plus :size="14" />
-              <span>修正</span>
-            </button>
-            <button class="tool-button" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(true)">
-              <Plus :size="14" />
-              <span>压缩</span>
-            </button>
-            <button
-              class="tool-button"
-              :disabled="!history.selectedOid || selectedCommitFilePaths.length === 0 || operations.loading"
-              @click="cherryPickSelectedFiles"
-            >
-              <Download :size="14" />
-              <span>应用文件</span>
-            </button>
-            <button class="tool-button" :disabled="!history.selectedOid || operations.loading" @click="revertSelectedCommit">
-              <RotateCcw :size="14" />
-              <span>反向提交</span>
-            </button>
-            <label class="log-option" title="只应用反向变更，不自动创建 revert 提交">
-              <input v-model="operations.revertNoCommit" type="checkbox" />
-              <span>不自动提交</span>
-            </label>
-            <select v-model="operations.resetMode" class="reset-select" title="重置模式">
-              <option value="soft">软重置</option>
-              <option value="mixed">混合重置</option>
-              <option value="hard">硬重置</option>
-            </select>
-            <button class="tool-button danger" :disabled="!history.selectedOid || operations.loading" @click="resetToSelectedCommit">
-              <Trash2 :size="14" />
-              <span>重置</span>
-            </button>
-            <button class="tool-button danger" :disabled="!branch?.head || operations.loading" @click="undoLastCommit">
-              <RotateCcw :size="14" />
-              <span>撤销提交</span>
-            </button>
-            <button class="tool-button danger" :disabled="!history.selectedOid || advanced.loading" @click="dropSelectedCommit">
-              <Trash2 :size="14" />
-              <span>丢弃提交</span>
-            </button>
-            <button class="tool-button" :disabled="!history.selectedOid || advanced.loading || !remote.selectedRemote" @click="pushSelectedCommit">
-              <Upload :size="14" />
-              <span>推送提交</span>
-            </button>
-            <label class="log-option" title="撤销提交后保留为已暂存变更">
-              <input v-model="operations.undoKeepStaged" type="checkbox" />
-              <span>保留暂存</span>
-            </label>
-            <button class="tool-button" :disabled="history.loading" @click="history.refresh()">
-              <RefreshCw :size="14" />
-              <span>刷新日志</span>
-            </button>
-          </div>
-        </div>
+        <div class="log-workbench">
+          <section class="log-commit-panel">
+            <div class="log-topbar">
+              <label class="log-search-field">
+                <Search :size="14" />
+                <input v-model="history.query" placeholder="文字或哈希" @keydown.enter="history.refresh" />
+              </label>
+              <input v-model="history.authorFilter" class="log-mini-filter" placeholder="作者" @keydown.enter="history.refresh" />
+              <input v-model="history.pathFilter" class="log-mini-filter" placeholder="路径" @keydown.enter="history.refresh" />
+              <span class="log-filter-chip" :class="{ active: logFilterActive }">
+                分支: {{ activeLogRefLabel }}
+                <button v-if="history.branchFilter" title="清除分支过滤" @click="clearLogRef">
+                  <X :size="12" />
+                </button>
+              </span>
+              <button class="icon-only-button" title="刷新日志" :disabled="history.loading" @click="history.refresh()">
+                <RefreshCw :size="14" />
+              </button>
+            </div>
 
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
+            <div v-if="activeError" class="message error">{{ activeError }}</div>
+            <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
-        <div v-if="history.details" class="commit-detail-strip">
-          <div>
-            <span>作者</span>
-            <strong>{{ history.details.commit.authorName }}</strong>
-          </div>
-          <div>
-            <span>时间</span>
-            <strong>{{ formatCommitTime(history.details.commit.authorTime) }}</strong>
-          </div>
-          <div>
-            <span>父提交</span>
-            <strong>{{ history.details.commit.parents.length || "无" }}</strong>
-          </div>
-        </div>
+            <div class="log-table-head">
+              <span />
+              <span>提交</span>
+              <span>作者</span>
+              <span>日期</span>
+            </div>
 
-        <div v-if="history.details?.files.length" class="commit-files">
-          <div
-            v-for="file in history.details.files"
-            :key="`${file.status}-${file.oldPath ?? ''}-${file.path}`"
-            class="commit-file-row"
-          >
-            <input
-              type="checkbox"
-              :checked="selectedCommitFilePaths.includes(file.path)"
-              @change="toggleCommitFile(file.path)"
-            />
-            <span class="kind-badge">{{ formatCommitFileStatus(file) }}</span>
-            <strong>{{ file.path }}</strong>
-            <small v-if="file.oldPath">{{ file.oldPath }}</small>
-          </div>
-        </div>
+            <div class="log-commit-list">
+              <button
+                v-for="row in logGraphRows"
+                :key="row.item.oid"
+                class="log-commit-row"
+                :class="{ active: history.selectedOid === row.item.oid }"
+                @click="selectCommit(row.item.oid)"
+              >
+                <span class="log-graph-cell" :class="{ merge: row.hasMerge }" :style="logGraphStyle(row)">
+                  <svg class="log-graph-svg" :viewBox="logGraphViewBox(row)" preserveAspectRatio="none" aria-hidden="true">
+                    <path
+                      v-for="path in row.paths"
+                      :key="path.key"
+                      class="log-graph-path"
+                      :d="path.d"
+                      :stroke="path.color"
+                    />
+                  </svg>
+                  <span class="log-graph-node" :style="logNodeStyle(row)" />
+                </span>
+                <span class="log-subject">
+                  <strong>{{ row.item.summary }}</strong>
+                  <span v-if="row.item.refs.length" class="commit-refs">
+                    <em v-for="refName in row.item.refs" :key="refName">{{ formatRefName(refName) }}</em>
+                  </span>
+                </span>
+                <span class="log-author">{{ row.item.authorName }}</span>
+                <time class="log-date">{{ formatCompactCommitTime(row.item.authorTime) }}</time>
+              </button>
+              <div v-if="history.loading" class="diff-empty">加载中</div>
+              <div v-else-if="history.commits.length === 0" class="diff-empty">没有提交历史</div>
+            </div>
+          </section>
 
-        <div class="diff-scroller">
-          <div v-if="history.detailLoading || history.loading" class="diff-empty">加载中</div>
-          <div v-else-if="!history.details" class="diff-empty">没有提交历史</div>
-          <pre v-else class="diff-lines"><code
-            v-for="line in commitDiffLines"
-            :key="line.index"
-            class="diff-line"
-            :class="line.type"
-          ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
+          <aside class="log-detail-panel">
+            <section class="log-files-panel">
+              <div class="log-panel-header">
+                <div class="section-title">
+                  <FolderOpen :size="15" />
+                  <span>文件</span>
+                </div>
+                <small>{{ history.details?.files.length ?? 0 }} 个文件</small>
+              </div>
+              <div class="log-file-tree">
+                <div v-if="history.detailLoading" class="diff-empty">加载中</div>
+                <div v-else-if="!history.details" class="diff-empty">选择一个提交</div>
+                <div v-else-if="commitFileTreeRows.length === 0" class="diff-empty">没有文件变更</div>
+                <template v-else>
+                  <button
+                    v-for="row in commitFileTreeRows"
+                    :key="row.id"
+                    class="log-file-tree-row"
+                    :class="{ directory: row.directory, selected: !row.directory && selectedCommitFilePaths.includes(row.path) }"
+                    :style="logFileIndent(row.depth)"
+                    :title="row.path"
+                    @click="!row.directory && toggleCommitFile(row.path)"
+                  >
+                    <Folder v-if="row.directory" :size="14" />
+                    <FileIcon v-else :size="14" />
+                    <span>{{ row.name }}</span>
+                    <small v-if="!row.directory">{{ formatCommitFileStatusCode(row.status) }}</small>
+                  </button>
+                </template>
+              </div>
+            </section>
+
+            <section class="log-info-panel">
+              <div v-if="history.details" class="log-info-body">
+                <h2 :title="selectedCommitTitle">{{ history.details.commit.summary }}</h2>
+                <p>
+                  <strong>{{ history.details.commit.shortOid }}</strong>
+                  {{ history.details.commit.authorName }} &lt;{{ history.details.commit.authorEmail }}&gt;
+                </p>
+                <p>{{ formatCommitTime(history.details.commit.authorTime) }}</p>
+                <div v-if="selectedCommitRefs.length" class="commit-refs">
+                  <em v-for="refName in selectedCommitRefs" :key="refName">{{ refName }}</em>
+                </div>
+                <p>父提交: {{ history.details.commit.parents.length || "无" }}</p>
+              </div>
+              <div v-else class="diff-empty">选择一个提交</div>
+
+              <div class="log-detail-actions">
+                <button class="icon-only-button" title="挑选提交" :disabled="!history.selectedOid || operations.loading" @click="cherryPickSelectedCommit">
+                  <GitCommitVertical :size="14" />
+                </button>
+                <button class="icon-only-button" title="检出此提交" :disabled="!history.selectedOid || advanced.loading" @click="checkoutSelectedRevision">
+                  <GitBranch :size="14" />
+                </button>
+                <button class="icon-only-button" title="创建修正提交" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(false)">
+                  <Plus :size="14" />
+                </button>
+                <button class="icon-only-button" title="创建压缩提交" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(true)">
+                  <Plus :size="14" />
+                </button>
+                <button
+                  class="icon-only-button"
+                  title="应用选中文件"
+                  :disabled="!history.selectedOid || selectedCommitFilePaths.length === 0 || operations.loading"
+                  @click="cherryPickSelectedFiles"
+                >
+                  <Download :size="14" />
+                </button>
+                <button class="icon-only-button" title="反向提交" :disabled="!history.selectedOid || operations.loading" @click="revertSelectedCommit">
+                  <RotateCcw :size="14" />
+                </button>
+                <button class="icon-only-button danger" title="重置到此提交" :disabled="!history.selectedOid || operations.loading" @click="resetToSelectedCommit">
+                  <Trash2 :size="14" />
+                </button>
+                <button class="icon-only-button danger" title="撤销最后一次提交" :disabled="!branch?.head || operations.loading" @click="undoLastCommit">
+                  <RotateCcw :size="14" />
+                </button>
+                <button class="icon-only-button danger" title="丢弃提交" :disabled="!history.selectedOid || advanced.loading" @click="dropSelectedCommit">
+                  <Trash2 :size="14" />
+                </button>
+                <button class="icon-only-button" title="推送提交" :disabled="!history.selectedOid || advanced.loading || !remote.selectedRemote" @click="pushSelectedCommit">
+                  <Upload :size="14" />
+                </button>
+              </div>
+
+              <div class="log-operation-options">
+                <label class="log-option" title="只应用反向变更，不自动创建 revert 提交">
+                  <input v-model="operations.revertNoCommit" type="checkbox" />
+                  <span>revert 不提交</span>
+                </label>
+                <label class="log-option" title="撤销提交后保留为已暂存变更">
+                  <input v-model="operations.undoKeepStaged" type="checkbox" />
+                  <span>撤销后暂存</span>
+                </label>
+                <select v-model="operations.resetMode" class="reset-select" title="重置模式">
+                  <option value="soft">软重置</option>
+                  <option value="mixed">混合重置</option>
+                  <option value="hard">硬重置</option>
+                </select>
+              </div>
+
+              <details v-if="history.details" class="log-diff-preview">
+                <summary>补丁</summary>
+                <div class="diff-scroller">
+                  <pre class="diff-lines"><code
+                    v-for="line in commitDiffLines"
+                    :key="line.index"
+                    class="diff-line"
+                    :class="line.type"
+                  ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
 </code></pre>
+                </div>
+              </details>
+            </section>
+          </aside>
         </div>
         </template>
 
@@ -2306,7 +3299,7 @@ function deleteChangelist(id: string) {
               <Download :size="14" />
               <span>获取</span>
             </button>
-            <button class="tool-button" :disabled="repos.items.length === 0 || remote.loading" @click="fetchAllRepositories">
+            <button class="tool-button" :disabled="repos.initializedItems.length === 0 || remote.loading" @click="fetchAllRepositories">
               <Download :size="14" />
               <span>全部获取</span>
             </button>
@@ -2722,6 +3715,16 @@ button:disabled {
   font-size: 22px;
 }
 
+.empty-panel p {
+  max-width: min(560px, 70vw);
+  margin: -6px 0 2px;
+  color: #68766f;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
 .workspace {
   display: grid;
   grid-template-columns: 220px 280px 390px minmax(0, 1fr);
@@ -2743,6 +3746,7 @@ button:disabled {
 .project-pane,
 .repo-pane,
 .history-pane,
+.project-tree-pane,
 .changes-pane,
 .diff-pane {
   min-height: 0;
@@ -2779,6 +3783,12 @@ button:disabled {
   overflow: auto;
   scrollbar-gutter: stable;
   background: #f6f7f3;
+}
+
+.project-tree-pane {
+  display: grid;
+  grid-template-rows: 46px minmax(0, 1fr);
+  background: #fbfcfa;
 }
 
 .workbench-rail {
@@ -2920,6 +3930,14 @@ button:disabled {
   background: #4c82d9;
 }
 
+.project-row.uninitialized .project-dot {
+  background: #c18a25;
+}
+
+.project-row.uninitialized.active .project-dot {
+  background: #d79c2f;
+}
+
 .project-copy {
   display: grid;
   min-width: 0;
@@ -2966,23 +3984,187 @@ button:disabled {
   background: #ffffff;
 }
 
-.quick-create {
+.project-file-browser {
   display: grid;
-  gap: 7px;
+  gap: 8px;
   margin-top: 14px;
   padding-top: 12px;
   border-top: 1px solid #dce2dd;
 }
 
-.quick-create input {
-  min-width: 0;
-  width: 100%;
-  height: 30px;
-  padding: 0 8px;
-  border: 1px solid #c5cec8;
-  border-radius: 7px;
+.project-tree-pane .project-file-browser {
+  min-height: 0;
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.project-file-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-file-list {
+  display: grid;
+  align-content: start;
+  max-height: calc(100vh - 250px);
+  overflow: auto;
+}
+
+.project-tree-pane .project-file-list {
+  min-height: 0;
+  max-height: none;
+}
+
+.project-file-row {
+  display: grid;
+  grid-template-columns: 14px 16px minmax(0, 1fr) 8px;
+  align-items: center;
+  gap: 5px;
+  min-height: 28px;
+  padding: 0 8px 0 6px;
+  border: 0;
+  border-radius: 6px;
   color: #26312c;
-  background: #ffffff;
+  background: transparent;
+  text-align: left;
+}
+
+.project-file-row.directory {
+  color: #4f5e56;
+  font-weight: 700;
+}
+
+.project-file-row.root {
+  min-height: 30px;
+  margin-bottom: 2px;
+  color: #233228;
+  background: #e7edf8;
+  font-weight: 800;
+}
+
+.project-file-disclosure {
+  display: grid;
+  place-items: center;
+  width: 14px;
+  color: #7a877f;
+}
+
+.project-status-marker {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+}
+
+.project-file-row.status-added,
+.project-tab.status-added {
+  color: #237044;
+}
+
+.project-file-row.status-modified,
+.project-file-row.status-typechange,
+.project-tab.status-modified,
+.project-tab.status-typechange {
+  color: #8b6500;
+}
+
+.project-file-row.status-deleted,
+.project-tab.status-deleted {
+  color: #b7332c;
+}
+
+.project-file-row.status-renamed,
+.project-tab.status-renamed {
+  color: #3463a6;
+}
+
+.project-file-row.status-conflicted,
+.project-tab.status-conflicted {
+  color: #b64200;
+}
+
+.project-file-row.status-ignored,
+.project-tab.status-ignored {
+  color: #8b9690;
+}
+
+.project-file-row.status-added .project-status-marker,
+.project-tab.status-added::before {
+  background: #2f9d58;
+}
+
+.project-file-row.status-modified .project-status-marker,
+.project-file-row.status-typechange .project-status-marker,
+.project-tab.status-modified::before,
+.project-tab.status-typechange::before {
+  background: #d39a00;
+}
+
+.project-file-row.status-deleted .project-status-marker,
+.project-tab.status-deleted::before {
+  background: #d14b42;
+}
+
+.project-file-row.status-renamed .project-status-marker,
+.project-tab.status-renamed::before {
+  background: #4b7fd0;
+}
+
+.project-file-row.status-conflicted .project-status-marker,
+.project-tab.status-conflicted::before {
+  background: #e06416;
+}
+
+.project-file-row.status-ignored .project-status-marker,
+.project-tab.status-ignored::before {
+  background: #9aa39e;
+}
+
+.project-file-row:hover:not(:disabled),
+.project-file-row.active {
+  background: #e8f0fb;
+}
+
+.project-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.project-file-name.root {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.project-file-name.root strong,
+.project-file-name.root small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-file-name.root strong {
+  flex: 0 1 auto;
+  min-width: max-content;
+  font-size: 12px;
+}
+
+.project-file-name.root small {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: #76827b;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.project-file-empty {
+  padding: 10px 8px;
+  color: #738077;
   font-size: 12px;
 }
 
@@ -3898,6 +5080,446 @@ button:disabled {
   white-space: nowrap;
 }
 
+.log-ref-pane {
+  grid-template-rows: 46px minmax(0, 1fr);
+}
+
+.log-ref-list {
+  min-height: 0;
+  overflow: auto;
+  padding: 8px;
+}
+
+.log-ref-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: #25312b;
+  background: transparent;
+  text-align: left;
+}
+
+.log-ref-row:hover,
+.log-ref-row.active {
+  background: #e8f0fb;
+}
+
+.log-ref-row.active {
+  border-color: #9db8dc;
+}
+
+.log-ref-row.current .branch-dot {
+  background: #d0a044;
+}
+
+.log-ref-row span {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+
+.log-ref-row strong,
+.log-ref-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-ref-row strong {
+  font-size: 12px;
+}
+
+.log-ref-row small,
+.log-ref-group-title small {
+  color: #6b766f;
+  font-size: 11px;
+}
+
+.log-ref-group {
+  display: grid;
+  gap: 2px;
+}
+
+.log-ref-group-title {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 8px;
+  color: #627168;
+  font-size: 12px;
+}
+
+.tag-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: #d0a044;
+  transform: rotate(45deg);
+}
+
+.log-workbench {
+  display: grid;
+  grid-template-columns: minmax(440px, 1fr) minmax(280px, 330px);
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  background: #ffffff;
+}
+
+.log-commit-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  border-right: 1px solid #dce2dd;
+}
+
+.log-topbar {
+  display: grid;
+  grid-template-columns: minmax(160px, 1.2fr) minmax(82px, 0.55fr) minmax(82px, 0.55fr) auto 34px;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 48px;
+  min-width: 0;
+  padding: 7px 10px;
+  border-bottom: 1px solid #dce2dd;
+  background: #f6f8f6;
+}
+
+.log-search-field {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid #c5cec8;
+  border-radius: 7px;
+  color: #68766f;
+  background: #ffffff;
+}
+
+.log-search-field input,
+.log-mini-filter {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  color: #26312c;
+  background: transparent;
+  font-size: 12px;
+}
+
+.log-mini-filter {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid #c5cec8;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.log-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 180px;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid #d4dcd6;
+  border-radius: 7px;
+  color: #627168;
+  background: #ffffff;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-filter-chip.active {
+  border-color: #9db8dc;
+  color: #365f91;
+  background: #e9f0f7;
+}
+
+.log-filter-chip button {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+}
+
+.log-table-head,
+.log-commit-row {
+  display: grid;
+  grid-template-columns: 94px minmax(0, 1fr) minmax(82px, 108px) minmax(124px, 152px);
+  align-items: center;
+  gap: 8px;
+}
+
+.log-table-head {
+  flex: 0 0 28px;
+  padding: 0 12px 0 0;
+  border-bottom: 1px solid #eef1ed;
+  color: #728078;
+  background: #fbfcfa;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.log-commit-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: #ffffff;
+}
+
+.log-commit-row {
+  position: relative;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 12px 0 0;
+  border: 0;
+  color: #25312b;
+  background: transparent;
+  text-align: left;
+}
+
+.log-commit-row:hover,
+.log-commit-row.active {
+  background: #e8f0fb;
+}
+
+.log-commit-row.active::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 3px;
+  background: #4c82d9;
+}
+
+.log-graph-cell {
+  position: relative;
+  align-self: stretch;
+  min-width: 42px;
+  margin-left: 7px;
+  overflow: visible;
+}
+
+.log-graph-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.log-graph-path {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.log-graph-node {
+  position: absolute;
+  top: 50%;
+  z-index: 1;
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--graph-node-ring, #ffffff);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(57, 48, 28, 0.18);
+  transform: translate(-50%, -50%);
+}
+
+.log-subject {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.log-subject strong,
+.log-author,
+.log-date {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-subject strong {
+  min-width: 0;
+  color: #25312b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.log-author,
+.log-date {
+  color: #536159;
+  font-size: 12px;
+}
+
+.log-date {
+  text-align: right;
+}
+
+.log-detail-panel {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  min-height: 0;
+  min-width: 0;
+  background: #fbfcfa;
+}
+
+.log-files-panel {
+  display: grid;
+  grid-template-rows: 42px minmax(0, 1fr);
+  min-height: 0;
+  border-bottom: 1px solid #dce2dd;
+}
+
+.log-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 12px;
+  border-bottom: 1px solid #eef1ed;
+}
+
+.log-panel-header small {
+  color: #728078;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.log-file-tree {
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 0;
+}
+
+.log-file-tree-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 25px;
+  padding: 0 10px;
+  border: 0;
+  color: #25312b;
+  background: transparent;
+  text-align: left;
+}
+
+.log-file-tree-row:hover,
+.log-file-tree-row.selected {
+  background: #eef4ef;
+}
+
+.log-file-tree-row.directory {
+  color: #4c5a52;
+  cursor: default;
+}
+
+.log-file-tree-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-file-tree-row small {
+  color: #6b766f;
+  font-size: 10px;
+}
+
+.log-info-panel {
+  display: grid;
+  gap: 8px;
+  min-height: 190px;
+  padding: 14px;
+}
+
+.log-info-body {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.log-info-body h2 {
+  margin: 0;
+  color: #25312b;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+.log-info-body p {
+  margin: 0;
+  color: #5d6a63;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.log-info-body p strong {
+  color: #25312b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.log-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.log-operation-options {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.log-operation-options .reset-select {
+  height: 30px;
+}
+
+.log-diff-preview {
+  min-width: 0;
+}
+
+.log-diff-preview summary {
+  cursor: pointer;
+  color: #536159;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.log-diff-preview .diff-scroller {
+  max-height: 260px;
+  margin-top: 8px;
+  border: 1px solid #dce2dd;
+  border-radius: 7px;
+}
+
 .segmented {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -4569,6 +6191,88 @@ button:disabled {
   background: #fbfcfa;
 }
 
+.project-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  min-height: 38px;
+  overflow-x: auto;
+  border-bottom: 1px solid #dce2dd;
+  background: #f3f5f2;
+}
+
+.project-tab {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  align-items: stretch;
+  min-width: 136px;
+  max-width: 240px;
+  border-right: 1px solid #dce2dd;
+  color: #445149;
+  background: #edf1ec;
+}
+
+.project-tab::before {
+  content: "";
+  position: absolute;
+  left: 10px;
+  bottom: 0;
+  width: 42px;
+  height: 2px;
+  background: transparent;
+}
+
+.project-tab.active {
+  color: #202b26;
+  background: #fbfcfa;
+}
+
+.project-tab.active::before {
+  background: #4c82d9;
+}
+
+.project-tab-select,
+.project-tab-close {
+  min-width: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+}
+
+.project-tab-select {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 10px;
+  text-align: left;
+}
+
+.project-tab-select span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.project-tab-close {
+  display: grid;
+  place-items: center;
+  color: #7a877f;
+}
+
+.project-tab:hover,
+.project-tab-close:hover {
+  background: #e4e9e3;
+}
+
+.project-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  background: #fbfcfa;
+}
+
 .diff-empty {
   display: grid;
   place-items: center;
@@ -4576,7 +6280,8 @@ button:disabled {
   color: #6c7971;
 }
 
-.diff-lines {
+.diff-lines,
+.project-lines {
   margin: 0;
   padding: 12px 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -4585,11 +6290,57 @@ button:disabled {
   tab-size: 2;
 }
 
-.diff-line {
+.diff-line,
+.project-line,
+.project-original-line {
   display: grid;
   grid-template-columns: 58px max-content;
   min-height: 18px;
   white-space: pre;
+}
+
+.project-line {
+  position: relative;
+}
+
+.project-line.changed {
+  cursor: pointer;
+  background: #fff6f3;
+}
+
+.project-line.changed:hover,
+.project-line.changed.expanded {
+  background: #ffece8;
+}
+
+.project-line.changed .line-number {
+  position: relative;
+  border-left: 2px solid #df3f36;
+  color: #b13029;
+  background: #fff0ee;
+}
+
+.project-line.change-start .line-number {
+  box-shadow: inset 0 1px 0 #df3f36;
+}
+
+.project-line.change-end .line-number {
+  box-shadow: inset 0 -1px 0 #df3f36;
+}
+
+.project-line.change-start.change-end .line-number {
+  box-shadow: inset 0 1px 0 #df3f36, inset 0 -1px 0 #df3f36;
+}
+
+.project-line.changed .line-number::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  right: -2px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 3px;
+  background: #4c82d9;
 }
 
 .line-number {
@@ -4601,6 +6352,93 @@ button:disabled {
 
 .line-content {
   padding: 0 18px 0 10px;
+}
+
+.syntax-comment {
+  color: #7a8790;
+  font-style: italic;
+}
+
+.syntax-string {
+  color: #2f8a43;
+}
+
+.syntax-keyword {
+  color: #8c4aa6;
+  font-weight: 600;
+}
+
+.syntax-number {
+  color: #986801;
+}
+
+.syntax-function {
+  color: #2f6fc7;
+}
+
+.syntax-property {
+  color: #6f42c1;
+}
+
+.syntax-operator {
+  color: #6b7280;
+}
+
+.project-original-panel {
+  display: grid;
+  grid-template-columns: 58px minmax(460px, 1fr);
+  border-top: 1px solid #f0b5ae;
+  border-bottom: 1px solid #f0b5ae;
+  background: #fffaf8;
+}
+
+.project-original-gutter {
+  padding: 7px 12px 0 0;
+  border-left: 2px solid #df3f36;
+  color: #a8a09a;
+  text-align: right;
+  user-select: none;
+  background: #fff0ee;
+}
+
+.project-original-card {
+  max-width: 980px;
+  border-right: 1px solid #f0c7c1;
+  background: #ffffff;
+}
+
+.project-original-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  padding: 4px 10px;
+  border-bottom: 1px solid #eadbd6;
+  color: #7a4a43;
+  background: #fff5f2;
+}
+
+.project-original-toolbar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-original-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.project-original-code {
+  padding: 6px 0;
+}
+
+.project-original-empty {
+  padding: 10px 12px;
+  color: #8a7973;
 }
 
 .diff-line.add {
@@ -4855,10 +6693,15 @@ html[data-theme="dark"] .empty-panel {
   color: #dfe1e5;
 }
 
+html[data-theme="dark"] .empty-panel p {
+  color: #8f949b;
+}
+
 html[data-theme="dark"] .project-pane,
 html[data-theme="dark"] .repo-pane,
 html[data-theme="dark"] .workbench-rail,
 html[data-theme="dark"] .history-pane,
+html[data-theme="dark"] .project-tree-pane,
 html[data-theme="dark"] .changes-pane,
 html[data-theme="dark"] .diff-pane {
   border-right-color: #3c3f41;
@@ -4897,6 +6740,7 @@ html[data-theme="dark"] .rail-button.active {
 
 html[data-theme="dark"] .changes-pane,
 html[data-theme="dark"] .history-pane,
+html[data-theme="dark"] .project-tree-pane,
 html[data-theme="dark"] .advanced-sidebar,
 html[data-theme="dark"] .diff-header,
 html[data-theme="dark"] .changelist-panel,
@@ -4908,7 +6752,8 @@ html[data-theme="dark"] .commit-files {
 }
 
 html[data-theme="dark"] .diff-pane,
-html[data-theme="dark"] .diff-scroller {
+html[data-theme="dark"] .diff-scroller,
+html[data-theme="dark"] .project-editor {
   background: #1e1f22;
 }
 
@@ -4926,6 +6771,10 @@ html[data-theme="dark"] .commit-files {
 }
 
 html[data-theme="dark"] .shelve-box {
+  border-top-color: #3c3f41;
+}
+
+html[data-theme="dark"] .project-file-browser {
   border-top-color: #3c3f41;
 }
 
@@ -4969,12 +6818,100 @@ html[data-theme="dark"] .project-switch:hover {
   background: #313335;
 }
 
+html[data-theme="dark"] .project-file-row {
+  color: #c9d1d9;
+}
+
+html[data-theme="dark"] .project-file-row.directory {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .project-file-row.root {
+  color: #f0f2f5;
+  background: #33445f;
+}
+
+html[data-theme="dark"] .project-file-name.root small {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .project-file-row:hover:not(:disabled),
+html[data-theme="dark"] .project-file-row.active {
+  background: #313335;
+}
+
+html[data-theme="dark"] .project-file-disclosure,
+html[data-theme="dark"] .project-tab-close {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .project-tabs {
+  border-bottom-color: #3c3f41;
+  background: #252629;
+}
+
+html[data-theme="dark"] .project-tab {
+  border-right-color: #3c3f41;
+  color: #a9b7c6;
+  background: #2b2d30;
+}
+
+html[data-theme="dark"] .project-tab.active {
+  color: #dfe1e5;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-tab:hover,
+html[data-theme="dark"] .project-tab-close:hover {
+  background: #313335;
+}
+
+html[data-theme="dark"] .project-file-row.status-added,
+html[data-theme="dark"] .project-tab.status-added {
+  color: #6fce8b;
+}
+
+html[data-theme="dark"] .project-file-row.status-modified,
+html[data-theme="dark"] .project-file-row.status-typechange,
+html[data-theme="dark"] .project-tab.status-modified,
+html[data-theme="dark"] .project-tab.status-typechange {
+  color: #e0b95f;
+}
+
+html[data-theme="dark"] .project-file-row.status-deleted,
+html[data-theme="dark"] .project-tab.status-deleted {
+  color: #ff8177;
+}
+
+html[data-theme="dark"] .project-file-row.status-renamed,
+html[data-theme="dark"] .project-tab.status-renamed {
+  color: #89b4ff;
+}
+
+html[data-theme="dark"] .project-file-row.status-conflicted,
+html[data-theme="dark"] .project-tab.status-conflicted {
+  color: #ff9a5f;
+}
+
+html[data-theme="dark"] .project-file-row.status-ignored,
+html[data-theme="dark"] .project-tab.status-ignored {
+  color: #838991;
+}
+
+html[data-theme="dark"] .project-file-empty {
+  color: #8f949b;
+}
+
 html[data-theme="dark"] .project-dot {
   background: #6b7078;
 }
 
 html[data-theme="dark"] .project-row.active .project-dot {
   background: #7aa2f7;
+}
+
+html[data-theme="dark"] .project-row.uninitialized .project-dot {
+  background: #d0a044;
 }
 
 html[data-theme="dark"] .project-copy small {
@@ -4997,7 +6934,6 @@ html[data-theme="dark"] .remote-select,
 html[data-theme="dark"] .remote-editor input,
 html[data-theme="dark"] .push-options input[type="text"],
 html[data-theme="dark"] .push-options input[type="number"],
-html[data-theme="dark"] .quick-create input,
 html[data-theme="dark"] .branch-create input,
 html[data-theme="dark"] .tag-create input,
 html[data-theme="dark"] .changelist-create input,
@@ -5274,6 +7210,95 @@ html[data-theme="dark"] .commit-refs em {
   background: #28354b;
 }
 
+html[data-theme="dark"] .log-workbench,
+html[data-theme="dark"] .log-commit-list {
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-commit-panel,
+html[data-theme="dark"] .log-files-panel,
+html[data-theme="dark"] .log-panel-header,
+html[data-theme="dark"] .log-topbar,
+html[data-theme="dark"] .log-table-head {
+  border-color: #3c3f41;
+}
+
+html[data-theme="dark"] .log-topbar,
+html[data-theme="dark"] .log-table-head,
+html[data-theme="dark"] .log-detail-panel {
+  background: #2b2d30;
+}
+
+html[data-theme="dark"] .log-search-field,
+html[data-theme="dark"] .log-mini-filter,
+html[data-theme="dark"] .log-filter-chip,
+html[data-theme="dark"] .log-diff-preview .diff-scroller {
+  border-color: #4e5258;
+  color: #dfe1e5;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-search-field input,
+html[data-theme="dark"] .log-mini-filter {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .log-filter-chip.active {
+  border-color: #4c82d9;
+  color: #a9c7ff;
+  background: #28354b;
+}
+
+html[data-theme="dark"] .log-ref-row,
+html[data-theme="dark"] .log-file-tree-row,
+html[data-theme="dark"] .log-commit-row {
+  color: #c9d1d9;
+}
+
+html[data-theme="dark"] .log-ref-row:hover,
+html[data-theme="dark"] .log-ref-row.active,
+html[data-theme="dark"] .log-commit-row:hover,
+html[data-theme="dark"] .log-file-tree-row:hover,
+html[data-theme="dark"] .log-file-tree-row.selected {
+  background: #313335;
+}
+
+html[data-theme="dark"] .log-ref-row.active,
+html[data-theme="dark"] .log-diff-preview .diff-scroller {
+  border-color: #4c82d9;
+}
+
+html[data-theme="dark"] .log-commit-row.active {
+  background: #3a3f47;
+}
+
+html[data-theme="dark"] .log-subject strong,
+html[data-theme="dark"] .log-info-body h2,
+html[data-theme="dark"] .log-info-body p strong {
+  color: #f0f2f5;
+}
+
+html[data-theme="dark"] .log-author,
+html[data-theme="dark"] .log-date,
+html[data-theme="dark"] .log-ref-row small,
+html[data-theme="dark"] .log-ref-group-title,
+html[data-theme="dark"] .log-ref-group-title small,
+html[data-theme="dark"] .log-panel-header small,
+html[data-theme="dark"] .log-file-tree-row small,
+html[data-theme="dark"] .log-info-body p,
+html[data-theme="dark"] .log-diff-preview summary {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .log-file-tree-row.directory {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .log-graph-node {
+  --graph-node-ring: #1e1f22;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+}
+
 html[data-theme="dark"] .commit-detail-strip strong,
 html[data-theme="dark"] .commit-file-row strong {
   color: #dfe1e5;
@@ -5339,7 +7364,6 @@ html[data-theme="dark"] .file-row.active .kind-badge {
 
 html[data-theme="dark"] .remote-editor input::placeholder,
 html[data-theme="dark"] .push-options input::placeholder,
-html[data-theme="dark"] .quick-create input::placeholder,
 html[data-theme="dark"] .changelist-create input::placeholder,
 html[data-theme="dark"] .log-filter-panel input::placeholder,
 html[data-theme="dark"] .advanced-form input::placeholder,
@@ -5403,12 +7427,48 @@ html[data-theme="dark"] .diff-lines {
   background: #1e1f22;
 }
 
-html[data-theme="dark"] .diff-line {
+html[data-theme="dark"] .project-lines {
+  padding: 0;
+  color: #c9d1d9;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .diff-line,
+html[data-theme="dark"] .project-line,
+html[data-theme="dark"] .project-original-line {
   grid-template-columns: 66px max-content;
 }
 
-html[data-theme="dark"] .diff-line.context {
+html[data-theme="dark"] .diff-line.context,
+html[data-theme="dark"] .project-line {
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-line.changed {
+  background: #2b2424;
+}
+
+html[data-theme="dark"] .project-line.changed:hover,
+html[data-theme="dark"] .project-line.changed.expanded {
+  background: #352929;
+}
+
+html[data-theme="dark"] .project-line.changed .line-number {
+  border-left-color: #e05b55;
+  color: #d46a64;
+  background: #332525;
+}
+
+html[data-theme="dark"] .project-line.change-start .line-number {
+  box-shadow: inset 0 1px 0 #e05b55;
+}
+
+html[data-theme="dark"] .project-line.change-end .line-number {
+  box-shadow: inset 0 -1px 0 #e05b55;
+}
+
+html[data-theme="dark"] .project-line.change-start.change-end .line-number {
+  box-shadow: inset 0 1px 0 #e05b55, inset 0 -1px 0 #e05b55;
 }
 
 html[data-theme="dark"] .line-number {
@@ -5421,6 +7481,61 @@ html[data-theme="dark"] .line-number {
 html[data-theme="dark"] .line-content {
   min-width: 100%;
   padding-left: 12px;
+}
+
+html[data-theme="dark"] .syntax-comment {
+  color: #7f8590;
+}
+
+html[data-theme="dark"] .syntax-string {
+  color: #6a8759;
+}
+
+html[data-theme="dark"] .syntax-keyword {
+  color: #cc7832;
+}
+
+html[data-theme="dark"] .syntax-number {
+  color: #6897bb;
+}
+
+html[data-theme="dark"] .syntax-function {
+  color: #ffc66d;
+}
+
+html[data-theme="dark"] .syntax-property {
+  color: #9876aa;
+}
+
+html[data-theme="dark"] .syntax-operator {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .project-original-panel {
+  grid-template-columns: 66px minmax(460px, 1fr);
+  border-color: #5b3634;
+  background: #251f1f;
+}
+
+html[data-theme="dark"] .project-original-gutter {
+  border-left-color: #e05b55;
+  color: #696d75;
+  background: #332525;
+}
+
+html[data-theme="dark"] .project-original-card {
+  border-right-color: #3c3030;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-original-toolbar {
+  border-bottom-color: #3c3030;
+  color: #d3b6b2;
+  background: #2b2424;
+}
+
+html[data-theme="dark"] .project-original-empty {
+  color: #8d9299;
 }
 
 html[data-theme="dark"] .diff-line.add {

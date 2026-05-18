@@ -1,14 +1,15 @@
 <script setup lang="ts">
-import {
-  ArchiveRestore,
-  Download,
-  GitBranch,
-  GitCommitVertical,
-  ListChecks,
-  RotateCcw,
-} from "@lucide/vue";
+import type { Component } from "vue";
+import { FolderOpen, GitBranch, GitCommitVertical } from "@lucide/vue";
 
-type WorkbenchMode = "changes" | "log" | "branches" | "remote" | "operations" | "advanced";
+type WorkbenchMode =
+  | "changes"
+  | "log"
+  | "project"
+  | "branches"
+  | "remote"
+  | "operations"
+  | "advanced";
 
 defineProps<{
   mode: WorkbenchMode;
@@ -23,14 +24,11 @@ const navItems: Array<{
   key: WorkbenchMode;
   label: string;
   title: string;
-  icon: typeof ListChecks;
+  icon: Component;
 }> = [
-  { key: "changes", label: "变更", title: "变更与提交", icon: ListChecks },
-  { key: "log", label: "日志", title: "提交日志", icon: GitCommitVertical },
-  { key: "branches", label: "分支", title: "分支与标签", icon: GitBranch },
-  { key: "remote", label: "远程", title: "远程与同步", icon: Download },
-  { key: "operations", label: "操作", title: "合并、变基与冲突", icon: RotateCcw },
-  { key: "advanced", label: "高级", title: "高级 Git 工具", icon: ArchiveRestore },
+  { key: "changes", label: "提交", title: "提交与变更", icon: GitCommitVertical },
+  { key: "log", label: "日志", title: "提交日志", icon: GitBranch },
+  { key: "project", label: "项目", title: "项目文件", icon: FolderOpen },
 ];
 </script>
 
@@ -47,7 +45,6 @@ const navItems: Array<{
     >
       <component :is="item.icon" :size="18" />
       <span>{{ item.label }}</span>
-      <small v-if="item.key === 'operations' && conflictCount > 0">{{ conflictCount }}</small>
     </button>
   </nav>
 </template>

@@ -7,7 +7,7 @@ export type ThemeMode = "system" | "dark" | "light";
 const STORAGE_KEY = "gitbox.settings";
 
 const DEFAULT_PANEL_WIDTHS: Record<LayoutPanelKey, number> = {
-  project: 220,
+  project: 320,
   repo: 380,
   changes: 390,
 };
@@ -19,7 +19,7 @@ const DEFAULT_PANEL_VISIBILITY: Record<LayoutPanelKey, boolean> = {
 };
 
 const PANEL_WIDTH_LIMITS: Record<LayoutPanelKey, { min: number; max: number }> = {
-  project: { min: 160, max: 360 },
+  project: { min: 260, max: 460 },
   repo: { min: 300, max: 620 },
   changes: { min: 260, max: 680 },
 };

@@ -10,18 +10,20 @@ use gitbox::{
     delete_remote_branch_core, delete_remote_core, delete_remote_tag_core, delete_shelf_core,
     delete_tag_core, discard_changes_core, drop_commit_core, fetch_core, file_history_core,
     fixup_commit_core, get_diff_core, init_repository_core, lfs_status_core, list_branches_core,
-    list_commits_filtered_core, list_shelves_core, list_stashes_core, list_submodules_core,
-    list_worktrees_core, mark_conflict_resolved_core, mark_shelf_applied, merge_branch_core,
-    open_repo_core, operation_control_core, operation_state_core, pull_core, push_commit_core,
-    push_tag_core, push_with_options_core, rebase_branch_core, record_recent_repo, record_shelf,
-    rebase_advanced_core, remove_worktree_core, rename_branch_core, repo_status_core, reset_to_commit_core,
+    list_commits_filtered_core, list_project_files_core, list_shelves_core, list_stashes_core,
+    list_submodules_core, list_worktrees_core, mark_conflict_resolved_core, mark_shelf_applied,
+    merge_branch_core, open_repo_core, operation_control_core, operation_state_core, pull_core,
+    push_commit_core, push_tag_core, push_with_options_core, read_project_file_core,
+    rebase_advanced_core, rebase_branch_core, record_recent_repo, record_shelf,
+    remove_worktree_core, rename_branch_core, repo_status_core, reset_to_commit_core,
     resolve_conflict_block_core, resolve_conflict_file_core, revert_commit_core,
     save_conflict_result_core, set_branch_upstream_core, shelve_changes_core, stage_hunks_core,
     stage_paths_core, stash_action_core, undo_last_commit_core, unshallow_repository_core,
     unshelve_core, unstage_paths_core, update_remote_core, update_submodules_core, BlameLine,
     BranchList, BranchSummary, CommandResult, CommitDetails, CommitResult, CommitSummary,
-    ConflictDetails, DiffResponse, FileHistoryEntry, GitOperationState, RefComparison, RepoStatus,
-    RepositoryInfo, ShelfInfo, StashInfo, SubmoduleInfo, WorktreeInfo,
+    ConflictDetails, DiffResponse, FileHistoryEntry, GitOperationState, ProjectFileContent,
+    ProjectFileEntry, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo, StashInfo,
+    SubmoduleInfo, WorktreeInfo,
 };
 use tauri::AppHandle;
 
@@ -75,6 +77,19 @@ fn repo_status(path: String, include_ignored: Option<bool>) -> CommandResponse<R
 #[tauri::command]
 fn branch_summary(path: String) -> CommandResponse<BranchSummary> {
     branch_summary_core(&path, false).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn list_project_files(
+    path: String,
+    limit: Option<usize>,
+) -> CommandResponse<Vec<ProjectFileEntry>> {
+    list_project_files_core(&path, limit).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn read_project_file(path: String, file_path: String) -> CommandResponse<ProjectFileContent> {
+    read_project_file_core(&path, file_path).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -626,6 +641,8 @@ pub fn run() {
             clone_repository,
             unshallow_repository,
             repo_status,
+            list_project_files,
+            read_project_file,
             get_diff,
             stage_paths,
             unstage_paths,

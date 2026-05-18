@@ -220,3 +220,19 @@ export interface ConflictDetails {
   current?: string | null;
   blocks: ConflictBlock[];
 }
+
+export interface ProjectFileEntry {
+  path: string;
+  name: string;
+  parent?: string | null;
+  depth: number;
+  directory: boolean;
+  size?: number | null;
+}
+
+export interface ProjectFileContent {
+  path: string;
+  content?: string | null;
+  binary: boolean;
+  size: number;
+}

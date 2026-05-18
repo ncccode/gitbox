@@ -11,6 +11,8 @@ import type {
   BlameLine,
   FileHistoryEntry,
   GitOperationState,
+  ProjectFileContent,
+  ProjectFileEntry,
   RefComparison,
   RepoStatus,
   RepositoryInfo,
@@ -51,6 +53,14 @@ export function branchSummary(path: string) {
   return invoke<BranchSummary>("branch_summary", { path });
 }
 
+export function listProjectFiles(path: string, limit = 1400) {
+  return invoke<ProjectFileEntry[]>("list_project_files", { path, limit });
+}
+
+export function readProjectFile(path: string, filePath: string) {
+  return invoke<ProjectFileContent>("read_project_file", { path, filePath });
+}
+
 export function getDiff(path: string, filePath?: string | null, staged = false) {
   return invoke<DiffResponse>("get_diff", { path, filePath, staged });
 }
@@ -63,7 +73,7 @@ export function unstagePaths(path: string, paths: string[]) {
   return invoke<CommandResult>("unstage_paths", { path, paths });
 }
 
-export function stageHunks(path: string, patches: string[], mode: "stage" | "unstage") {
+export function stageHunks(path: string, patches: string[], mode: "stage" | "unstage" | "discard") {
   return invoke<CommandResult>("stage_hunks", { path, patches, mode });
 }
 

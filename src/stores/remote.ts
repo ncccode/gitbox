@@ -99,7 +99,7 @@ export const useRemoteStore = defineStore("remote", {
       const repos = useRepositoriesStore();
       const changes = useChangesStore();
       const currentPath = repos.path;
-      const targets = repos.items.filter((repo) => repo.remotes.length > 0);
+      const targets = repos.initializedItems.filter((repo) => repo.remotes.length > 0);
       if (targets.length === 0) return;
 
       this.loading = true;

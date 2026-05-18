@@ -4,9 +4,63 @@ import type { RepositoryInfo } from "../types/gitbox";
 
 const STORAGE_KEY = "gitbox.repositories";
 
+export interface ProjectItem {
+  path: string;
+  initialized: boolean;
+  repository: RepositoryInfo | null;
+  error?: string;
+}
+
 interface StoredRepositories {
-  items: RepositoryInfo[];
+  items: ProjectItem[];
   activePath?: string | null;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isRepositoryInfo(value: unknown): value is RepositoryInfo {
+  return (
+    isObject(value) &&
+    typeof value.path === "string" &&
+    typeof value.gitDir === "string" &&
+    typeof value.isBare === "boolean" &&
+    Array.isArray(value.remotes)
+  );
+}
+
+function projectFromRepository(repo: RepositoryInfo): ProjectItem {
+  return {
+    path: repo.path,
+    initialized: true,
+    repository: repo,
+  };
+}
+
+function normalizeProjectItem(value: unknown): ProjectItem | null {
+  if (!isObject(value) || typeof value.path !== "string" || !value.path.trim()) return null;
+
+  if (isRepositoryInfo(value)) {
+    return projectFromRepository(value);
+  }
+
+  const repository = isRepositoryInfo(value.repository) ? value.repository : null;
+  const error = typeof value.error === "string" ? value.error : undefined;
+  return {
+    path: value.path,
+    initialized: Boolean(value.initialized) && Boolean(repository),
+    repository,
+    error,
+  };
+}
+
+function dedupeProjectItems(items: ProjectItem[]) {
+  const byPath = new Map<string, ProjectItem>();
+  for (const item of items) {
+    byPath.set(item.path, item);
+  }
+  return [...byPath.values()];
 }
 
 function readStoredRepositories(): StoredRepositories {
@@ -17,10 +71,21 @@ function readStoredRepositories(): StoredRepositories {
     if (!raw) return { items: [] };
 
     const parsed = JSON.parse(raw) as Partial<StoredRepositories> | RepositoryInfo[];
-    if (Array.isArray(parsed)) return { items: parsed };
+    if (Array.isArray(parsed)) {
+      return {
+        items: dedupeProjectItems(
+          parsed.map(normalizeProjectItem).filter((item): item is ProjectItem => Boolean(item)),
+        ),
+      };
+    }
+
+    const items = Array.isArray(parsed.items)
+      ? parsed.items.map(normalizeProjectItem).filter((item): item is ProjectItem => Boolean(item))
+      : [];
+
     return {
-      items: Array.isArray(parsed.items) ? parsed.items : [],
-      activePath: parsed.activePath,
+      items: dedupeProjectItems(items),
+      activePath: typeof parsed.activePath === "string" ? parsed.activePath : null,
     };
   } catch {
     return { items: [] };
@@ -40,11 +105,13 @@ function nameFromPath(path: string) {
 export const useRepositoriesStore = defineStore("repositories", {
   state: () => {
     const stored = readStoredRepositories();
-    const current =
-      stored.items.find((item) => item.path === stored.activePath) ?? stored.items[0] ?? null;
+    const activePath =
+      stored.items.find((item) => item.path === stored.activePath)?.path ?? stored.items[0]?.path ?? null;
+    const current = stored.items.find((item) => item.path === activePath)?.repository ?? null;
 
     return {
       current: current as RepositoryInfo | null,
+      activePath: activePath as string | null,
       items: stored.items,
       loading: false,
       error: "",
@@ -52,21 +119,28 @@ export const useRepositoriesStore = defineStore("repositories", {
   },
   getters: {
     path: (state) => state.current?.path ?? "",
+    selectedPath: (state) => state.activePath ?? "",
+    selectedItem: (state) => state.items.find((item) => item.path === state.activePath) ?? null,
+    initializedItems: (state) =>
+      state.items
+        .map((item) => item.repository)
+        .filter((repo): repo is RepositoryInfo => Boolean(repo)),
     name: (state) => {
-      if (!state.current?.path) return "未打开仓库";
-      return nameFromPath(state.current.path);
+      const path = state.current?.path ?? state.activePath;
+      if (!path) return "未打开仓库";
+      return nameFromPath(path);
     },
     projectName: () => (path: string) => nameFromPath(path),
   },
   actions: {
     async open(path: string) {
       const opened = await this.openMany([path]);
-      return opened[opened.length - 1];
+      return opened[opened.length - 1] ?? null;
     },
     async openMany(paths: string[]) {
       const uniquePaths = [...new Set(paths.filter(Boolean))];
       const opened: RepositoryInfo[] = [];
-      const errors: string[] = [];
+      let activePath = "";
 
       this.loading = true;
       this.error = "";
@@ -74,20 +148,23 @@ export const useRepositoriesStore = defineStore("repositories", {
         for (const path of uniquePaths) {
           try {
             const repo = await openRepo(path);
-            this.upsert(repo);
+            this.upsert(projectFromRepository(repo));
             opened.push(repo);
+            activePath = repo.path;
           } catch (error) {
-            errors.push(`${path}: ${String(error)}`);
+            this.upsert({
+              path,
+              initialized: false,
+              repository: null,
+              error: String(error),
+            });
+            activePath = path;
           }
         }
 
-        if (opened.length > 0) {
-          this.current = opened[opened.length - 1];
-        }
-
-        if (errors.length > 0) {
-          this.error = `部分项目添加失败：${errors.join("；")}`;
-          if (opened.length === 0) throw new Error(this.error);
+        if (activePath) {
+          this.activePath = activePath;
+          this.current = this.items.find((item) => item.path === activePath)?.repository ?? null;
         }
 
         this.persist();
@@ -101,41 +178,57 @@ export const useRepositoriesStore = defineStore("repositories", {
       this.error = "";
       try {
         const repo = await openRepo(path);
-        this.upsert(repo);
+        this.upsert(projectFromRepository(repo));
+        this.activePath = repo.path;
         this.current = repo;
-        this.persist();
       } catch (error) {
-        this.error = String(error);
-        throw error;
+        this.upsert({
+          path,
+          initialized: false,
+          repository: null,
+          error: String(error),
+        });
+        this.activePath = path;
+        this.current = null;
       } finally {
+        this.persist();
         this.loading = false;
       }
     },
+    selectKnown(path: string) {
+      this.activePath = path;
+      this.current = this.items.find((item) => item.path === path)?.repository ?? null;
+      this.persist();
+    },
     setCurrent(repo: RepositoryInfo) {
       this.current = repo;
-      this.upsert(repo);
+      this.activePath = repo.path;
+      this.upsert(projectFromRepository(repo));
       this.persist();
     },
     remove(path: string) {
-      const wasCurrent = this.current?.path === path;
+      const wasActive = this.activePath === path;
       this.items = this.items.filter((item) => item.path !== path);
-      if (wasCurrent) {
-        this.current = this.items[0] ?? null;
+      if (wasActive) {
+        this.activePath = this.items[0]?.path ?? null;
+        this.current = this.items.find((item) => item.path === this.activePath)?.repository ?? null;
+      } else if (this.current?.path === path) {
+        this.current = null;
       }
       this.persist();
     },
-    upsert(repo: RepositoryInfo) {
-      const index = this.items.findIndex((item) => item.path === repo.path);
+    upsert(project: ProjectItem) {
+      const index = this.items.findIndex((item) => item.path === project.path);
       if (index >= 0) {
-        this.items.splice(index, 1, repo);
+        this.items.splice(index, 1, project);
       } else {
-        this.items.push(repo);
+        this.items.push(project);
       }
     },
     persist() {
       saveStoredRepositories({
         items: this.items,
-        activePath: this.current?.path ?? null,
+        activePath: this.activePath,
       });
     },
   },

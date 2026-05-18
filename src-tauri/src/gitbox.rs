@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -314,6 +314,26 @@ pub struct ConflictDetails {
     pub blocks: Vec<ConflictBlock>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileEntry {
+    pub path: String,
+    pub name: String,
+    pub parent: Option<String>,
+    pub depth: usize,
+    pub directory: bool,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectFileContent {
+    pub path: String,
+    pub content: Option<String>,
+    pub binary: bool,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone)]
 struct ParsedConflictBlock {
     index: usize,
@@ -353,6 +373,53 @@ impl GitProcessOutput {
 pub fn open_repo_core(path: &str) -> Result<RepositoryInfo, GitboxError> {
     let repo = Repository::discover(path)?;
     repository_info(&repo)
+}
+
+pub fn list_project_files_core(
+    path: &str,
+    limit: Option<usize>,
+) -> Result<Vec<ProjectFileEntry>, GitboxError> {
+    let repo = Repository::discover(path)?;
+    let root = fs::canonicalize(repo_workdir(&repo)?)?;
+    let max_entries = limit.unwrap_or(1400).clamp(1, 5000);
+    let mut entries = Vec::new();
+    collect_project_entries(&root, &root, 0, max_entries, &mut entries)?;
+    Ok(entries)
+}
+
+pub fn read_project_file_core(
+    path: &str,
+    file_path: String,
+) -> Result<ProjectFileContent, GitboxError> {
+    let repo = Repository::discover(path)?;
+    let root = fs::canonicalize(repo_workdir(&repo)?)?;
+    let relative = clean_project_relative_path(file_path)?;
+    let target = fs::canonicalize(root.join(&relative))?;
+
+    if !target.starts_with(&root) {
+        return Err(GitboxError::Message("文件不在当前项目内".to_string()));
+    }
+
+    let metadata = fs::metadata(&target)?;
+    if metadata.is_dir() {
+        return Err(GitboxError::Message("请选择文件而不是目录".to_string()));
+    }
+    if metadata.len() > 1_000_000 {
+        return Err(GitboxError::Message(
+            "文件超过 1MB，暂不在项目视图中预览".to_string(),
+        ));
+    }
+
+    let bytes = fs::read(&target)?;
+    let content = std::str::from_utf8(&bytes)
+        .map(|value| value.to_string())
+        .ok();
+    Ok(ProjectFileContent {
+        path: repo_path_string(&relative),
+        binary: content.is_none(),
+        content,
+        size: metadata.len(),
+    })
 }
 
 pub fn init_repository_core(
@@ -665,9 +732,13 @@ pub fn stage_hunks_core(
             .iter()
             .map(|value| value.to_string())
             .collect(),
+        "discard" => ["apply", "--reverse", "--whitespace=nowarn", "-"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
         _ => {
             return Err(GitboxError::Message(
-                "暂存块操作模式只支持 stage 或 unstage".to_string(),
+                "差异块操作模式只支持 stage、unstage 或 discard".to_string(),
             ))
         }
     };
@@ -681,6 +752,8 @@ pub fn stage_hunks_core(
         ok: true,
         message: if mode == "stage" {
             "已暂存选中块".to_string()
+        } else if mode == "discard" {
+            "已撤回选中块".to_string()
         } else {
             "已取消暂存选中块".to_string()
         },
@@ -3105,6 +3178,112 @@ fn branch_type_order(value: &str) -> u8 {
     }
 }
 
+fn collect_project_entries(
+    root: &Path,
+    directory: &Path,
+    depth: usize,
+    max_entries: usize,
+    entries: &mut Vec<ProjectFileEntry>,
+) -> Result<(), GitboxError> {
+    if entries.len() >= max_entries {
+        return Ok(());
+    }
+
+    let mut children = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            !is_skipped_project_entry(name.to_string_lossy().as_ref())
+        })
+        .collect::<Vec<_>>();
+
+    children.sort_by(|left, right| {
+        let left_type = left.file_type().ok();
+        let right_type = right.file_type().ok();
+        let left_is_dir = left_type
+            .as_ref()
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false);
+        let right_is_dir = right_type
+            .as_ref()
+            .map(|kind| kind.is_dir())
+            .unwrap_or(false);
+
+        right_is_dir.cmp(&left_is_dir).then_with(|| {
+            left.file_name()
+                .to_string_lossy()
+                .to_lowercase()
+                .cmp(&right.file_name().to_string_lossy().to_lowercase())
+        })
+    });
+
+    let mut directories = Vec::new();
+    for child in children {
+        if entries.len() >= max_entries {
+            break;
+        }
+
+        let file_type = child.file_type()?;
+        let metadata = child.metadata()?;
+        let child_path = child.path();
+        let relative = child_path
+            .strip_prefix(root)
+            .map_err(|_| GitboxError::Message("无法读取项目文件路径".to_string()))?;
+        let parent = relative
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(repo_path_string);
+        let directory = file_type.is_dir();
+
+        entries.push(ProjectFileEntry {
+            path: repo_path_string(relative),
+            name: child.file_name().to_string_lossy().to_string(),
+            parent,
+            depth,
+            directory,
+            size: if directory {
+                None
+            } else {
+                Some(metadata.len())
+            },
+        });
+
+        if directory {
+            directories.push(child_path);
+        }
+    }
+
+    for child_path in directories {
+        if entries.len() >= max_entries {
+            break;
+        }
+        collect_project_entries(root, &child_path, depth + 1, max_entries, entries)?;
+    }
+
+    Ok(())
+}
+
+fn is_skipped_project_entry(name: &str) -> bool {
+    matches!(name, ".git" | "node_modules" | "target")
+}
+
+fn clean_project_relative_path(value: String) -> Result<PathBuf, GitboxError> {
+    let trimmed = clean_ref_input(value, "请选择项目文件")?;
+    let path = PathBuf::from(trimmed);
+    let invalid = path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    });
+
+    if path.is_absolute() || invalid {
+        return Err(GitboxError::Message("项目文件路径无效".to_string()));
+    }
+
+    Ok(path)
+}
+
 fn clean_ref_input(value: String, empty_message: &str) -> Result<String, GitboxError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -3722,6 +3901,24 @@ mod tests {
     }
 
     #[test]
+    fn project_file_listing_keeps_root_files_before_deep_descendants() {
+        let (dir, _repo) = test_repo();
+        write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+        write_file(dir.path(), "README.md", "hello\n");
+
+        let files =
+            list_project_files_core(dir.path().to_str().unwrap(), Some(2)).expect("project files");
+        let paths = files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["src", "README.md"]);
+        assert_eq!(files[1].parent, None);
+        assert!(!files[1].directory);
+    }
+
+    #[test]
     fn status_stage_and_commit_lifecycle() {
         let (dir, _repo) = test_repo();
         write_file(dir.path(), "src/main.rs", "fn main() {}\n");
@@ -3840,7 +4037,10 @@ mod tests {
         .expect("filtered commits");
         assert_eq!(commits.len(), 1);
         assert_eq!(commits[0].summary, "search branch work");
-        assert!(commits[0].refs.iter().any(|reference| reference == "feature/search"));
+        assert!(commits[0]
+            .refs
+            .iter()
+            .any(|reference| reference == "feature/search"));
     }
 
     #[test]
@@ -4141,6 +4341,35 @@ mod tests {
 
         let status = repo_status_core(dir.path().to_str().unwrap(), false).expect("status");
         assert_eq!(status.counts.staged, 1);
+    }
+
+    #[test]
+    fn hunk_patch_can_be_discarded() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        write_file(dir.path(), "README.md", "hello\nworld\n");
+
+        let diff = get_diff_core(
+            dir.path().to_str().unwrap(),
+            Some("README.md".to_string()),
+            false,
+        )
+        .expect("diff");
+        assert_eq!(diff.hunks.len(), 1);
+
+        stage_hunks_core(
+            dir.path().to_str().unwrap(),
+            vec![diff.hunks[0].patch.clone()],
+            "discard".to_string(),
+        )
+        .expect("discard hunk");
+
+        let status = repo_status_core(dir.path().to_str().unwrap(), false).expect("status");
+        assert_eq!(status.counts.unstaged, 0);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("README.md")).unwrap(),
+            "hello\n"
+        );
     }
 
     #[test]

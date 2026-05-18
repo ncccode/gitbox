@@ -1,0 +1,5 @@
+[build]
+target = "aarch64-apple-darwin"
+
+[env]
+AARCH64_APPLE_DARWIN_OPENSSL_DIR = "/opt/homebrew/opt/openssl@3"
