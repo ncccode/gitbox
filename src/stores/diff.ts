@@ -62,7 +62,7 @@ export const useDiffStore = defineStore("diff", {
         const mode = changes.selectedSide === "staged" ? "unstage" : "stage";
         await stageHunks(repos.path, [hunk.patch], mode);
         changes.notice = mode === "stage" ? "已暂存选中块" : "已取消暂存选中块";
-        await changes.refresh();
+        await changes.refresh({ includeShelves: false });
         await this.loadSelected();
       } catch (error) {
         this.error = String(error);

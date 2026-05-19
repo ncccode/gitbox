@@ -121,6 +121,7 @@ const activeLogDiffHunkIndex = ref(0);
 const syncingSideBySideScroll = new WeakSet<HTMLElement>();
 const projectEditorScrollTop = ref(0);
 const projectEditorScrollLeft = ref(0);
+const projectEditorViewportHeight = ref(0);
 const expandedProjectHunkIndex = ref<number | null>(null);
 const expandedChangeFileGroups = ref<Record<string, boolean>>({
   staged: true,
@@ -242,6 +243,7 @@ const systemPrefersDark = ref(
     window.matchMedia("(prefers-color-scheme: dark)").matches,
 );
 let stopSystemThemeWatch: (() => void) | null = null;
+let projectEditorResizeObserver: ResizeObserver | null = null;
 let autoFetchTimer: number | null = null;
 let noticeToastTimer: number | null = null;
 let noticeToastId = 0;
@@ -249,6 +251,11 @@ const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "op
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 const PROJECT_EDITOR_LINE_HEIGHT = 18;
 const PROJECT_EDITOR_PADDING_TOP = 12;
+const PROJECT_EDITOR_OVERSCAN_LINES = 32;
+const PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT = 720;
+const PROJECT_TOKEN_CACHE_LIMIT = 6000;
+const projectKeywordCache = new Map<string, Set<string>>();
+const projectLineTokenCache = new Map<string, ProjectCodeToken[]>();
 
 const activeFiles = computed(() => {
   return changes.filesForSide(settings.selectedSide);
@@ -405,13 +412,34 @@ const projectEditorText = computed({
   },
 });
 const projectLanguage = computed(() => projectLanguageForPath(project.selectedPath));
-const projectEditorLines = computed<ProjectEditorLine[]>(() =>
-  projectEditorText.value.split("\n").map((content, index) => ({
-    index,
-    number: index + 1,
-    tokens: tokenizeProjectLine(content || " ", projectLanguage.value),
-  })),
-);
+const projectEditorLineTexts = computed(() => projectEditorText.value.split("\n"));
+const projectEditorLineCount = computed(() => projectEditorLineTexts.value.length);
+const projectEditorVisibleRange = computed(() => {
+  const viewportHeight =
+    projectEditorViewportHeight.value ||
+    projectEditorTextarea.value?.clientHeight ||
+    PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT;
+  const contentTop = Math.max(0, projectEditorScrollTop.value - PROJECT_EDITOR_PADDING_TOP);
+  const firstVisibleLine = Math.floor(contentTop / PROJECT_EDITOR_LINE_HEIGHT);
+  const visibleLineCount = Math.ceil(viewportHeight / PROJECT_EDITOR_LINE_HEIGHT);
+  const start = Math.max(0, firstVisibleLine - PROJECT_EDITOR_OVERSCAN_LINES);
+  const end = Math.min(
+    projectEditorLineCount.value,
+    firstVisibleLine + visibleLineCount + PROJECT_EDITOR_OVERSCAN_LINES,
+  );
+  return { start, end };
+});
+const projectEditorLines = computed<ProjectEditorLine[]>(() => {
+  const { start, end } = projectEditorVisibleRange.value;
+  return projectEditorLineTexts.value.slice(start, end).map((content, offset) => {
+    const index = start + offset;
+    return {
+      index,
+      number: index + 1,
+      tokens: tokenizeProjectLine(content || " ", projectLanguage.value),
+    };
+  });
+});
 const projectEditorHunks = computed<ProjectEditorHunkView[]>(() => {
   if (!project.content || project.content.binary || !project.diff?.hunks.length) return [];
   return project.diff.hunks.map((hunk) => buildProjectEditorHunkView(hunk, projectLanguage.value));
@@ -420,8 +448,14 @@ const expandedProjectHunk = computed(
   () => projectEditorHunks.value.find((hunk) => hunk.index === expandedProjectHunkIndex.value) ?? null,
 );
 const projectEditorRenderStyle = computed(() => ({
-  "--project-editor-scroll-top-offset": `${-projectEditorScrollTop.value}px`,
   "--project-editor-scroll-left-offset": `${-projectEditorScrollLeft.value}px`,
+}));
+const projectEditorRenderContentStyle = computed(() => ({
+  transform: `translateY(${
+    PROJECT_EDITOR_PADDING_TOP +
+    projectEditorVisibleRange.value.start * PROJECT_EDITOR_LINE_HEIGHT -
+    projectEditorScrollTop.value
+  }px)`,
 }));
 const projectRootEntry = computed<ProjectFileEntry | null>(() => {
   if (!repos.current) return null;
@@ -530,7 +564,10 @@ const workspaceGridStyle = computed(() => {
   const columns: string[] = [];
 
   if (settings.panelVisibility.project) {
-    columns.push(`${settings.panelWidths.project}px`, "6px");
+    columns.push(settings.projectPaneCollapsed ? "64px" : `${settings.panelWidths.project}px`);
+    if (!settings.projectPaneCollapsed) {
+      columns.push("6px");
+    }
   }
 
   if (repos.current || repos.selectedPath) {
@@ -901,6 +938,22 @@ watch(
 );
 
 watch(
+  projectEditorTextarea,
+  (textarea) => {
+    projectEditorResizeObserver?.disconnect();
+    projectEditorResizeObserver = null;
+
+    if (!textarea) return;
+    updateProjectEditorViewport();
+    if (typeof ResizeObserver !== "undefined") {
+      projectEditorResizeObserver = new ResizeObserver(updateProjectEditorViewport);
+      projectEditorResizeObserver.observe(textarea);
+    }
+  },
+  { flush: "post" },
+);
+
+watch(
   () => project.selectedPath,
   () => {
     expandedProjectHunkIndex.value = null;
@@ -910,6 +963,7 @@ watch(
       projectEditorTextarea.value.scrollTop = 0;
       projectEditorTextarea.value.scrollLeft = 0;
     }
+    nextTick(updateProjectEditorViewport).catch(() => undefined);
   },
 );
 
@@ -997,6 +1051,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopSystemThemeWatch?.();
+  projectEditorResizeObserver?.disconnect();
   clearAutoFetchTimer();
   clearNoticeToastTimer();
 });
@@ -1806,6 +1861,10 @@ function projectLanguageForPath(path?: string | null) {
 }
 
 function tokenizeProjectLine(content: string, language: string): ProjectCodeToken[] {
+  const cacheKey = `${language}\u0000${content}`;
+  const cached = projectLineTokenCache.get(cacheKey);
+  if (cached) return cached;
+
   const tokens: ProjectCodeToken[] = [];
   const keywords = projectKeywords(language);
   let index = 0;
@@ -1881,10 +1940,24 @@ function tokenizeProjectLine(content: string, language: string): ProjectCodeToke
     index += 1;
   }
 
-  return tokens.length ? tokens : [{ text: " " }];
+  return rememberProjectLineTokens(cacheKey, tokens.length ? tokens : [{ text: " " }]);
+}
+
+function rememberProjectLineTokens(key: string, tokens: ProjectCodeToken[]) {
+  if (projectLineTokenCache.size >= PROJECT_TOKEN_CACHE_LIMIT) {
+    const oldestKey = projectLineTokenCache.keys().next().value;
+    if (oldestKey) {
+      projectLineTokenCache.delete(oldestKey);
+    }
+  }
+  projectLineTokenCache.set(key, tokens);
+  return tokens;
 }
 
 function projectKeywords(language: string) {
+  const cached = projectKeywordCache.get(language);
+  if (cached) return cached;
+
   const shared = [
     "as",
     "async",
@@ -1930,7 +2003,9 @@ function projectKeywords(language: string) {
     shell: ["do", "done", "elif", "fi", "for", "function", "if", "in", "then"],
     toml: ["false", "true"],
   };
-  return new Set([...(byLanguage[language] ?? shared), ...(language === "plain" ? [] : shared)]);
+  const keywords = new Set([...(byLanguage[language] ?? shared), ...(language === "plain" ? [] : shared)]);
+  projectKeywordCache.set(language, keywords);
+  return keywords;
 }
 
 function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEditorHunkView {
@@ -2035,10 +2110,16 @@ function toggleProjectEditorHunk(index: number) {
   expandedProjectHunkIndex.value = expandedProjectHunkIndex.value === index ? null : index;
 }
 
+function updateProjectEditorViewport() {
+  projectEditorViewportHeight.value =
+    projectEditorTextarea.value?.clientHeight ?? PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT;
+}
+
 function syncProjectEditorScroll(event: Event) {
   const target = event.target as HTMLTextAreaElement;
   projectEditorScrollTop.value = target.scrollTop;
   projectEditorScrollLeft.value = target.scrollLeft;
+  projectEditorViewportHeight.value = target.clientHeight;
 }
 
 async function discardProjectEditorHunk(index: number) {
@@ -3963,13 +4044,15 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
     >
       <ProjectPane
         v-if="settings.panelVisibility.project"
+        :collapsed="settings.projectPaneCollapsed"
         @choose-repository="chooseRepository"
         @remove-repository="removeRepository"
         @switch-repository="switchRepository"
+        @toggle-collapsed="settings.setProjectPaneCollapsed(!settings.projectPaneCollapsed)"
       />
 
       <div
-        v-if="settings.panelVisibility.project"
+        v-if="settings.panelVisibility.project && !settings.projectPaneCollapsed"
         class="pane-resizer"
         :class="{ active: activeResizePanel === 'project' }"
         role="separator"
@@ -5062,7 +5145,7 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
           </div>
           <div v-else-if="!project.content" class="diff-empty">选择一个项目文件</div>
           <div v-else class="project-edit-pane">
-            <div class="project-editor-render" :style="projectEditorRenderStyle" aria-hidden="true"><div class="project-editor-render-content">
+            <div class="project-editor-render" :style="projectEditorRenderStyle" aria-hidden="true"><div class="project-editor-render-content" :style="projectEditorRenderContentStyle">
               <span
                 v-for="line in projectEditorLines"
                 :key="line.index"
@@ -5199,7 +5282,11 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
           <div v-if="diff.loading" class="diff-empty">加载中</div>
           <div v-else-if="!activeChangeDiffHasContent" class="diff-empty">没有差异</div>
           <div v-else-if="activeChangeSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
-          <div v-else class="side-by-side-diff">
+          <div
+            v-else
+            v-memo="[diff.current?.text, activeChangeDiffHunkIndex, settings.selectedSide, changes.selectedFile]"
+            class="side-by-side-diff"
+          >
             <div class="side-by-side-file-header">
               <div class="side-by-side-title">
                 <strong>{{ changeDiffLeftLabel }}</strong>
@@ -5812,7 +5899,11 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
               <div v-else-if="activeLogDiffTab?.error" class="diff-empty">{{ activeLogDiffTab?.error }}</div>
               <div v-else-if="!activeLogDiffHasContent" class="diff-empty">没有差异</div>
               <div v-else-if="activeLogSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
-              <div v-else class="side-by-side-diff">
+                <div
+                  v-else
+                  v-memo="[activeLogDiffTab?.id, activeLogDiffTab?.diff?.text, activeLogDiffHunkIndex]"
+                  class="side-by-side-diff"
+                >
                 <div class="side-by-side-file-header">
                   <div class="side-by-side-title">
                     <strong>提交</strong>
@@ -7002,11 +7093,21 @@ button:disabled {
   padding: 12px;
 }
 
+.project-pane.collapsed .projects-section {
+  padding: 8px 7px;
+}
+
 .section-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.project-pane.collapsed .section-heading {
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 7px;
 }
 
 .section-title,
@@ -7018,6 +7119,17 @@ button:disabled {
   font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
+}
+
+.project-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.project-pane.collapsed .project-heading-actions {
+  display: grid;
+  justify-items: center;
 }
 
 .icon-only-button,
@@ -7038,6 +7150,12 @@ button:disabled {
   margin-top: 12px;
 }
 
+.project-pane.collapsed .project-list {
+  justify-items: center;
+  gap: 8px;
+  margin-top: 14px;
+}
+
 .project-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 30px;
@@ -7047,6 +7165,12 @@ button:disabled {
   border-radius: 7px;
 }
 
+.project-pane.collapsed .project-row {
+  grid-template-columns: 1fr;
+  width: 44px;
+  border-radius: 8px;
+}
+
 .project-row.active {
   border-color: #5b8fd7;
   background: #e8f0fb;
@@ -7054,7 +7178,7 @@ button:disabled {
 
 .project-switch {
   display: grid;
-  grid-template-columns: 10px minmax(0, 1fr);
+  grid-template-columns: 28px minmax(0, 1fr);
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -7068,27 +7192,53 @@ button:disabled {
   background: transparent;
 }
 
+.project-pane.collapsed .project-switch {
+  grid-template-columns: 1fr;
+  justify-items: center;
+  min-height: 42px;
+  padding: 4px;
+}
+
 .project-switch:hover {
   background: #edf1ec;
 }
 
-.project-dot {
-  width: 8px;
-  height: 8px;
+.project-avatar {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 1px 2px rgba(31, 45, 36, 0.14);
+}
+
+.project-pane.collapsed .project-avatar {
+  width: 32px;
+  height: 32px;
+  font-size: 14px;
+}
+
+.project-row.uninitialized .project-avatar {
+  filter: saturate(0.8);
+}
+
+.project-row.uninitialized .project-avatar::after {
+  content: "";
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
-  background: #88948d;
-}
-
-.project-row.active .project-dot {
-  background: #4c82d9;
-}
-
-.project-row.uninitialized .project-dot {
-  background: #c18a25;
-}
-
-.project-row.uninitialized.active .project-dot {
   background: #d79c2f;
+  box-shadow: 0 0 0 2px #f6f7f3;
 }
 
 .project-copy {
@@ -10405,8 +10555,7 @@ button:disabled {
 .project-editor-render-content {
   display: block;
   min-width: max-content;
-  padding: 12px 0;
-  transform: translateY(var(--project-editor-scroll-top-offset));
+  will-change: transform;
 }
 
 .project-render-line {
@@ -11188,16 +11337,8 @@ html[data-theme="dark"] .project-file-empty {
   color: #8f949b;
 }
 
-html[data-theme="dark"] .project-dot {
-  background: #6b7078;
-}
-
-html[data-theme="dark"] .project-row.active .project-dot {
-  background: #7aa2f7;
-}
-
-html[data-theme="dark"] .project-row.uninitialized .project-dot {
-  background: #d0a044;
+html[data-theme="dark"] .project-row.uninitialized .project-avatar::after {
+  box-shadow: 0 0 0 2px #252629;
 }
 
 html[data-theme="dark"] .project-copy small {
@@ -11445,14 +11586,6 @@ html[data-theme="dark"] .project-switch {
 
 html[data-theme="dark"] .project-switch:hover {
   background: #313335;
-}
-
-html[data-theme="dark"] .project-dot {
-  background: #787d85;
-}
-
-html[data-theme="dark"] .project-row.active .project-dot {
-  background: #7aa2f7;
 }
 
 html[data-theme="dark"] .project-copy strong {

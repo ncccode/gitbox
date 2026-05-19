@@ -29,6 +29,7 @@ interface StoredSettings {
   selectedSide: ChangeSide;
   compactMode: boolean;
   themeMode: ThemeMode;
+  projectPaneCollapsed: boolean;
   panelWidths: Record<LayoutPanelKey, number>;
   panelVisibility: Record<LayoutPanelKey, boolean>;
 }
@@ -52,6 +53,7 @@ function readStoredSettings(): StoredSettings {
     selectedSide: "unstaged",
     compactMode: true,
     themeMode: "system",
+    projectPaneCollapsed: false,
     panelWidths: { ...DEFAULT_PANEL_WIDTHS },
     panelVisibility: { ...DEFAULT_PANEL_VISIBILITY },
   };
@@ -74,6 +76,10 @@ function readStoredSettings(): StoredSettings {
       compactMode:
         typeof parsed.compactMode === "boolean" ? parsed.compactMode : defaults.compactMode,
       themeMode: isThemeMode(parsed.themeMode) ? parsed.themeMode : defaults.themeMode,
+      projectPaneCollapsed:
+        typeof parsed.projectPaneCollapsed === "boolean"
+          ? parsed.projectPaneCollapsed
+          : defaults.projectPaneCollapsed,
       panelWidths: {
         project: clampPanelWidth("project", parsed.panelWidths?.project ?? defaults.panelWidths.project),
         repo: clampPanelWidth("repo", parsed.panelWidths?.repo ?? defaults.panelWidths.repo),
@@ -114,6 +120,7 @@ export const useSettingsStore = defineStore("settings", {
           selectedSide: this.selectedSide,
           compactMode: this.compactMode,
           themeMode: this.themeMode,
+          projectPaneCollapsed: this.projectPaneCollapsed,
           panelWidths: this.panelWidths,
           panelVisibility: this.panelVisibility,
         }),
@@ -131,6 +138,10 @@ export const useSettingsStore = defineStore("settings", {
       this.themeMode = themeMode;
       this.persist();
     },
+    setProjectPaneCollapsed(collapsed: boolean) {
+      this.projectPaneCollapsed = collapsed;
+      this.persist();
+    },
     setPanelVisible(panel: LayoutPanelKey, visible: boolean) {
       this.panelVisibility[panel] = visible;
       this.persist();
@@ -142,6 +153,7 @@ export const useSettingsStore = defineStore("settings", {
     resetLayout() {
       this.panelWidths = { ...DEFAULT_PANEL_WIDTHS };
       this.panelVisibility = { ...DEFAULT_PANEL_VISIBILITY };
+      this.projectPaneCollapsed = false;
       this.persist();
     },
   },

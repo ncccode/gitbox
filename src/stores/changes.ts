@@ -13,6 +13,10 @@ import { useRepositoriesStore } from "./repositories";
 import { useSettingsStore } from "./settings";
 import type { ChangeSide, ChangedFile, RepoStatus, ShelfInfo } from "../types/gitbox";
 
+type RefreshOptions = {
+  includeShelves?: boolean;
+};
+
 export const useChangesStore = defineStore("changes", {
   state: () => ({
     status: null as RepoStatus | null,
@@ -38,11 +42,12 @@ export const useChangesStore = defineStore("changes", {
     },
   },
   actions: {
-    async refresh() {
+    async refresh(options: RefreshOptions = {}) {
       const repos = useRepositoriesStore();
       const settings = useSettingsStore();
       if (!repos.path) return;
 
+      const includeShelves = options.includeShelves ?? true;
       this.loading = true;
       this.error = "";
       try {
@@ -52,7 +57,9 @@ export const useChangesStore = defineStore("changes", {
           this.selectedFile = null;
           this.selectedPaths = [];
         }
-        await this.refreshShelves();
+        if (includeShelves) {
+          await this.refreshShelves();
+        }
       } catch (error) {
         this.error = String(error);
         throw error;
@@ -161,7 +168,7 @@ export const useChangesStore = defineStore("changes", {
       try {
         const result = await action(repos.path, paths);
         this.notice = result.message || fallbackNotice;
-        await this.refresh();
+        await this.refresh({ includeShelves: false });
       } catch (error) {
         this.error = String(error);
         throw error;

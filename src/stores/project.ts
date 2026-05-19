@@ -165,6 +165,15 @@ export const useProjectStore = defineStore("project", {
         }
       }
     },
+    async reloadFileContent(path: string) {
+      delete this.contents[path];
+      delete this.drafts[path];
+      delete this.diffs[path];
+      await this.loadFileContent(path);
+      if (!this.contents[path]) {
+        await this.refresh();
+      }
+    },
     setEditorText(value: string) {
       const path = this.selectedPath;
       if (!path) return;
@@ -210,11 +219,9 @@ export const useProjectStore = defineStore("project", {
       this.error = "";
       try {
         await stageHunks(repos.path, [hunk.patch], "discard");
-        delete this.contents[path];
-        delete this.diffs[path];
         changes.notice = "已撤回选中块";
-        await changes.refresh();
-        await this.refresh();
+        await changes.refresh({ includeShelves: false });
+        await this.reloadFileContent(path);
       } catch (error) {
         this.error = String(error);
         throw error;
@@ -237,7 +244,7 @@ export const useProjectStore = defineStore("project", {
         await stageHunks(repos.path, [hunk.patch], "stage");
         delete this.diffs[path];
         changes.notice = "已暂存选中块";
-        await changes.refresh();
+        await changes.refresh({ includeShelves: false });
         await this.loadFileContent(path);
       } catch (error) {
         this.error = String(error);
