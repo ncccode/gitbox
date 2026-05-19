@@ -20,6 +20,7 @@ import {
   GitBranch,
   GitCommitVertical,
   ListChecks,
+  LoaderCircle,
   Minus,
   Plus,
   RefreshCw,
@@ -84,6 +85,7 @@ const project = useProjectStore();
 const remote = useRemoteStore();
 const settings = useSettingsStore();
 const shelveMessage = ref("");
+const pendingCommitAction = ref<"commit" | "push" | null>(null);
 const newBranchName = ref("");
 const newTagName = ref("");
 const newTagTarget = ref("");
@@ -376,6 +378,11 @@ const changeDiffRightLabel = computed(() => (settings.selectedSide === "staged" 
 const changeDiffRightDetail = computed(() => changes.selectedFile ?? "");
 const canCommit = computed(() =>
   Boolean(commit.message.trim() && ((counts.value?.staged ?? 0) > 0 || (commit.amend && branch.value?.head))),
+);
+const commitBusy = computed(() => commit.loading || pendingCommitAction.value !== null);
+const commitButtonLabel = computed(() => (pendingCommitAction.value === "commit" ? "提交中" : "提交"));
+const commitPushButtonLabel = computed(() =>
+  pendingCommitAction.value === "push" ? "提交并推送中" : "提交并推送",
 );
 const selectedCommitTitle = computed(() => {
   if (!history.details) return "未选择提交";
@@ -1806,9 +1813,15 @@ async function deleteShelfRecord(record: ShelfInfo) {
 }
 
 async function commitCurrent(pushAfter = false) {
-  await commit.commit(pushAfter ? remote.selectedRemote || undefined : undefined);
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  syncOperationTargets();
+  if (commitBusy.value || !canCommit.value || (pushAfter && !remote.selectedRemote)) return;
+  pendingCommitAction.value = pushAfter ? "push" : "commit";
+  try {
+    await commit.commit(pushAfter ? remote.selectedRemote || undefined : undefined);
+    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    syncOperationTargets();
+  } finally {
+    pendingCommitAction.value = null;
+  }
 }
 
 function shortHash(hash?: string | null) {
@@ -4686,16 +4699,25 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
             placeholder="覆盖作者：姓名 <email@example.com>"
           />
           <div class="commit-actions">
-            <button class="commit-button" :disabled="!canCommit || commit.loading">
-              {{ commit.amend ? "修正提交" : "提交" }} {{ counts?.staged ?? 0 }} 个文件
+            <button
+              class="commit-button"
+              :class="{ loading: pendingCommitAction === 'commit' }"
+              :disabled="!canCommit || commitBusy"
+              :aria-busy="pendingCommitAction === 'commit'"
+            >
+              <LoaderCircle v-if="pendingCommitAction === 'commit'" class="button-spinner" :size="14" />
+              <span>{{ commitButtonLabel }}</span>
             </button>
             <button
               class="commit-button secondary"
               type="button"
-              :disabled="!canCommit || commit.loading || !remote.selectedRemote"
+              :class="{ loading: pendingCommitAction === 'push' }"
+              :disabled="!canCommit || commitBusy || !remote.selectedRemote"
+              :aria-busy="pendingCommitAction === 'push'"
               @click="commitCurrent(true)"
             >
-              提交并推送
+              <LoaderCircle v-if="pendingCommitAction === 'push'" class="button-spinner" :size="14" />
+              <span>{{ commitPushButtonLabel }}</span>
             </button>
           </div>
         </form>
@@ -6924,6 +6946,25 @@ button:disabled {
   border-color: #5b8fd7;
   color: #ffffff;
   background: #3f6ea5;
+}
+
+.commit-button.loading:disabled {
+  cursor: progress;
+  opacity: 0.92;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.16),
+    0 0 0 2px rgba(91, 143, 215, 0.12);
+}
+
+.button-spinner {
+  flex: 0 0 auto;
+  animation: button-spin 0.8s linear infinite;
+}
+
+@keyframes button-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .tool-button.large {
@@ -11098,6 +11139,13 @@ html[data-theme="dark"] .commit-button.secondary {
   border-color: #4e6687;
   color: #c8dcff;
   background: #253246;
+}
+
+html[data-theme="dark"] .commit-button.loading:disabled {
+  opacity: 0.9;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 0 0 2px rgba(91, 143, 215, 0.16);
 }
 
 html[data-theme="dark"] .tool-button.danger,
