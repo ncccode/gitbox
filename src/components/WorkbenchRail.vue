@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import type { Component } from "vue";
-import { FolderOpen, GitBranch, GitCommitVertical } from "@lucide/vue";
+import { FolderOpen } from "@lucide/vue";
+import CommitIcon from "./icons/CommitIcon.vue";
+import VcsIcon from "./icons/VcsIcon.vue";
 
 type WorkbenchMode =
   | "changes"
@@ -26,8 +28,8 @@ const navItems: Array<{
   title: string;
   icon: Component;
 }> = [
-  { key: "changes", label: "提交", title: "提交与变更", icon: GitCommitVertical },
-  { key: "log", label: "日志", title: "提交日志", icon: GitBranch },
+  { key: "changes", label: "提交", title: "提交与变更", icon: CommitIcon },
+  { key: "log", label: "日志", title: "提交日志", icon: VcsIcon },
   { key: "project", label: "项目", title: "项目文件", icon: FolderOpen },
 ];
 </script>

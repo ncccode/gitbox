@@ -122,6 +122,13 @@ export const useChangelistsStore = defineStore("changelists", {
     createList() {
       const name = this.newName.trim();
       if (!name) return;
+      this.createListFrom(name, this.newDescription.trim(), true);
+      this.newName = "";
+      this.newDescription = "";
+    },
+    createListFrom(name: string, description = "", activate = true) {
+      name = name.trim();
+      if (!name) return null;
       const id = `list-${Date.now().toString(36)}`;
       const now = nowSeconds();
       this.lists = [
@@ -129,16 +136,37 @@ export const useChangelistsStore = defineStore("changelists", {
         {
           id,
           name,
-          description: this.newDescription.trim(),
+          description: description.trim(),
           active: false,
           paths: [],
           createdAt: now,
           updatedAt: now,
         },
       ];
-      this.newName = "";
-      this.newDescription = "";
-      this.setActive(id);
+      if (activate) {
+        this.setActive(id);
+      } else {
+        this.save();
+      }
+      return id;
+    },
+    updateList(id: string, updates: { name?: string; description?: string }) {
+      const target = this.lists.find((item) => item.id === id);
+      if (!target) return;
+      const name = updates.name?.trim();
+      const description = updates.description?.trim();
+      const now = nowSeconds();
+      this.lists = this.lists.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              name: name || item.name,
+              description: description ?? item.description,
+              updatedAt: now,
+            }
+          : item,
+      );
+      this.save();
     },
     setActive(id: string) {
       if (!this.lists.some((item) => item.id === id)) return;

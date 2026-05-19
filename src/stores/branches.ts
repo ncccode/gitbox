@@ -10,6 +10,7 @@ import {
   deleteTag,
   listBranches,
   pushTag,
+  renameBranch,
   setBranchUpstream,
 } from "../lib/gitboxCommands";
 import { useRepositoriesStore } from "./repositories";
@@ -116,6 +117,12 @@ export const useBranchesStore = defineStore("branches", {
     },
     async delete(name: string, force = false) {
       await this.runBranchAction((repoPath) => deleteBranch(repoPath, name, force), `已删除分支 ${name}`);
+    },
+    async rename(oldName: string, newName: string) {
+      await this.runBranchAction(
+        (repoPath) => renameBranch(repoPath, oldName, newName),
+        `已将分支 ${oldName} 重命名为 ${newName}`,
+      );
     },
     async deleteRemote(remoteBranch: string) {
       await this.runBranchAction(

@@ -32,6 +32,7 @@ import {
   X,
 } from "@lucide/vue";
 import AppTopbar from "./components/AppTopbar.vue";
+import VcsIcon from "./components/icons/VcsIcon.vue";
 import ProjectPane from "./components/ProjectPane.vue";
 import WorkbenchRail from "./components/WorkbenchRail.vue";
 import {
@@ -94,6 +95,10 @@ const logAuthorPickerOpen = ref(false);
 const logFilePickerOpen = ref(false);
 const logFilePickerSearch = ref("");
 const logFilePickerDraft = ref<string[]>([]);
+const logRefSearch = ref("");
+const logRefPanelCollapsed = ref(false);
+const logFavoriteRefsOnly = ref(false);
+const logRefSearchInput = ref<HTMLInputElement | null>(null);
 const expandedLogFilePickerDirectories = ref<Record<string, boolean>>({
   [PROJECT_ROOT_PATH]: true,
 });
@@ -102,18 +107,34 @@ const expandedLogRefGroups = ref<Record<string, boolean>>({
   remote: true,
   tags: true,
 });
+const changeFileContextMenu = ref<ChangeFileContextMenu | null>(null);
+const changeListContextMenu = ref<ChangeListContextMenu | null>(null);
 const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
 const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
 const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
+const changeDiffScroller = ref<HTMLElement | null>(null);
 const logDiffScroller = ref<HTMLElement | null>(null);
+const activeChangeDiffHunkIndex = ref<number | null>(null);
 const activeLogDiffHunkIndex = ref(0);
 const syncingSideBySideScroll = new WeakSet<HTMLElement>();
 const projectEditorScrollTop = ref(0);
 const projectEditorScrollLeft = ref(0);
 const expandedProjectHunkIndex = ref<number | null>(null);
+const expandedChangeFileGroups = ref<Record<string, boolean>>({
+  staged: true,
+  tracked: true,
+  untracked: true,
+});
 type WorkbenchMode = "changes" | "log" | "project" | "branches" | "remote" | "operations" | "advanced";
+type ChangeFileGroup = {
+  key: string;
+  label: string;
+  side: ChangeSide;
+  files: ChangedFile[];
+  changelistId?: string;
+};
 type ProjectCodeToken = {
   text: string;
   kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
@@ -169,6 +190,17 @@ type LogDiffTab = {
   loading: boolean;
   error: string;
 };
+type ChangeFileContextMenu = {
+  file: ChangedFile;
+  side: ChangeSide;
+  x: number;
+  y: number;
+};
+type ChangeListContextMenu = {
+  listId: string;
+  x: number;
+  y: number;
+};
 type ProjectFileContextMenu = {
   file: ProjectFileEntry | null;
   x: number;
@@ -193,11 +225,16 @@ type ProjectCloseDialog = {
   saving: boolean;
   error: string;
 };
+type NoticeToast = {
+  id: number;
+  message: string;
+};
 
 const workbenchMode = ref<WorkbenchMode>("changes");
 const LOG_TAB_ID = "log-root";
 const activeLogTabId = ref(LOG_TAB_ID);
 const logDiffTabs = ref<LogDiffTab[]>([]);
+const noticeToast = ref<NoticeToast | null>(null);
 const activeResizePanel = ref<LayoutPanelKey | null>(null);
 const systemPrefersDark = ref(
   typeof window !== "undefined" &&
@@ -206,14 +243,67 @@ const systemPrefersDark = ref(
 );
 let stopSystemThemeWatch: (() => void) | null = null;
 let autoFetchTimer: number | null = null;
+let noticeToastTimer: number | null = null;
+let noticeToastId = 0;
 const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 const PROJECT_EDITOR_LINE_HEIGHT = 18;
 const PROJECT_EDITOR_PADDING_TOP = 12;
 
 const activeFiles = computed(() => {
-  const files = changes.filesForSide(settings.selectedSide);
-  return files.filter((file) => changelists.listForPath(file.path).id === changelists.selectedListId);
+  return changes.filesForSide(settings.selectedSide);
+});
+const changeFileGroups = computed<ChangeFileGroup[]>(() => {
+  if (settings.selectedSide === "staged") {
+    const stagedGroups: ChangeFileGroup[] = [
+      {
+        key: "staged",
+        label: "暂存的变更",
+        side: "staged",
+        files: activeFiles.value,
+        changelistId: "default",
+      },
+    ];
+
+    return stagedGroups.filter((group) => group.files.length > 0);
+  }
+
+  const listGroups = new Map<string, ChangeFileGroup>(
+    changelists.lists.map((list) => [
+      `changelist-${list.id}`,
+      {
+        key: `changelist-${list.id}`,
+        label: list.id === "default" && list.name === "默认变更" ? "变更" : list.name,
+        side: "unstaged",
+        files: [],
+        changelistId: list.id,
+      },
+    ]),
+  );
+  const untrackedFiles: ChangedFile[] = [];
+
+  for (const file of activeFiles.value) {
+    const list = changelists.listForPath(file.path);
+    if (file.untracked && list.id === "default") {
+      untrackedFiles.push(file);
+      continue;
+    }
+
+    listGroups.get(`changelist-${list.id}`)?.files.push(file);
+  }
+
+  const unstagedGroups: ChangeFileGroup[] = [
+    ...listGroups.values(),
+    {
+      key: "untracked",
+      label: "未纳入版本控制的文件",
+      side: "unstaged",
+      files: untrackedFiles,
+      changelistId: "default",
+    },
+  ];
+
+  return unstagedGroups.filter((group) => group.key !== "untracked" || group.files.length > 0);
 });
 const usesRepositoryContext = computed(() => repositoryContextModes.has(workbenchMode.value));
 const usesWorkbenchContext = computed(() => workbenchContextModes.has(workbenchMode.value));
@@ -245,13 +335,38 @@ const activeNotice = computed(
     advanced.notice ||
     branches.notice ||
     changes.notice ||
-    remote.notice ||
-    (commit.lastCommit ? `最近提交 ${commit.lastCommit}` : ""),
+    remote.notice,
 );
-const selectedDiffTitle = computed(() => {
-  if (!changes.selectedFile) return "未选择文件";
-  return `${changes.selectedSide === "staged" ? "暂存区" : "工作区"} · ${changes.selectedFile}`;
+const selectedDiffFileTitle = computed(() => changes.selectedFile ?? "未选择文件");
+const activeChangeDiffLanguage = computed(() => projectLanguageForPath(changes.selectedFile));
+const activeChangeSideBySideDiffRows = computed(() =>
+  buildSideBySideDiffRows(diff.current, activeChangeDiffLanguage.value),
+);
+const activeChangeDiffHasContent = computed(() => Boolean(diff.current?.text?.trim()));
+const activeChangeDiffHunkCount = computed(() => diff.current?.hunks.length ?? 0);
+const currentChangeDiffHunkPosition = computed(() => {
+  if (activeChangeDiffHunkCount.value === 0) return 0;
+  const index = diff.current?.hunks.findIndex((hunk) => hunk.index === activeChangeDiffHunkIndex.value) ?? -1;
+  return index >= 0 ? index + 1 : 1;
 });
+const activeChangeDiffFileIndex = computed(() =>
+  changes.selectedFile ? activeFiles.value.findIndex((file) => file.path === changes.selectedFile) : -1,
+);
+const activeChangeDiffFilePosition = computed(() =>
+  activeChangeDiffFileIndex.value >= 0
+    ? `${activeChangeDiffFileIndex.value + 1}/${activeFiles.value.length}`
+    : `0/${activeFiles.value.length}`,
+);
+const canSelectPreviousChangeDiffFile = computed(() => activeChangeDiffFileIndex.value > 0);
+const canSelectNextChangeDiffFile = computed(
+  () => activeChangeDiffFileIndex.value >= 0 && activeChangeDiffFileIndex.value < activeFiles.value.length - 1,
+);
+const changeDiffLeftLabel = computed(() => (settings.selectedSide === "staged" ? "提交" : "索引"));
+const changeDiffLeftDetail = computed(() =>
+  settings.selectedSide === "staged" ? shortHash(branch.value?.head) : "暂存快照",
+);
+const changeDiffRightLabel = computed(() => (settings.selectedSide === "staged" ? "暂存区" : "工作区"));
+const changeDiffRightDetail = computed(() => changes.selectedFile ?? "");
 const canCommit = computed(() =>
   Boolean(commit.message.trim() && ((counts.value?.staged ?? 0) > 0 || (commit.amend && branch.value?.head))),
 );
@@ -427,7 +542,11 @@ const workspaceGridStyle = computed(() => {
   }
 
   if (repos.current && usesWorkbenchContext.value && settings.panelVisibility.changes) {
-    columns.push(`${settings.panelWidths.changes}px`, "6px");
+    const workbenchContextWidth =
+      workbenchMode.value === "log" && logRefPanelCollapsed.value
+        ? "42px"
+        : `${settings.panelWidths.changes}px`;
+    columns.push(workbenchContextWidth, "6px");
   }
 
   columns.push("minmax(0, 1fr)");
@@ -444,6 +563,20 @@ const statusKindLabels: Record<string, string> = {
   conflicted: "冲突",
   ignored: "忽略",
   unknown: "未知",
+};
+const changeFileIconLabels: Record<string, string> = {
+  css: "CSS",
+  html: "<>",
+  js: "JS",
+  json: "{}",
+  jsx: "JS",
+  md: "MD",
+  rs: "RS",
+  ts: "TS",
+  tsx: "TS",
+  vue: "VUE",
+  wxml: "<>",
+  wxss: "CSS",
 };
 const operationKindLabels: Record<string, string> = {
   merge: "合并",
@@ -506,6 +639,19 @@ type LogFileContextMenu = {
   y: number;
   row: LogFileTreeRow;
 };
+type LogRefContextMenu =
+  | {
+      kind: "local" | "remote";
+      x: number;
+      y: number;
+      branch: BranchInfo;
+    }
+  | {
+      kind: "tag";
+      x: number;
+      y: number;
+      tag: TagInfo;
+    };
 type LogAuthorOption = {
   value: string;
   label: string;
@@ -527,7 +673,7 @@ const hostedRemoteLinks = computed(() =>
       Boolean(item),
     ),
 );
-const logHeadLabel = computed(() => `HEAD (${branchNameLabel(branch.value?.currentBranch)})`);
+const logHeadLabel = computed(() => (branch.value?.detached ? "HEAD (游离)" : "HEAD (目前分支)"));
 const logRemoteGroups = computed<LogRemoteGroup[]>(() => {
   const groups = new Map<string, BranchInfo[]>();
   for (const item of branches.sortedRemoteBranches) {
@@ -539,6 +685,81 @@ const logRemoteGroups = computed<LogRemoteGroup[]>(() => {
   }
   return [...groups.entries()].map(([name, groupBranches]) => ({ name, branches: groupBranches }));
 });
+const logRefSearchQuery = computed(() => logRefSearch.value.trim().toLocaleLowerCase());
+const logRefFiltering = computed(() => Boolean(logRefSearchQuery.value));
+const showLogHeadRef = computed(() => {
+  const query = logRefSearchQuery.value;
+  return (
+    !logFavoriteRefsOnly.value &&
+    logRefMatches(query, logHeadLabel.value, branch.value?.currentBranch, branch.value?.head, "head")
+  );
+});
+const visibleLogLocalBranches = computed<BranchInfo[]>(() => {
+  const query = logRefSearchQuery.value;
+  const localBranches = logFavoriteRefsOnly.value
+    ? branches.sortedLocalBranches.filter((item) => isLogBranchFavorite(item))
+    : branches.sortedLocalBranches;
+  if (!query || logRefMatches(query, "本地", "local")) return localBranches;
+  return localBranches.filter((item) => logRefMatches(query, item.name, item.fullName, item.upstream, item.target));
+});
+const visibleLogRemoteGroups = computed<LogRemoteGroup[]>(() => {
+  const query = logRefSearchQuery.value;
+  const remoteGroups = logRemoteGroups.value
+    .map((group) => ({
+      ...group,
+      branches: logFavoriteRefsOnly.value
+        ? group.branches.filter((item) => isLogBranchFavorite(item))
+        : group.branches,
+    }))
+    .filter((group) => group.branches.length > 0);
+  if (!query) return remoteGroups;
+  return remoteGroups
+    .map((group) => {
+      if (logRefMatches(query, group.name, "远端", "remote")) return group;
+      return {
+        ...group,
+        branches: group.branches.filter((item) =>
+          logRefMatches(query, item.name, item.fullName, item.upstream, item.target),
+        ),
+      };
+    })
+    .filter((group) => group.branches.length > 0);
+});
+const visibleLogTags = computed<TagInfo[]>(() => {
+  const query = logRefSearchQuery.value;
+  const tags = (branches.list?.tags ?? []).filter(
+    (item) =>
+      !logFavoriteRefsOnly.value ||
+      branches.isFavorite(item.name) ||
+      branches.isFavorite(`refs/tags/${item.name}`),
+  );
+  if (!query || logRefMatches(query, "标签", "tag", "tags")) return tags;
+  return tags.filter((item) => logRefMatches(query, item.name, item.target));
+});
+const activeLogBranchRef = computed<BranchInfo | null>(() => {
+  const refName = history.branchFilter || branch.value?.currentBranch || "";
+  if (!refName) return null;
+  return (
+    (branches.list?.branches ?? []).find(
+      (item) => item.name === refName || item.fullName === refName || formatRefName(item.fullName) === refName,
+    ) ?? null
+  );
+});
+const activeLogBranchFavorite = computed(() => {
+  const refName = activeLogBranchRef.value?.fullName;
+  return Boolean(refName && branches.isFavorite(refName));
+});
+const logRefGroupsFullyExpanded = computed(() => {
+  const keys: LogRefGroupKey[] = ["local", "remote", "tags", ...logRemoteGroups.value.map((group) => logRemoteGroupKey(group.name))];
+  return keys.every((key) => isLogRefGroupExpanded(key));
+});
+const hasVisibleLogRefs = computed(
+  () =>
+    showLogHeadRef.value ||
+    visibleLogLocalBranches.value.length > 0 ||
+    visibleLogRemoteGroups.value.length > 0 ||
+    visibleLogTags.value.length > 0,
+);
 const logGraphRows = computed<LogGraphRow[]>(() => buildLogGraphRows(history.commits));
 const commitFileTreeRows = computed<LogFileTreeRow[]>(() => buildCommitFileTreeRows(history.details?.files ?? []));
 const visibleCommitFileTreeRows = computed<LogFileTreeRow[]>(() => {
@@ -641,6 +862,7 @@ const logFilterActive = computed(() =>
   ),
 );
 const logFileContextMenu = ref<LogFileContextMenu | null>(null);
+const logRefContextMenu = ref<LogRefContextMenu | null>(null);
 const commitFileSignature = computed(() =>
   history.details
     ? `${history.details.commit.oid}:${history.details.files
@@ -653,6 +875,13 @@ watch(
   () => [changes.selectedFile, changes.selectedSide],
   () => {
     diff.loadSelected().catch(() => undefined);
+  },
+);
+
+watch(
+  () => diff.current?.text,
+  () => {
+    activeChangeDiffHunkIndex.value = diff.current?.hunks[0]?.index ?? null;
   },
 );
 
@@ -728,6 +957,16 @@ watch(
   },
 );
 
+watch(
+  activeNotice,
+  (message) => {
+    if (!message) return;
+    showNoticeToast(message);
+    clearNoticeSources();
+  },
+  { flush: "post" },
+);
+
 watch(workbenchMode, (mode) => {
   if (mode === "advanced") {
     loadAdvancedSnapshots().catch(() => undefined);
@@ -759,7 +998,41 @@ onMounted(() => {
 onUnmounted(() => {
   stopSystemThemeWatch?.();
   clearAutoFetchTimer();
+  clearNoticeToastTimer();
 });
+
+function clearNoticeToastTimer() {
+  if (noticeToastTimer !== null && typeof window !== "undefined") {
+    window.clearTimeout(noticeToastTimer);
+  }
+  noticeToastTimer = null;
+}
+
+function showNoticeToast(message: string) {
+  const id = noticeToastId + 1;
+  noticeToastId = id;
+  noticeToast.value = { id, message };
+  clearNoticeToastTimer();
+  if (typeof window !== "undefined") {
+    noticeToastTimer = window.setTimeout(() => {
+      dismissNoticeToast(id);
+    }, 3200);
+  }
+}
+
+function dismissNoticeToast(id?: number) {
+  if (id !== undefined && noticeToast.value?.id !== id) return;
+  clearNoticeToastTimer();
+  noticeToast.value = null;
+}
+
+function clearNoticeSources() {
+  operations.notice = "";
+  advanced.notice = "";
+  branches.notice = "";
+  changes.notice = "";
+  remote.notice = "";
+}
 
 function normalizeSelectedPaths(selected: string | string[] | null) {
   if (!selected) return [];
@@ -1136,6 +1409,239 @@ function startPanelResize(panel: LayoutPanelKey, event: PointerEvent) {
 
 function selectFile(file: ChangedFile, side: ChangeSide) {
   changes.selectFile(file, side);
+}
+
+function selectChangeFileForContext(file: ChangedFile, side: ChangeSide) {
+  if (!changes.selectedPaths.includes(file.path)) {
+    selectFile(file, side);
+    return;
+  }
+
+  changes.selectedFile = file.path;
+  changes.selectedSide = side;
+  settings.setSide(side);
+}
+
+function openChangeFileContextMenu(file: ChangedFile, side: ChangeSide, event: MouseEvent) {
+  closeChangeListContextMenu();
+  selectChangeFileForContext(file, side);
+  const menuWidth = 260;
+  const menuHeight = Math.min(420, 258 + changelists.lists.length * 28);
+  changeFileContextMenu.value = {
+    file,
+    side,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function closeChangeFileContextMenu() {
+  changeFileContextMenu.value = null;
+}
+
+function openChangeListContextMenu(listId: string | null | undefined, event: MouseEvent) {
+  closeChangeFileContextMenu();
+  const targetId = listId && changelists.lists.some((item) => item.id === listId)
+    ? listId
+    : changelists.activeId || "default";
+  const menuWidth = 260;
+  const menuHeight = 92;
+  changeListContextMenu.value = {
+    listId: targetId,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function closeChangeListContextMenu() {
+  changeListContextMenu.value = null;
+}
+
+function changelistById(id: string) {
+  return changelists.lists.find((item) => item.id === id) ?? changelists.activeList;
+}
+
+function canDeleteChangelist(id: string) {
+  return id !== "default";
+}
+
+function changeContextPaths(file: ChangedFile) {
+  return changes.selectedPaths.includes(file.path) ? changes.selectedPaths : [file.path];
+}
+
+function changeContextFiles(file: ChangedFile) {
+  const paths = new Set(changeContextPaths(file));
+  return changes.files.filter((item) => paths.has(item.path));
+}
+
+function changeContextLabel(file: ChangedFile) {
+  const count = changeContextPaths(file).length;
+  return count > 1 ? `${count} 个文件` : fileBaseName(file.path);
+}
+
+function canDeleteChangeFile(file: ChangedFile) {
+  return !file.kind.split("|").includes("deleted");
+}
+
+function deletableChangeContextPaths(file: ChangedFile) {
+  return changeContextFiles(file).filter(canDeleteChangeFile).map((item) => item.path);
+}
+
+function changelistForChangeContext(file: ChangedFile) {
+  return changelists.listForPath(file.path);
+}
+
+function changelistMoveTargets(file: ChangedFile) {
+  const currentIds = new Set(changeContextPaths(file).map((path) => changelists.listForPath(path).id));
+  return changelists.lists.filter((list) => !(currentIds.size === 1 && currentIds.has(list.id)));
+}
+
+function validateChangelistName(value: string, editingId?: string) {
+  const name = value.trim();
+  if (!name) return "请输入变更清单名称";
+  const exists = changelists.lists.some(
+    (item) => item.id !== editingId && item.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
+  );
+  return exists ? "变更清单名称已存在" : "";
+}
+
+function expandChangelistGroup(id: string) {
+  expandedChangeFileGroups.value = {
+    ...expandedChangeFileGroups.value,
+    [`changelist-${id}`]: true,
+  };
+}
+
+async function showChangeFileDiffFromContext(file: ChangedFile, side: ChangeSide) {
+  selectFile(file, side);
+  workbenchMode.value = "changes";
+  closeChangeFileContextMenu();
+  await diff.loadSelected().catch(() => undefined);
+}
+
+async function discardChangeFilesFromContext(file: ChangedFile) {
+  const paths = changeContextPaths(file);
+  if (paths.length === 0) return;
+  if (!window.confirm(`回滚 ${changeContextLabel(file)} 的本地变更？`)) return;
+  closeChangeFileContextMenu();
+  await runAndReload(() => changes.discardSelected());
+}
+
+function moveChangeFilesToChangelistFromContext(file: ChangedFile, listId: string) {
+  const paths = changeContextPaths(file);
+  changelists.movePaths(paths, listId);
+  expandChangelistGroup(listId);
+  changes.notice = `已移动 ${paths.length} 个文件到 ${changelists.lists.find((item) => item.id === listId)?.name ?? "变更清单"}`;
+  closeChangeFileContextMenu();
+}
+
+async function createChangelistFromChangeContext(file: ChangedFile) {
+  const paths = changeContextPaths(file);
+  closeChangeFileContextMenu();
+  const name = await promptProjectName("新建变更清单", "", (value) => validateChangelistName(value));
+  if (!name) return;
+
+  const id = changelists.createListFrom(name, "", true);
+  if (!id) return;
+  changelists.movePaths(paths, id);
+  expandChangelistGroup(id);
+  changes.notice = `已新建变更清单 ${name}`;
+}
+
+async function createChangelistFromListContext() {
+  closeChangeListContextMenu();
+  const name = await promptProjectName("新建变更清单", "", (value) => validateChangelistName(value));
+  if (!name) return;
+
+  const id = changelists.createListFrom(name, "", true);
+  if (!id) return;
+  expandChangelistGroup(id);
+  changes.notice = `已新建变更清单 ${name}`;
+}
+
+async function editChangelistFromChangeContext(file: ChangedFile) {
+  const list = changelistForChangeContext(file);
+  closeChangeFileContextMenu();
+  const name = await promptProjectName("编辑变更清单", list.name, (value) => validateChangelistName(value, list.id));
+  if (!name || name === list.name) return;
+
+  changelists.updateList(list.id, { name });
+  expandChangelistGroup(list.id);
+  changes.notice = `已更新变更清单 ${name}`;
+}
+
+async function editChangelistFromListContext(listId: string) {
+  const list = changelistById(listId);
+  closeChangeListContextMenu();
+  const name = await promptProjectName("编辑变更清单", list.name, (value) => validateChangelistName(value, list.id));
+  if (!name || name === list.name) return;
+
+  changelists.updateList(list.id, { name });
+  expandChangelistGroup(list.id);
+  changes.notice = `已更新变更清单 ${name}`;
+}
+
+function deleteChangelistFromListContext(listId: string) {
+  const list = changelistById(listId);
+  if (!canDeleteChangelist(list.id)) return;
+  if (!window.confirm(`删除变更清单 ${list.name}？其中的文件会移回默认变更。`)) return;
+
+  closeChangeListContextMenu();
+  changelists.deleteList(list.id);
+  expandChangelistGroup("default");
+  changes.notice = `已删除变更清单 ${list.name}`;
+}
+
+async function deleteChangeFilesFromContext(file: ChangedFile) {
+  const paths = deletableChangeContextPaths(file);
+  if (paths.length === 0 || !repos.path) return;
+  if (!window.confirm(`删除 ${paths.length > 1 ? `${paths.length} 个文件` : paths[0]}？`)) return;
+
+  closeChangeFileContextMenu();
+  changes.loading = true;
+  changes.error = "";
+  try {
+    for (const path of paths) {
+      await deleteProjectEntry(repos.path, path);
+    }
+    changes.notice = `已删除 ${paths.length} 个文件`;
+    await reloadAfterProjectFileOperation();
+  } catch (error) {
+    changes.error = String(error);
+  } finally {
+    changes.loading = false;
+  }
+}
+
+async function showChangeFileHistoryFromContext(file: ChangedFile) {
+  const paths = changeContextPaths(file);
+  history.pathFilters = paths;
+  activeLogTabId.value = LOG_TAB_ID;
+  workbenchMode.value = "log";
+  closeChangeFileContextMenu();
+  await history.refresh().catch(() => undefined);
+}
+
+async function selectAdjacentChangeDiffFile(direction: -1 | 1) {
+  const files = activeFiles.value;
+  if (!files.length) return;
+
+  const currentIndex = activeChangeDiffFileIndex.value >= 0 ? activeChangeDiffFileIndex.value : 0;
+  const nextIndex = Math.min(Math.max(currentIndex + direction, 0), files.length - 1);
+  if (nextIndex === activeChangeDiffFileIndex.value) return;
+
+  selectFile(files[nextIndex], settings.selectedSide);
+}
+
+async function jumpChangeDiffHunk(direction: -1 | 1) {
+  const hunks = diff.current?.hunks ?? [];
+  if (!hunks.length) return;
+
+  const currentIndex = hunks.findIndex((hunk) => hunk.index === activeChangeDiffHunkIndex.value);
+  const nextIndex = ((currentIndex >= 0 ? currentIndex : 0) + direction + hunks.length) % hunks.length;
+  activeChangeDiffHunkIndex.value = hunks[nextIndex].index;
+  await nextTick();
+  scrollSideBySideHunkIntoView(changeDiffScroller.value, hunks[nextIndex].index);
 }
 
 function commitFileRowFromChange(file: CommitFileChange): LogFileTreeRow {
@@ -1757,8 +2263,11 @@ function closeProjectFileContextMenu() {
 }
 
 function closeContextMenus() {
+  closeChangeFileContextMenu();
+  closeChangeListContextMenu();
   closeProjectFileContextMenu();
   closeLogFileContextMenu();
+  closeLogRefContextMenu();
 }
 
 async function createProjectFileFromContext(file: ProjectFileEntry | null) {
@@ -1970,6 +2479,69 @@ function formatStatusKind(kind: string) {
     .join(" / ");
 }
 
+function isChangeFileGroupExpanded(key: string) {
+  return expandedChangeFileGroups.value[key] ?? true;
+}
+
+function toggleChangeFileGroup(key: string) {
+  expandedChangeFileGroups.value = {
+    ...expandedChangeFileGroups.value,
+    [key]: !isChangeFileGroupExpanded(key),
+  };
+}
+
+function isChangeFileGroupSelected(files: ChangedFile[]) {
+  return files.length > 0 && files.every((file) => changes.selectedPaths.includes(file.path));
+}
+
+function isChangeFileGroupPartiallySelected(files: ChangedFile[]) {
+  return files.some((file) => changes.selectedPaths.includes(file.path)) && !isChangeFileGroupSelected(files);
+}
+
+function toggleChangeFileGroupSelection(files: ChangedFile[]) {
+  const groupPaths = files.map((file) => file.path);
+  const groupPathSet = new Set(groupPaths);
+
+  if (isChangeFileGroupSelected(files)) {
+    changes.selectedPaths = changes.selectedPaths.filter((path) => !groupPathSet.has(path));
+    return;
+  }
+
+  changes.selectedPaths = [...new Set([...changes.selectedPaths, ...groupPaths])];
+  if (!changes.selectedFile && groupPaths[0]) {
+    changes.selectedFile = groupPaths[0];
+  }
+}
+
+function fileDirectoryName(path: string) {
+  const parts = path.split("/").filter(Boolean);
+  if (parts.length <= 1) return "";
+  return parts.slice(0, -1).join("/");
+}
+
+function fileContextPath(path: string) {
+  return fileDirectoryName(path) || repos.name;
+}
+
+function fileExtension(path: string) {
+  const name = fileBaseName(path);
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === name.length - 1) return "";
+  return name.slice(dotIndex + 1).toLowerCase();
+}
+
+function fileTypeLabel(path: string) {
+  return changeFileIconLabels[fileExtension(path)] ?? "";
+}
+
+function changeFileIconClass(path: string) {
+  const extension = fileExtension(path) || "file";
+  return {
+    [`ext-${extension}`]: true,
+    labeled: Boolean(fileTypeLabel(path)),
+  };
+}
+
 function formatCommitTime(seconds: number) {
   return new Date(seconds * 1000).toLocaleString();
 }
@@ -2094,6 +2666,15 @@ function shortRemoteBranchName(name: string, remoteName: string) {
   return name.startsWith(`${remoteName}/`) ? name.slice(remoteName.length + 1) : name;
 }
 
+function isLogBranchFavorite(item: BranchInfo) {
+  return branches.isFavorite(item.fullName) || branches.isFavorite(item.name);
+}
+
+function logRefMatches(query: string, ...values: Array<string | null | undefined>) {
+  if (!query) return true;
+  return values.some((value) => value?.toLocaleLowerCase().includes(query));
+}
+
 function isLogRefActive(refName: string) {
   return history.branchFilter === refName;
 }
@@ -2113,14 +2694,381 @@ function toggleLogRefGroup(key: LogRefGroupKey) {
   };
 }
 
+function toggleLogRefPanelCollapsed() {
+  logRefPanelCollapsed.value = !logRefPanelCollapsed.value;
+}
+
+function focusLogRefSearch() {
+  logRefPanelCollapsed.value = false;
+  nextTick(() => logRefSearchInput.value?.focus());
+}
+
+function toggleLogFavoriteRefsOnly() {
+  logFavoriteRefsOnly.value = !logFavoriteRefsOnly.value;
+  logRefPanelCollapsed.value = false;
+}
+
+function toggleAllLogRefGroups() {
+  const expanded = !logRefGroupsFullyExpanded.value;
+  const nextGroups: Record<string, boolean> = {
+    local: expanded,
+    remote: expanded,
+    tags: expanded,
+  };
+  for (const group of logRemoteGroups.value) {
+    nextGroups[logRemoteGroupKey(group.name)] = expanded;
+  }
+  expandedLogRefGroups.value = {
+    ...expandedLogRefGroups.value,
+    ...nextGroups,
+  };
+}
+
 function clearLogRef() {
   history.branchFilter = "";
   history.refresh().catch(() => undefined);
 }
 
+function clearLogRefContext() {
+  logRefSearch.value = "";
+  clearLogRef();
+}
+
 function selectLogRef(refName: string) {
   history.branchFilter = refName;
   history.refresh().catch(() => undefined);
+}
+
+function contextMenuPoint(event: MouseEvent, menuWidth = 260, menuHeight = 320) {
+  return {
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function openLogBranchContextMenu(branchItem: BranchInfo, event: MouseEvent) {
+  closeContextMenus();
+  logRefContextMenu.value = {
+    kind: branchItem.branchType === "remote" ? "remote" : "local",
+    branch: branchItem,
+    ...contextMenuPoint(event, 270, branchItem.branchType === "remote" ? 282 : 306),
+  };
+}
+
+function openLogTagContextMenu(tag: TagInfo, event: MouseEvent) {
+  closeContextMenus();
+  logRefContextMenu.value = {
+    kind: "tag",
+    tag,
+    ...contextMenuPoint(event, 270, 248),
+  };
+}
+
+function closeLogRefContextMenu() {
+  logRefContextMenu.value = null;
+}
+
+function logRefContextBranchItem(menu: LogRefContextMenu | null) {
+  return menu?.kind === "local" || menu?.kind === "remote" ? menu.branch : null;
+}
+
+function logRefContextTagItem(menu: LogRefContextMenu | null) {
+  return menu?.kind === "tag" ? menu.tag : null;
+}
+
+function logRefContextRefName(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  return branchItem?.name ?? logRefContextTagItem(menu)?.name ?? "";
+}
+
+function logRefContextFullName(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  return branchItem?.fullName ?? (menu?.kind === "tag" ? `refs/tags/${menu.tag.name}` : "");
+}
+
+function logRefContextFavoriteKey(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  if (branchItem) {
+    if (branches.isFavorite(branchItem.fullName)) return branchItem.fullName;
+    if (branches.isFavorite(branchItem.name)) return branchItem.name;
+    return branchItem.fullName;
+  }
+  if (menu?.kind !== "tag") return "";
+  const tagFullName = `refs/tags/${menu.tag.name}`;
+  if (branches.isFavorite(tagFullName)) return tagFullName;
+  if (branches.isFavorite(menu.tag.name)) return menu.tag.name;
+  return tagFullName;
+}
+
+function isLogRefContextFavorite(menu: LogRefContextMenu | null) {
+  const key = logRefContextFavoriteKey(menu);
+  return Boolean(key && branches.isFavorite(key));
+}
+
+function isLogBranchContextTarget(branchItem: BranchInfo) {
+  return logRefContextMenu.value?.kind !== "tag" && logRefContextMenu.value?.branch.fullName === branchItem.fullName;
+}
+
+function isLogTagContextTarget(tag: TagInfo) {
+  return logRefContextMenu.value?.kind === "tag" && logRefContextMenu.value.tag.name === tag.name;
+}
+
+function canCheckoutLogRefContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  return menu?.kind === "tag" || Boolean(branchItem && !branchItem.current);
+}
+
+function canMergeOrRebaseLogRefContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  return Boolean(branchItem && !branchItem.current && branch.value?.currentBranch);
+}
+
+function canRenameLogRefContext(menu: LogRefContextMenu | null) {
+  return menu?.kind === "local";
+}
+
+function canDeleteLogRefContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  return menu?.kind === "tag" || Boolean(branchItem && !branchItem.current);
+}
+
+function canSetLogRefContextUpstream(menu: LogRefContextMenu | null) {
+  return menu?.kind === "remote" && Boolean(branch.value?.currentBranch);
+}
+
+function branchStartPointName(menu: LogRefContextMenu | null) {
+  return logRefContextRefName(menu);
+}
+
+function branchNameBaseFromRef(menu: LogRefContextMenu | null) {
+  if (menu?.kind === "remote") {
+    const remoteName = menu.branch.name.split("/")[0] || "";
+    return `${shortRemoteBranchName(menu.branch.name, remoteName)}-local`;
+  }
+  const refName = logRefContextRefName(menu).replace(/^refs\/tags\//, "");
+  return menu?.kind === "tag" ? `${refName}-branch` : `${refName}-copy`;
+}
+
+function nextAvailableBranchName(baseName: string) {
+  const base = baseName
+    .trim()
+    .replace(/^\-+/, "")
+    .replace(/[\s~^:?*\[\\\]]+/g, "-")
+    .replace(/\/+/g, "/")
+    .replace(/[/.]+$/g, "");
+  const fallback = base || "new-branch";
+  if (!validateBranchName(fallback)) return fallback;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${fallback}-${index}`;
+    if (!validateBranchName(candidate)) return candidate;
+  }
+  return fallback;
+}
+
+function showLogRefFromContext(menu: LogRefContextMenu | null) {
+  const refName = logRefContextRefName(menu);
+  if (!refName) return;
+  closeLogRefContextMenu();
+  activeLogTabId.value = LOG_TAB_ID;
+  workbenchMode.value = "log";
+  selectLogRef(refName);
+}
+
+async function checkoutLogRefFromContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  const tag = logRefContextTagItem(menu);
+  if (branchItem) {
+    closeLogRefContextMenu();
+    await checkoutSelectedBranch(branchItem);
+    return;
+  }
+  if (!tag) return;
+  if (!window.confirm(`检出标签 ${tag.name} 为游离 HEAD？`)) return;
+  closeLogRefContextMenu();
+  await advanced.checkoutDetached(tag.name);
+  await loadCurrentRepository();
+}
+
+async function createBranchFromLogRefContext(menu: LogRefContextMenu | null) {
+  const startPoint = branchStartPointName(menu);
+  if (!startPoint) return;
+  const defaultName = nextAvailableBranchName(branchNameBaseFromRef(menu));
+  closeLogRefContextMenu();
+  const name = await promptProjectName(`从 ${startPoint} 新建分支`, defaultName, validateBranchName);
+  if (!name) return;
+  const previousFilter = history.branchFilter;
+  history.branchFilter = name;
+  try {
+    await branches.create(name, true, startPoint);
+    await loadCurrentRepository();
+  } catch (error) {
+    history.branchFilter = previousFilter;
+    throw error;
+  }
+}
+
+async function renameLogBranchFromContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  if (!branchItem || menu?.kind !== "local") return;
+  closeLogRefContextMenu();
+  const newName = await promptProjectName("重命名分支", branchItem.name, (value) =>
+    validateBranchName(value, branchItem.name),
+  );
+  if (!newName || newName === branchItem.name) return;
+  if (!window.confirm(`将分支 ${branchItem.name} 重命名为 ${newName}？`)) return;
+  await branches.rename(branchItem.name, newName);
+  if (history.branchFilter === branchItem.name) {
+    history.branchFilter = newName;
+  }
+  await loadCurrentRepository();
+}
+
+async function deleteLogRefFromContext(menu: LogRefContextMenu | null) {
+  const branchItem = logRefContextBranchItem(menu);
+  const tag = logRefContextTagItem(menu);
+  const refName = logRefContextRefName(menu);
+  if (branchItem) {
+    if (branchItem.current) return;
+    const confirmed =
+      branchItem.branchType === "remote"
+        ? window.confirm(`删除远程分支 ${branchItem.name}？这会推送删除到远程仓库。`)
+        : window.confirm(`删除本地分支 ${branchItem.name}？`);
+    if (!confirmed) return;
+    const previousFilter = history.branchFilter;
+    if (history.branchFilter === refName) history.branchFilter = "";
+    closeLogRefContextMenu();
+    try {
+      if (branchItem.branchType === "remote") {
+        await branches.deleteRemote(branchItem.name);
+      } else {
+        await branches.delete(branchItem.name, false);
+      }
+      await loadCurrentRepository();
+    } catch (error) {
+      history.branchFilter = previousFilter;
+      throw error;
+    }
+    return;
+  }
+  if (!tag || !window.confirm(`删除本地标签 ${tag.name}？`)) return;
+  const previousFilter = history.branchFilter;
+  if (history.branchFilter === refName) history.branchFilter = "";
+  closeLogRefContextMenu();
+  try {
+    await branches.deleteTag(tag.name);
+    await loadCurrentRepository();
+  } catch (error) {
+    history.branchFilter = previousFilter;
+    throw error;
+  }
+}
+
+async function mergeLogRefIntoCurrent(menu: LogRefContextMenu | null) {
+  const target = logRefContextBranchItem(menu)?.name ?? "";
+  if (!target || !canMergeOrRebaseLogRefContext(menu)) return;
+  if (!window.confirm(`将 ${target} 合并到当前分支？`)) return;
+  closeLogRefContextMenu();
+  operations.mergeTarget = target;
+  await operations.merge();
+  await reloadAfterGitOperation();
+}
+
+async function rebaseCurrentOntoLogRef(menu: LogRefContextMenu | null) {
+  const target = logRefContextBranchItem(menu)?.name ?? "";
+  if (!target || !canMergeOrRebaseLogRefContext(menu)) return;
+  if (!window.confirm(`将当前分支变基到 ${target}？`)) return;
+  closeLogRefContextMenu();
+  operations.rebaseTarget = target;
+  await operations.rebase();
+  await reloadAfterGitOperation();
+}
+
+async function setCurrentBranchUpstreamFromContext(menu: LogRefContextMenu | null) {
+  const target = logRefContextBranchItem(menu)?.name ?? "";
+  const current = branch.value?.currentBranch;
+  if (!target || !current || menu?.kind !== "remote") return;
+  if (!window.confirm(`将 ${current} 的上游设置为 ${target}？`)) return;
+  closeLogRefContextMenu();
+  await branches.setUpstream(current, target);
+  await loadCurrentRepository();
+}
+
+function toggleLogRefFavoriteFromContext(menu: LogRefContextMenu | null) {
+  const key = logRefContextFavoriteKey(menu);
+  if (!key) return;
+  branches.toggleFavorite(key);
+  closeLogRefContextMenu();
+}
+
+async function copyLogRefNameFromContext(menu: LogRefContextMenu | null) {
+  const refName = logRefContextRefName(menu);
+  if (!refName) return;
+  await writeClipboardText(refName);
+  branches.notice = `已复制 ${refName}`;
+  closeLogRefContextMenu();
+}
+
+async function pushLogTagFromContext(menu: LogRefContextMenu | null) {
+  const tag = logRefContextTagItem(menu);
+  if (!tag) return;
+  closeLogRefContextMenu();
+  await pushSelectedTag(tag);
+}
+
+async function deleteRemoteLogTagFromContext(menu: LogRefContextMenu | null) {
+  const tag = logRefContextTagItem(menu);
+  if (!tag) return;
+  closeLogRefContextMenu();
+  await deleteSelectedRemoteTag(tag);
+}
+
+function validateBranchName(value: string, existingLocalName = "") {
+  const name = value.trim();
+  if (!name) return "请输入分支名称";
+  if (
+    name.startsWith("-") ||
+    name.endsWith("/") ||
+    name.endsWith(".") ||
+    name.includes("..") ||
+    name.includes("@{") ||
+    /[\s~^:?*\[\\\]]/.test(name)
+  ) {
+    return "分支名包含 Git 不支持的字符";
+  }
+  if (branches.localBranches.some((item) => item.name !== existingLocalName && item.name === name)) {
+    return "本地分支已存在";
+  }
+  if (branches.remoteBranches.some((item) => item.name === name || item.name.endsWith(`/${name}`))) {
+    return "远程分支已存在";
+  }
+  return "";
+}
+
+async function createLogBranchFromHead() {
+  logRefPanelCollapsed.value = false;
+  const name = await promptProjectName("新建分支", "", validateBranchName);
+  if (!name) return;
+  await branches.create(name, true);
+  await loadCurrentRepository();
+  history.branchFilter = name;
+  await history.refresh().catch(() => undefined);
+}
+
+async function deleteActiveLogBranch() {
+  const selected = activeLogBranchRef.value;
+  if (!selected) return;
+  if (selected.branchType === "remote") {
+    await deleteRemoteBranchItem(selected);
+  } else {
+    await deleteLocalBranch(selected);
+  }
+  clearLogRef();
+}
+
+function toggleActiveLogBranchFavorite() {
+  const selected = activeLogBranchRef.value;
+  if (!selected) return;
+  branches.toggleFavorite(selected.fullName);
 }
 
 function graphLaneX(index: number) {
@@ -2788,16 +3736,6 @@ async function pushSelectedCommit() {
   await advanced.pushSelectedCommit(oid, remote.selectedRemote || undefined, remote.targetBranch || undefined);
 }
 
-async function loadSelectedFileHistory() {
-  await advanced.loadFileHistory(changes.selectedFile);
-  workbenchMode.value = "advanced";
-}
-
-async function loadSelectedFileBlame() {
-  await advanced.loadBlame(changes.selectedFile);
-  workbenchMode.value = "advanced";
-}
-
 function toggleCommitFile(path: string) {
   if (selectedCommitFilePaths.value.includes(path)) {
     selectedCommitFilePaths.value = selectedCommitFilePaths.value.filter((item) => item !== path);
@@ -2996,23 +3934,6 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
   await saveConflictResult(false);
 }
 
-function createChangelist() {
-  changelists.createList();
-}
-
-function moveSelectedToChangelist() {
-  changelists.movePaths(changes.activePaths);
-}
-
-function setActiveChangelist(id: string) {
-  changelists.setActive(id);
-  pickFirstAvailable(settings.selectedSide);
-}
-
-function deleteChangelist(id: string) {
-  changelists.deleteList(id);
-  pickFirstAvailable(settings.selectedSide);
-}
 </script>
 
 <template>
@@ -3023,9 +3944,17 @@ function deleteChangelist(id: string) {
       :current-branch="branchNameLabel(branch?.currentBranch)"
       :ahead="branch?.ahead ?? 0"
       :behind="branch?.behind ?? 0"
-      @add-repository="chooseRepository"
-      @refresh="refreshAll"
     />
+
+    <Transition name="notice-toast">
+      <div v-if="noticeToast" class="notice-toast" role="status" aria-live="polite" @click.stop>
+        <Check :size="15" />
+        <span>{{ noticeToast.message }}</span>
+        <button type="button" title="关闭通知" @click="dismissNoticeToast(noticeToast.id)">
+          <X :size="13" />
+        </button>
+      </div>
+    </Transition>
 
     <section
       class="workspace"
@@ -3479,47 +4408,6 @@ function deleteChangelist(id: string) {
           </button>
         </div>
 
-        <section class="changelist-panel">
-          <div class="changelist-tabs">
-            <button
-              v-for="list in changelists.lists"
-              :key="list.id"
-              :class="{ active: changelists.selectedListId === list.id }"
-              :title="list.description || list.name"
-              @click="setActiveChangelist(list.id)"
-            >
-              <span>{{ list.name }}</span>
-              <small>{{ list.id === 'default' ? changes.files.filter((file) => changelists.listForPath(file.path).id === list.id).length : list.paths.length }}</small>
-            </button>
-          </div>
-          <form class="changelist-create" @submit.prevent="createChangelist">
-            <input v-model="changelists.newName" placeholder="新变更列表" />
-            <input v-model="changelists.newDescription" placeholder="描述，可空" />
-            <button class="icon-only-button" title="创建变更列表" :disabled="!changelists.newName.trim()">
-              <Plus :size="13" />
-            </button>
-          </form>
-          <div class="changelist-actions">
-            <select v-model="changelists.selectedListId" class="remote-select">
-              <option v-for="list in changelists.lists" :key="`move-${list.id}`" :value="list.id">
-                {{ list.name }}
-              </option>
-            </select>
-            <button class="icon-button" :disabled="changes.activePaths.length === 0" @click="moveSelectedToChangelist">
-              <ListChecks :size="14" />
-              <span>移动</span>
-            </button>
-            <button
-              class="icon-button danger"
-              :disabled="changelists.selectedListId === 'default'"
-              @click="deleteChangelist(changelists.selectedListId)"
-            >
-              <Trash2 :size="14" />
-              <span>删除</span>
-            </button>
-          </div>
-        </section>
-
         <section v-if="conflictedFiles.length" class="conflict-panel">
           <div class="conflict-header">
             <strong>冲突 {{ conflictedFiles.length }}</strong>
@@ -3600,47 +4488,80 @@ function deleteChangelist(id: string) {
             <Trash2 :size="15" />
             <span>回滚</span>
           </button>
-          <button
-            class="icon-button"
-            title="查看文件历史"
-            :disabled="!changes.selectedFile"
-            @click="loadSelectedFileHistory"
-          >
-            <GitCommitVertical :size="15" />
-            <span>历史</span>
-          </button>
-          <button
-            class="icon-button"
-            title="查看文件追溯"
-            :disabled="!changes.selectedFile"
-            @click="loadSelectedFileBlame"
-          >
-            <ListChecks :size="15" />
-            <span>追溯</span>
-          </button>
+          <label class="toggle-row file-actions-toggle">
+            <input
+              :checked="settings.includeIgnored"
+              type="checkbox"
+              @change="setIncludeIgnored"
+            />
+            <span>显示忽略文件</span>
+          </label>
         </div>
 
-        <div class="file-list">
-          <button
-            v-for="file in activeFiles"
-            :key="`${settings.selectedSide}-${file.path}`"
-            class="file-row"
-            :class="{ active: changes.selectedFile === file.path }"
-            @click="selectFile(file, settings.selectedSide)"
-          >
-            <input
-              type="checkbox"
-              :checked="changes.selectedPaths.includes(file.path)"
-              @click.stop
-              @change="changes.togglePath(file.path)"
-            />
-            <span class="status-dot" :class="file.kind.split('|')[0]" />
-            <span class="file-main">
-              <strong>{{ file.path }}</strong>
-              <small v-if="file.oldPath">{{ file.oldPath }}</small>
-            </span>
-            <span class="kind-badge">{{ formatStatusKind(file.kind) }}</span>
-          </button>
+        <div class="file-list source-control-tree" @contextmenu.prevent="openChangeListContextMenu(null, $event)">
+          <div v-if="changeFileGroups.length === 0" class="file-list-empty">没有文件变更</div>
+          <template v-else>
+            <section
+              v-for="group in changeFileGroups"
+              :key="group.key"
+              class="change-file-group"
+              @contextmenu.prevent.stop="openChangeListContextMenu(group.changelistId, $event)"
+            >
+              <div
+                class="change-file-group-header"
+                @contextmenu.prevent.stop="openChangeListContextMenu(group.changelistId, $event)"
+              >
+                <button class="change-group-toggle" type="button" @click="toggleChangeFileGroup(group.key)">
+                  <ChevronDown v-if="isChangeFileGroupExpanded(group.key)" :size="14" />
+                  <ChevronRight v-else :size="14" />
+                </button>
+                <input
+                  class="change-group-checkbox"
+                  type="checkbox"
+                  :checked="isChangeFileGroupSelected(group.files)"
+                  :disabled="group.files.length === 0"
+                  :indeterminate.prop="isChangeFileGroupPartiallySelected(group.files)"
+                  @change="toggleChangeFileGroupSelection(group.files)"
+                />
+                <button class="change-group-title" type="button" @click="toggleChangeFileGroup(group.key)">
+                  <span>{{ group.label }}</span>
+                  <small>{{ group.files.length }} 个文件</small>
+                </button>
+              </div>
+              <div v-if="isChangeFileGroupExpanded(group.key)" class="change-file-group-list">
+                <div v-if="group.files.length === 0" class="change-file-group-empty">没有文件</div>
+                <button
+                  v-for="file in group.files"
+                  :key="`${group.side}-${file.path}`"
+                  class="file-row"
+                  :class="{
+                    active: changes.selectedFile === file.path,
+                    selected: changes.selectedPaths.includes(file.path),
+                    [`status-${file.kind.split('|')[0]}`]: true,
+                  }"
+                  :title="`${file.path} · ${formatStatusKind(file.kind)}`"
+                  @click="selectFile(file, group.side)"
+                  @contextmenu.prevent.stop="openChangeFileContextMenu(file, group.side, $event)"
+                >
+                  <input
+                    type="checkbox"
+                    :checked="changes.selectedPaths.includes(file.path)"
+                    @click.stop
+                    @change="changes.togglePath(file.path)"
+                  />
+                  <span class="status-dot" :class="file.kind.split('|')[0]" />
+                  <span class="change-file-icon" :class="changeFileIconClass(file.path)">
+                    <span v-if="fileTypeLabel(file.path)">{{ fileTypeLabel(file.path) }}</span>
+                    <FileIcon v-else :size="13" />
+                  </span>
+                  <span class="file-main">
+                    <strong>{{ fileBaseName(file.path) }}</strong>
+                    <small>{{ fileContextPath(file.path) }}</small>
+                  </span>
+                </button>
+              </div>
+            </section>
+          </template>
         </div>
 
         <div class="shelve-box">
@@ -3697,123 +4618,253 @@ function deleteChangelist(id: string) {
         </form>
       </section>
 
-      <section v-else-if="settings.panelVisibility.changes && workbenchMode === 'log'" class="history-pane log-ref-pane">
-        <div class="history-header">
-          <div class="section-title">
-            <GitBranch :size="16" />
-            <span>引用</span>
+      <section
+        v-else-if="settings.panelVisibility.changes && workbenchMode === 'log'"
+        class="history-pane log-ref-pane"
+        :class="{ collapsed: logRefPanelCollapsed }"
+      >
+        <nav class="log-ref-toolbar" aria-label="日志引用工具栏">
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            :title="logRefPanelCollapsed ? '展开分支栏' : '收起分支栏'"
+            @click="toggleLogRefPanelCollapsed"
+          >
+            <ArrowRight v-if="logRefPanelCollapsed" :size="16" />
+            <ArrowLeft v-else :size="16" />
+          </button>
+          <span class="log-ref-tool-separator" />
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="搜索分支或标签"
+            @click="focusLogRefSearch"
+          >
+            <Search :size="15" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="刷新引用和日志"
+            :disabled="history.loading || branches.loading"
+            @click="refreshAll"
+          >
+            <RefreshCw :size="15" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="获取远程引用"
+            :disabled="remote.loading || !remote.selectedRemote"
+            @click="runRemoteAction('fetch')"
+          >
+            <Download :size="15" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="拉取代码"
+            :disabled="remote.loading || !remote.selectedRemote"
+            @click="runRemoteAction('pull')"
+          >
+            <ArrowDown :size="15" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="推送代码"
+            :disabled="remote.loading || !remote.selectedRemote"
+            @click="runRemoteAction('push')"
+          >
+            <ArrowUp :size="15" />
+          </button>
+          <span class="log-ref-tool-separator" />
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="从当前 HEAD 创建并切换分支"
+            :disabled="branches.loading"
+            @click="createLogBranchFromHead"
+          >
+            <Plus :size="16" />
+          </button>
+          <button
+            class="log-ref-tool-button danger"
+            type="button"
+            title="删除当前选中的分支"
+            :disabled="branches.loading || !activeLogBranchRef || activeLogBranchRef.current"
+            @click="deleteActiveLogBranch"
+          >
+            <Trash2 :size="15" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            :class="{ active: activeLogBranchFavorite || logFavoriteRefsOnly }"
+            type="button"
+            :title="activeLogBranchRef ? (activeLogBranchFavorite ? '取消收藏当前分支' : '收藏当前分支') : '仅显示收藏引用'"
+            @click="activeLogBranchRef ? toggleActiveLogBranchFavorite() : toggleLogFavoriteRefsOnly()"
+          >
+            <Star :size="15" :fill="activeLogBranchFavorite || logFavoriteRefsOnly ? 'currentColor' : 'none'" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            :title="logRefGroupsFullyExpanded ? '折叠引用分组' : '展开引用分组'"
+            @click="toggleAllLogRefGroups"
+          >
+            <ChevronDown v-if="logRefGroupsFullyExpanded" :size="16" />
+            <ChevronRight v-else :size="16" />
+          </button>
+          <button
+            class="log-ref-tool-button"
+            type="button"
+            title="清除引用筛选"
+            :disabled="!history.branchFilter && !logRefSearch"
+            @click="clearLogRefContext"
+          >
+            <X :size="15" />
+          </button>
+        </nav>
+
+        <div v-if="!logRefPanelCollapsed" class="log-ref-content">
+          <div class="log-ref-search-bar">
+            <label class="log-ref-search-field">
+              <Search :size="14" />
+              <input
+                ref="logRefSearchInput"
+                v-model="logRefSearch"
+                type="search"
+                placeholder="Branch or tag"
+                aria-label="筛选分支或标签"
+              />
+            </label>
           </div>
-          <button class="icon-only-button" title="刷新引用和日志" :disabled="history.loading || branches.loading" @click="refreshAll">
-            <RefreshCw :size="14" />
-          </button>
-        </div>
 
-        <div class="log-ref-list">
-          <button class="log-ref-row head" :class="{ active: !history.branchFilter }" @click="clearLogRef">
-            <GitCommitVertical :size="15" />
-            <span>
-              <strong>{{ logHeadLabel }}</strong>
-              <small>{{ shortHash(branch?.head) }}</small>
-            </span>
+          <div class="log-ref-list">
+          <button
+            v-if="showLogHeadRef"
+            class="log-ref-head-row"
+            :class="{ active: !history.branchFilter }"
+            type="button"
+            title="显示全部引用"
+            @click="clearLogRef"
+          >
+            {{ logHeadLabel }}
           </button>
 
-          <button class="log-ref-toggle" type="button" @click="toggleLogRefGroup('local')">
-            <ChevronDown v-if="isLogRefGroupExpanded('local')" :size="13" />
+          <button
+            v-if="visibleLogLocalBranches.length"
+            class="log-ref-toggle"
+            type="button"
+            @click="toggleLogRefGroup('local')"
+          >
+            <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded('local')" :size="13" />
             <ChevronRight v-else :size="13" />
             <span>本地</span>
-            <small>{{ branches.sortedLocalBranches.length }}</small>
           </button>
-          <div v-if="isLogRefGroupExpanded('local')" class="log-ref-children">
+          <div v-if="visibleLogLocalBranches.length && (logRefFiltering || isLogRefGroupExpanded('local'))" class="log-ref-children">
             <button
-              v-for="branchItem in branches.sortedLocalBranches"
+              v-for="branchItem in visibleLogLocalBranches"
               :key="`log-local-${branchItem.fullName}`"
               class="log-ref-row local"
-              :class="{ active: isLogRefActive(branchItem.name), current: branchItem.current }"
+              :class="{
+                active: isLogRefActive(branchItem.name),
+                current: branchItem.current,
+                favorite: branches.isFavorite(branchItem.fullName),
+                'context-target': isLogBranchContextTarget(branchItem),
+              }"
               :title="branchItem.fullName"
+              type="button"
               @click="selectLogRef(branchItem.name)"
+              @contextmenu.prevent.stop="openLogBranchContextMenu(branchItem, $event)"
             >
-              <GitBranch :size="13" />
+              <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+              <GitBranch v-else :size="13" />
               <span>
                 <strong>{{ branchItem.name }}</strong>
-                <small v-if="branchItem.upstream">
-                  {{ formatRefName(branchItem.upstream) }} · +{{ branchItem.ahead }} / -{{ branchItem.behind }}
-                </small>
-                <small v-else>{{ branchItem.current ? "当前分支" : "未设置上游" }}</small>
               </span>
-              <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
             </button>
           </div>
 
           <button
-            v-if="logRemoteGroups.length"
+            v-if="visibleLogRemoteGroups.length"
             class="log-ref-toggle"
             type="button"
             @click="toggleLogRefGroup('remote')"
           >
-            <ChevronDown v-if="isLogRefGroupExpanded('remote')" :size="13" />
+            <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded('remote')" :size="13" />
             <ChevronRight v-else :size="13" />
             <span>远端</span>
-            <small>{{ logRemoteGroups.length }}</small>
           </button>
-          <div v-if="logRemoteGroups.length && isLogRefGroupExpanded('remote')" class="log-ref-children">
-            <section v-for="group in logRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
+          <div v-if="visibleLogRemoteGroups.length && (logRefFiltering || isLogRefGroupExpanded('remote'))" class="log-ref-children">
+            <section v-for="group in visibleLogRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
               <button
                 class="log-ref-toggle remote-root"
                 type="button"
                 @click="toggleLogRefGroup(logRemoteGroupKey(group.name))"
               >
-                <ChevronDown v-if="isLogRefGroupExpanded(logRemoteGroupKey(group.name))" :size="13" />
+                <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded(logRemoteGroupKey(group.name))" :size="13" />
                 <ChevronRight v-else :size="13" />
                 <Folder :size="13" />
                 <span>{{ group.name }}</span>
-                <small>{{ group.branches.length }}</small>
               </button>
-              <div v-if="isLogRefGroupExpanded(logRemoteGroupKey(group.name))" class="log-ref-children remote-branch-list">
+              <div
+                v-if="logRefFiltering || isLogRefGroupExpanded(logRemoteGroupKey(group.name))"
+                class="log-ref-children remote-branch-list"
+              >
                 <button
                   v-for="branchItem in group.branches"
                   :key="`log-remote-${branchItem.fullName}`"
                   class="log-ref-row remote"
-                  :class="{ active: isLogRefActive(branchItem.name) }"
+                  :class="{
+                    active: isLogRefActive(branchItem.name),
+                    favorite: branches.isFavorite(branchItem.fullName),
+                    'context-target': isLogBranchContextTarget(branchItem),
+                  }"
                   :title="branchItem.fullName"
+                  type="button"
                   @click="selectLogRef(branchItem.name)"
+                  @contextmenu.prevent.stop="openLogBranchContextMenu(branchItem, $event)"
                 >
-                  <GitBranch :size="13" />
+                  <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
+                  <GitBranch v-else :size="13" />
                   <span>
                     <strong>{{ shortRemoteBranchName(branchItem.name, group.name) }}</strong>
-                    <small>{{ shortHash(branchItem.target) }}</small>
                   </span>
-                  <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
                 </button>
               </div>
             </section>
           </div>
 
           <button
-            v-if="branches.list?.tags.length"
+            v-if="visibleLogTags.length"
             class="log-ref-toggle"
             type="button"
             @click="toggleLogRefGroup('tags')"
           >
-            <ChevronDown v-if="isLogRefGroupExpanded('tags')" :size="13" />
+            <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded('tags')" :size="13" />
             <ChevronRight v-else :size="13" />
             <span>标签</span>
-            <small>{{ branches.list?.tags.length ?? 0 }}</small>
           </button>
-          <div v-if="branches.list?.tags.length && isLogRefGroupExpanded('tags')" class="log-ref-children">
+          <div v-if="visibleLogTags.length && (logRefFiltering || isLogRefGroupExpanded('tags'))" class="log-ref-children">
             <button
-              v-for="tag in branches.list?.tags ?? []"
+              v-for="tag in visibleLogTags"
               :key="`log-tag-${tag.name}`"
               class="log-ref-row tag-ref"
-              :class="{ active: isLogRefActive(tag.name) }"
+              :class="{ active: isLogRefActive(tag.name), 'context-target': isLogTagContextTarget(tag) }"
               :title="tag.name"
+              type="button"
               @click="selectLogRef(tag.name)"
+              @contextmenu.prevent.stop="openLogTagContextMenu(tag, $event)"
             >
               <span class="tag-dot" />
               <span>
                 <strong>{{ tag.name }}</strong>
-                <small>{{ shortHash(tag.target) }}</small>
               </span>
             </button>
+          </div>
+
+            <div v-if="!hasVisibleLogRefs" class="log-ref-empty">没有匹配的引用</div>
           </div>
         </div>
       </section>
@@ -3919,7 +4970,6 @@ function deleteChangelist(id: string) {
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="merge-editor-toolbar">
           <span :class="{ warning: resultHasConflictMarkers }">
@@ -4096,47 +5146,117 @@ function deleteChangelist(id: string) {
 
         <template v-else-if="workbenchMode === 'changes'">
         <div class="diff-header">
-          <div>
-            <span class="eyebrow">差异</span>
-            <h2>{{ selectedDiffTitle }}</h2>
+          <div class="diff-title-block">
+            <span class="eyebrow">文件差异</span>
+            <h2 :title="selectedDiffFileTitle">{{ selectedDiffFileTitle }}</h2>
+            <small>
+              文件 {{ activeChangeDiffFilePosition }} · 差异 {{ currentChangeDiffHunkPosition }}/{{ activeChangeDiffHunkCount }}
+            </small>
           </div>
-          <label class="toggle-row">
-            <input
-              :checked="settings.includeIgnored"
-              type="checkbox"
-              @change="setIncludeIgnored"
-            />
-            <span>显示忽略文件</span>
-          </label>
+          <div class="diff-header-actions">
+            <div class="diff-nav-group" aria-label="差异跳转">
+              <button
+                class="icon-only-button diff-nav-button"
+                title="上一个差异"
+                :disabled="activeChangeDiffHunkCount === 0"
+                @click="jumpChangeDiffHunk(-1)"
+              >
+                <ArrowUp :size="15" />
+              </button>
+              <button
+                class="icon-only-button diff-nav-button"
+                title="下一个差异"
+                :disabled="activeChangeDiffHunkCount === 0"
+                @click="jumpChangeDiffHunk(1)"
+              >
+                <ArrowDown :size="15" />
+              </button>
+            </div>
+            <div class="diff-nav-group" aria-label="差异文件切换">
+              <button
+                class="icon-only-button diff-nav-button"
+                title="上一个文件"
+                :disabled="!canSelectPreviousChangeDiffFile"
+                @click="selectAdjacentChangeDiffFile(-1)"
+              >
+                <ArrowLeft :size="15" />
+              </button>
+              <button
+                class="icon-only-button diff-nav-button"
+                title="下一个文件"
+                :disabled="!canSelectNextChangeDiffFile"
+                @click="selectAdjacentChangeDiffFile(1)"
+              >
+                <ArrowRight :size="15" />
+              </button>
+            </div>
+          </div>
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
-        <div v-if="diff.current?.hunks.length" class="hunk-strip">
-          <button
-            v-for="hunk in diff.current.hunks"
-            :key="hunk.index"
-            class="hunk-button"
-            @click="diff.applyHunk(hunk.index)"
-          >
-            <Check v-if="changes.selectedSide === 'unstaged'" :size="14" />
-            <Minus v-else :size="14" />
-            <span>{{ changes.selectedSide === "unstaged" ? "暂存此块" : "取消此块" }}</span>
-            <small>{{ hunk.header }}</small>
-          </button>
-        </div>
-
-        <div class="diff-scroller">
+        <div ref="changeDiffScroller" class="diff-scroller side-by-side-scroller">
           <div v-if="diff.loading" class="diff-empty">加载中</div>
-          <div v-else-if="!diff.current || !diff.current.text" class="diff-empty">没有差异</div>
-          <pre v-else class="diff-lines"><code
-            v-for="line in diff.lines"
-            :key="line.index"
-            class="diff-line"
-            :class="line.type"
-          ><span class="line-number">{{ line.index + 1 }}</span><span class="line-content">{{ line.content || " " }}</span>
-</code></pre>
+          <div v-else-if="!activeChangeDiffHasContent" class="diff-empty">没有差异</div>
+          <div v-else-if="activeChangeSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
+          <div v-else class="side-by-side-diff">
+            <div class="side-by-side-file-header">
+              <div class="side-by-side-title">
+                <strong>{{ changeDiffLeftLabel }}</strong>
+                <span>{{ changeDiffLeftDetail }}</span>
+              </div>
+              <div class="side-by-side-title">
+                <strong>{{ changeDiffRightLabel }}</strong>
+                <span>{{ changeDiffRightDetail }}</span>
+              </div>
+            </div>
+            <div class="side-by-side-editors">
+              <div class="side-by-side-column old" @scroll="syncSideBySideEditorScroll">
+                <div class="side-by-side-column-lines">
+                  <div
+                    v-for="row in activeChangeSideBySideDiffRows"
+                    :key="`change-old-${row.id}`"
+                    class="side-by-side-line"
+                    :class="[
+                      row.type,
+                      { active: row.hunkIndex !== null && row.hunkIndex === activeChangeDiffHunkIndex },
+                    ]"
+                    :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
+                  >
+                    <div class="diff-cell old" :class="row.old.type">
+                      <span class="line-number">{{ row.old.lineNumber ?? "" }}</span>
+                      <span class="line-content"><template
+                        v-for="(token, tokenIndex) in row.old.tokens"
+                        :key="tokenIndex"
+                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="side-by-side-column new" @scroll="syncSideBySideEditorScroll">
+                <div class="side-by-side-column-lines">
+                  <div
+                    v-for="row in activeChangeSideBySideDiffRows"
+                    :key="`change-new-${row.id}`"
+                    class="side-by-side-line"
+                    :class="[
+                      row.type,
+                      { active: row.hunkIndex !== null && row.hunkIndex === activeChangeDiffHunkIndex },
+                    ]"
+                    :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
+                  >
+                    <div class="diff-cell new" :class="row.new.type">
+                      <span class="line-number">{{ row.new.lineNumber ?? "" }}</span>
+                      <span class="line-content"><template
+                        v-for="(token, tokenIndex) in row.new.tokens"
+                        :key="tokenIndex"
+                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
         </div>
         </template>
 
@@ -4159,7 +5279,6 @@ function deleteChangelist(id: string) {
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="advanced-workbench">
           <section class="advanced-card">
@@ -4377,7 +5496,7 @@ function deleteChangelist(id: string) {
               title="日志"
               @click="selectLogRootTab"
             >
-              <GitBranch :size="14" />
+              <VcsIcon :size="14" />
               <span>日志</span>
             </button>
             <div
@@ -4471,7 +5590,6 @@ function deleteChangelist(id: string) {
             </div>
 
             <div v-if="activeError" class="message error">{{ activeError }}</div>
-            <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
             <div class="log-table-head">
               <span />
@@ -4676,7 +5794,7 @@ function deleteChangelist(id: string) {
                   </button>
                 </div>
                 <button class="tool-button" @click="selectLogRootTab">
-                  <GitBranch :size="14" />
+                  <VcsIcon :size="14" />
                   <span>返回日志</span>
                 </button>
                 <button
@@ -4770,7 +5888,6 @@ function deleteChangelist(id: string) {
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -4839,7 +5956,6 @@ function deleteChangelist(id: string) {
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -4898,7 +6014,6 @@ function deleteChangelist(id: string) {
         </div>
 
         <div v-if="activeError" class="message error">{{ activeError }}</div>
-        <div v-else-if="activeNotice" class="message notice">{{ activeNotice }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -5081,6 +6196,76 @@ function deleteChangelist(id: string) {
     </div>
 
     <div
+      v-if="changeFileContextMenu"
+      class="context-menu change-file-menu"
+      :style="{ left: `${changeFileContextMenu.x}px`, top: `${changeFileContextMenu.y}px` }"
+      @click.stop
+    >
+      <button @click="discardChangeFilesFromContext(changeFileContextMenu.file)">
+        <span>回滚变更</span>
+        <small>{{ changeContextLabel(changeFileContextMenu.file) }}</small>
+      </button>
+      <button
+        v-for="list in changelistMoveTargets(changeFileContextMenu.file)"
+        :key="`move-change-${list.id}`"
+        @click="moveChangeFilesToChangelistFromContext(changeFileContextMenu.file, list.id)"
+      >
+        <span>移至另一个变更清单</span>
+        <small>{{ list.name }}</small>
+      </button>
+      <button v-if="changelistMoveTargets(changeFileContextMenu.file).length === 0" disabled>
+        <span>移至另一个变更清单</span>
+        <small>无其他清单</small>
+      </button>
+      <button @click="showChangeFileDiffFromContext(changeFileContextMenu.file, changeFileContextMenu.side)">
+        <span>显示差异</span>
+        <small>{{ changeFileContextMenu.side === "staged" ? "暂存区" : "工作区" }}</small>
+      </button>
+      <button
+        :disabled="deletableChangeContextPaths(changeFileContextMenu.file).length === 0"
+        @click="deleteChangeFilesFromContext(changeFileContextMenu.file)"
+      >
+        <span>删除</span>
+        <small>从工作区</small>
+      </button>
+      <div class="context-menu-separator" />
+      <button @click="createChangelistFromChangeContext(changeFileContextMenu.file)">
+        <span>新建变更清单</span>
+      </button>
+      <button @click="editChangelistFromChangeContext(changeFileContextMenu.file)">
+        <span>编辑变更清单</span>
+        <small>{{ changelistForChangeContext(changeFileContextMenu.file).name }}</small>
+      </button>
+      <div class="context-menu-separator" />
+      <button @click="showChangeFileHistoryFromContext(changeFileContextMenu.file)">
+        <span>查看提交记录</span>
+      </button>
+    </div>
+
+    <div
+      v-if="changeListContextMenu"
+      class="context-menu change-list-menu"
+      :style="{ left: `${changeListContextMenu.x}px`, top: `${changeListContextMenu.y}px` }"
+      @click.stop
+    >
+      <button @click="createChangelistFromListContext">
+        <span>新建变更清单</span>
+      </button>
+      <button @click="editChangelistFromListContext(changeListContextMenu.listId)">
+        <span>编辑变更清单</span>
+        <small>{{ changelistById(changeListContextMenu.listId).name }}</small>
+      </button>
+      <div class="context-menu-separator" />
+      <button
+        :disabled="!canDeleteChangelist(changeListContextMenu.listId)"
+        @click="deleteChangelistFromListContext(changeListContextMenu.listId)"
+      >
+        <span>删除变更清单</span>
+        <small>{{ canDeleteChangelist(changeListContextMenu.listId) ? changelistById(changeListContextMenu.listId).name : "默认清单不可删除" }}</small>
+      </button>
+    </div>
+
+    <div
       v-if="projectFileContextMenu"
       class="context-menu project-file-menu"
       :style="{ left: `${projectFileContextMenu.x}px`, top: `${projectFileContextMenu.y}px` }"
@@ -5120,6 +6305,95 @@ function deleteChangelist(id: string) {
       <div v-if="projectFileContextMenu.file && !projectFileContextMenu.file.directory" class="context-menu-separator" />
       <button v-if="projectFileContextMenu.file && !projectFileContextMenu.file.directory" @click="openProjectEntryLog(projectFileContextMenu.file)">
         <span>查看变更日志</span>
+      </button>
+    </div>
+
+    <div
+      v-if="logRefContextMenu"
+      class="context-menu log-ref-menu"
+      :style="{ left: `${logRefContextMenu.x}px`, top: `${logRefContextMenu.y}px` }"
+      @click.stop
+    >
+      <button @click="showLogRefFromContext(logRefContextMenu)">
+        <span>查看此引用日志</span>
+        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+      <button :disabled="!canCheckoutLogRefContext(logRefContextMenu)" @click="checkoutLogRefFromContext(logRefContextMenu)">
+        <span>{{ logRefContextMenu.kind === "tag" ? "检出标签" : logRefContextMenu.kind === "remote" ? "检出远程分支" : "切换到此分支" }}</span>
+        <small>{{ canCheckoutLogRefContext(logRefContextMenu) ? logRefContextRefName(logRefContextMenu) : "当前分支" }}</small>
+      </button>
+      <button @click="createBranchFromLogRefContext(logRefContextMenu)">
+        <span>从此处新建分支</span>
+        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+
+      <div class="context-menu-separator" />
+      <button
+        v-if="logRefContextMenu.kind !== 'tag'"
+        :disabled="!canMergeOrRebaseLogRefContext(logRefContextMenu)"
+        @click="mergeLogRefIntoCurrent(logRefContextMenu)"
+      >
+        <span>合并到当前分支</span>
+        <small>{{ logRefContextMenu.kind === "local" && logRefContextMenu.branch.current ? "当前分支" : logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+      <button
+        v-if="logRefContextMenu.kind !== 'tag'"
+        :disabled="!canMergeOrRebaseLogRefContext(logRefContextMenu)"
+        @click="rebaseCurrentOntoLogRef(logRefContextMenu)"
+      >
+        <span>变基当前分支到此处</span>
+        <small>{{ logRefContextMenu.kind === "local" && logRefContextMenu.branch.current ? "当前分支" : logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+      <button
+        v-if="logRefContextMenu.kind === 'remote'"
+        :disabled="!canSetLogRefContextUpstream(logRefContextMenu)"
+        @click="setCurrentBranchUpstreamFromContext(logRefContextMenu)"
+      >
+        <span>设为当前分支上游</span>
+        <small>{{ branchNameLabel(branch?.currentBranch) }}</small>
+      </button>
+
+      <div class="context-menu-separator" />
+      <button @click="toggleLogRefFavoriteFromContext(logRefContextMenu)">
+        <span>{{ isLogRefContextFavorite(logRefContextMenu) ? "取消收藏" : "收藏" }}</span>
+        <small>{{ formatRefName(logRefContextFullName(logRefContextMenu)) }}</small>
+      </button>
+      <button @click="copyLogRefNameFromContext(logRefContextMenu)">
+        <span>复制引用名称</span>
+        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+
+      <div class="context-menu-separator" />
+      <button
+        v-if="canRenameLogRefContext(logRefContextMenu)"
+        @click="renameLogBranchFromContext(logRefContextMenu)"
+      >
+        <span>重命名分支</span>
+        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
+      </button>
+      <button
+        v-if="logRefContextMenu.kind === 'tag'"
+        :disabled="branches.loading || !remote.selectedRemote"
+        @click="pushLogTagFromContext(logRefContextMenu)"
+      >
+        <span>推送标签</span>
+        <small>{{ remote.selectedRemote || "origin" }}</small>
+      </button>
+      <button
+        v-if="logRefContextMenu.kind === 'tag'"
+        :disabled="branches.loading || !remote.selectedRemote"
+        @click="deleteRemoteLogTagFromContext(logRefContextMenu)"
+      >
+        <span>删除远程标签</span>
+        <small>{{ remote.selectedRemote || "origin" }}</small>
+      </button>
+      <button
+        class="danger-menu-item"
+        :disabled="!canDeleteLogRefContext(logRefContextMenu)"
+        @click="deleteLogRefFromContext(logRefContextMenu)"
+      >
+        <span>{{ logRefContextMenu.kind === "tag" ? "删除本地标签" : logRefContextMenu.kind === "remote" ? "删除远程分支" : "删除本地分支" }}</span>
+        <small>{{ canDeleteLogRefContext(logRefContextMenu) ? logRefContextRefName(logRefContextMenu) : "当前分支不可删除" }}</small>
       </button>
     </div>
 
@@ -5226,6 +6500,63 @@ button:disabled {
   height: 100vh;
   min-width: 0;
   background: #eef1ed;
+}
+
+.notice-toast {
+  position: fixed;
+  top: 72px;
+  right: 18px;
+  z-index: 120;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 8px;
+  min-width: 260px;
+  max-width: min(520px, calc(100vw - 36px));
+  min-height: 40px;
+  padding: 8px 8px 8px 12px;
+  border: 1px solid #8fc19a;
+  border-radius: 8px;
+  color: #1f6537;
+  background: #ecf8ef;
+  box-shadow: 0 18px 46px rgba(34, 48, 42, 0.2);
+}
+
+.notice-toast span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.notice-toast button {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 5px;
+  color: inherit;
+  background: transparent;
+}
+
+.notice-toast button:hover {
+  background: rgba(31, 101, 55, 0.12);
+}
+
+.notice-toast-enter-active,
+.notice-toast-leave-active {
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+
+.notice-toast-enter-from,
+.notice-toast-leave-to {
+  opacity: 0;
+  transform: translateY(-8px);
 }
 
 .topbar {
@@ -5440,6 +6771,10 @@ button:disabled {
 .context-menu button:hover:not(:disabled) {
   color: #ffffff;
   background: #3f6ea5;
+}
+
+.context-menu button.danger-menu-item:not(:hover):not(:disabled) span {
+  color: #b83e31;
 }
 
 .context-menu button:disabled {
@@ -6899,38 +8234,134 @@ button:disabled {
 }
 
 .log-ref-pane {
-  grid-template-rows: 46px minmax(0, 1fr);
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.log-ref-pane.collapsed {
+  grid-template-columns: 40px;
+}
+
+.log-ref-toolbar {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 4px;
+  border-right: 1px solid #dce2dd;
+  background: #f4f6f4;
+}
+
+.log-ref-tool-button {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #526158;
+  background: transparent;
+}
+
+.log-ref-tool-button:hover:not(:disabled),
+.log-ref-tool-button.active {
+  border-color: #c5cec8;
+  background: #ffffff;
+}
+
+.log-ref-tool-button.active {
+  color: #d0a044;
+}
+
+.log-ref-tool-button.danger:hover:not(:disabled) {
+  color: #b83e31;
+}
+
+.log-ref-tool-button:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.log-ref-tool-separator {
+  width: 18px;
+  height: 1px;
+  margin: 2px 0;
+  background: #d4ddd7;
+}
+
+.log-ref-content {
+  display: grid;
+  grid-template-rows: 40px minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+}
+
+.log-ref-search-bar {
+  display: flex;
+  align-items: center;
+  padding: 5px 8px;
+}
+
+.log-ref-search-field {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid #c5cec8;
+  border-radius: 4px;
+  color: #68766f;
+  background: #ffffff;
+}
+
+.log-ref-search-field input {
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: 0;
+  color: #26312c;
+  background: transparent;
+  font-size: 12px;
+}
+
+.log-ref-search-field input::placeholder {
+  color: #87918b;
 }
 
 .log-ref-list {
   display: grid;
   align-content: start;
-  gap: 2px;
+  gap: 1px;
   min-height: 0;
   overflow: auto;
-  padding: 8px;
+  padding: 6px 8px 8px;
 }
 
 .log-ref-toggle {
   display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   width: 100%;
-  min-height: 26px;
-  padding: 0 8px;
+  min-height: 24px;
+  padding: 0 6px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 4px;
   color: #627168;
   background: transparent;
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 13px;
+  font-weight: 600;
   text-align: left;
 }
 
 .log-ref-toggle.remote-root {
-  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
-  padding-left: 20px;
+  grid-template-columns: 16px 16px minmax(0, 1fr);
+  padding-left: 22px;
 }
 
 .log-ref-toggle:hover {
@@ -6944,30 +8375,25 @@ button:disabled {
   white-space: nowrap;
 }
 
-.log-ref-toggle small {
-  color: #7a867d;
-  font-size: 11px;
-  font-weight: 700;
-}
-
 .log-ref-children,
-.log-ref-row {
+.log-ref-row,
+.log-ref-head-row {
   display: grid;
 }
 
 .log-ref-children {
-  gap: 1px;
+  gap: 0;
 }
 
 .log-ref-row {
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   width: 100%;
-  min-height: 28px;
-  padding: 4px 8px;
-  border: 1px solid transparent;
-  border-radius: 7px;
+  min-height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
   color: #25312b;
   background: transparent;
   text-align: left;
@@ -6975,70 +8401,79 @@ button:disabled {
 
 .log-ref-row.local,
 .log-ref-row.tag-ref {
-  padding-left: 26px;
+  padding-left: 28px;
 }
 
 .log-ref-row.remote {
-  padding-left: 44px;
+  padding-left: 50px;
 }
 
 .log-ref-row:hover,
 .log-ref-row.active {
-  background: #e8f0fb;
+  background: #e7eaed;
+}
+
+.log-ref-row.context-target:not(.active) {
+  background: #e8eef5;
 }
 
 .log-ref-row.active {
-  border-color: #9db8dc;
-}
-
-.log-ref-row.current .branch-dot {
-  background: #d0a044;
+  color: #17202a;
 }
 
 .log-ref-row.current:not(.active) {
   background: #f0f2f4;
 }
 
-.log-ref-row.current > svg {
+.log-ref-row.current > svg,
+.log-ref-row.favorite > svg {
   color: #d0a044;
 }
 
 .log-ref-row span {
-  display: grid;
-  gap: 1px;
+  display: block;
   min-width: 0;
 }
 
-.log-ref-row strong,
-.log-ref-row small {
+.log-ref-row strong {
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .log-ref-row strong {
-  font-size: 12px;
-}
-
-.log-ref-row small,
-.log-ref-group-title small {
-  color: #6b766f;
-  font-size: 11px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
 .log-ref-group {
   display: grid;
-  gap: 2px;
+  gap: 0;
 }
 
-.log-ref-group-title {
-  display: grid;
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+.log-ref-head-row {
   align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  padding: 0 8px;
+  min-height: 24px;
+  padding: 0 6px 0 24px;
+  border: 0;
+  border-radius: 4px;
   color: #627168;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.log-ref-head-row:hover,
+.log-ref-head-row.active {
+  background: #eef1f4;
+}
+
+.log-ref-empty {
+  padding: 8px 6px;
+  color: #7a867d;
   font-size: 12px;
 }
 
@@ -7924,22 +9359,113 @@ button:disabled {
   padding: 0 8px;
 }
 
+.file-actions-toggle {
+  grid-column: 1 / -1;
+  min-height: 24px;
+  padding: 0 3px;
+}
+
 .file-list {
   flex: 1 1 180px;
   min-height: 0;
   overflow: auto;
+  padding: 4px 0 8px;
+  background: #fbfcfa;
+}
+
+.file-list-empty {
+  padding: 12px 10px;
+  color: #68766f;
+  font-size: 12px;
+}
+
+.change-file-group {
+  display: grid;
+  align-content: start;
+}
+
+.change-file-group-header {
+  display: grid;
+  grid-template-columns: 15px 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 26px;
+  padding: 0 10px 0 6px;
+  border: 0;
+  color: #26312c;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.change-file-group-header:hover {
+  background: #edf1ec;
+}
+
+.change-group-toggle,
+.change-group-title {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 26px;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+}
+
+.change-group-toggle {
+  justify-content: center;
+}
+
+.change-group-title {
+  gap: 5px;
+  text-align: left;
+}
+
+.change-group-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.change-file-group-header small {
+  color: #6b766f;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.change-group-checkbox,
+.file-row input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #3677d8;
+}
+
+.change-file-group-list {
+  display: grid;
+}
+
+.change-file-group-empty {
+  min-height: 24px;
+  padding: 5px 10px 5px 54px;
+  color: #87928b;
+  font-size: 12px;
 }
 
 .file-row {
   display: grid;
-  grid-template-columns: 20px 12px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 10px 18px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   width: 100%;
-  min-height: 44px;
-  padding: 6px 10px;
+  min-height: 24px;
+  padding: 0 10px 0 12px;
   border: 0;
-  border-bottom: 1px solid #eef1ed;
   text-align: left;
   color: #25312b;
   background: transparent;
@@ -7947,17 +9473,16 @@ button:disabled {
 
 .file-row:hover,
 .file-row.active {
-  background: #e8f0fb;
+  background: #dfeafd;
 }
 
-.file-row input {
-  width: 14px;
-  height: 14px;
+.file-row.selected:not(.active) {
+  background: #f0f5ff;
 }
 
 .status-dot {
-  width: 9px;
-  height: 9px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: #88948d;
 }
@@ -7982,24 +9507,67 @@ button:disabled {
   background: #8b3fa8;
 }
 
+.change-file-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: #68766f;
+}
+
+.change-file-icon.labeled span {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.change-file-icon.ext-js,
+.change-file-icon.ext-jsx {
+  color: #a06f16;
+}
+
+.change-file-icon.ext-ts,
+.change-file-icon.ext-tsx {
+  color: #2f70b6;
+}
+
+.change-file-icon.ext-json,
+.change-file-icon.ext-wxml,
+.change-file-icon.ext-html,
+.change-file-icon.ext-vue {
+  color: #5f6d65;
+}
+
+.change-file-icon.ext-css,
+.change-file-icon.ext-wxss {
+  color: #426db6;
+}
+
 .file-main {
-  display: grid;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
   min-width: 0;
 }
 
 .file-main strong,
 .file-main small {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .file-main strong {
+  flex: 0 1 auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
+  font-weight: 700;
 }
 
 .file-main small {
+  flex: 1 1 auto;
   color: #738077;
   font-size: 11px;
 }
@@ -8615,12 +10183,37 @@ button:disabled {
 }
 
 .side-by-side-editors {
+  position: relative;
+  isolation: isolate;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   min-height: 0;
 }
 
+.side-by-side-editors::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  z-index: 3;
+  width: 5px;
+  pointer-events: none;
+  background: linear-gradient(
+    90deg,
+    #ffffff 0,
+    #ffffff 2px,
+    #dce2dd 2px,
+    #dce2dd 3px,
+    #ffffff 3px,
+    #ffffff 100%
+  );
+  transform: translateX(-3px);
+}
+
 .side-by-side-column {
+  position: relative;
+  z-index: 1;
   min-width: 0;
   min-height: 0;
   overflow: auto;
@@ -9162,6 +10755,17 @@ html[data-theme="dark"] .app-shell {
   background: #1e1f22;
 }
 
+html[data-theme="dark"] .notice-toast {
+  border-color: #3d8b57;
+  color: #b7f0c6;
+  background: #163822;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.42);
+}
+
+html[data-theme="dark"] .notice-toast button:hover {
+  background: rgba(183, 240, 198, 0.12);
+}
+
 html[data-theme="dark"] .topbar {
   border-bottom-color: #3c3f41;
   background: #2b2d30;
@@ -9283,6 +10887,10 @@ html[data-theme="dark"] .context-menu button {
 html[data-theme="dark"] .context-menu button:hover:not(:disabled) {
   color: #ffffff;
   background: #3f6ea5;
+}
+
+html[data-theme="dark"] .context-menu button.danger-menu-item:not(:hover):not(:disabled) span {
+  color: #ff7b72;
 }
 
 html[data-theme="dark"] .context-menu button:disabled {
@@ -10003,7 +11611,53 @@ html[data-theme="dark"] .log-filter-chip.active {
   background: #28354b;
 }
 
+html[data-theme="dark"] .log-ref-pane {
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-ref-toolbar {
+  border-right-color: #3c3f41;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-ref-tool-button {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .log-ref-tool-button:hover:not(:disabled),
+html[data-theme="dark"] .log-ref-tool-button.active {
+  border-color: #4e5258;
+  background: #313335;
+}
+
+html[data-theme="dark"] .log-ref-tool-button.active {
+  color: #ffc66d;
+}
+
+html[data-theme="dark"] .log-ref-tool-button.danger:hover:not(:disabled) {
+  color: #ff7b72;
+}
+
+html[data-theme="dark"] .log-ref-tool-separator {
+  background: #3c3f41;
+}
+
+html[data-theme="dark"] .log-ref-search-field {
+  border-color: #3c3f41;
+  color: #a9b7c6;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .log-ref-search-field input {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .log-ref-search-field input::placeholder {
+  color: #787f87;
+}
+
 html[data-theme="dark"] .log-ref-row,
+html[data-theme="dark"] .log-ref-head-row,
 html[data-theme="dark"] .log-ref-toggle,
 html[data-theme="dark"] .log-file-tree-row,
 html[data-theme="dark"] .log-file-picker-row,
@@ -10018,6 +11672,8 @@ html[data-theme="dark"] .log-ref-toggle:hover {
 
 html[data-theme="dark"] .log-ref-row:hover,
 html[data-theme="dark"] .log-ref-row.active,
+html[data-theme="dark"] .log-ref-head-row:hover,
+html[data-theme="dark"] .log-ref-head-row.active,
 html[data-theme="dark"] .log-commit-row:hover,
 html[data-theme="dark"] .log-file-tree-row:hover,
 html[data-theme="dark"] .log-file-tree-row.selected,
@@ -10037,6 +11693,18 @@ html[data-theme="dark"] .log-ref-row.current:not(.active) {
   background: #33363a;
 }
 
+html[data-theme="dark"] .log-ref-row:hover,
+html[data-theme="dark"] .log-ref-row.active,
+html[data-theme="dark"] .log-ref-head-row:hover,
+html[data-theme="dark"] .log-ref-head-row.active {
+  color: #f0f2f5;
+  background: #3c3f41;
+}
+
+html[data-theme="dark"] .log-ref-row.context-target:not(.active) {
+  background: #343d4a;
+}
+
 html[data-theme="dark"] .log-commit-row.active {
   background: #3a3f47;
 }
@@ -10052,6 +11720,7 @@ html[data-theme="dark"] .log-filter-popover-head {
 html[data-theme="dark"] .log-author,
 html[data-theme="dark"] .log-date,
 html[data-theme="dark"] .log-ref-row small,
+html[data-theme="dark"] .log-ref-empty,
 html[data-theme="dark"] .log-ref-toggle,
 html[data-theme="dark"] .log-ref-toggle small,
 html[data-theme="dark"] .log-ref-group-title,
@@ -10130,21 +11799,48 @@ html[data-theme="dark"] .commit-file-row {
   background: #2b2d30;
 }
 
+html[data-theme="dark"] .file-list {
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .file-list-empty {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .change-file-group-header {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .change-file-group-header:hover {
+  background: #313335;
+}
+
+html[data-theme="dark"] .change-file-group-header small {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .change-file-group-empty {
+  color: #8f949b;
+}
+
 html[data-theme="dark"] .file-row {
-  border-bottom-color: #313335;
-  border-left: 3px solid transparent;
   color: #c9d1d9;
 }
 
 html[data-theme="dark"] .file-row:hover {
-  background: #313335;
+  background: #2c313a;
+}
+
+html[data-theme="dark"] .file-row.selected:not(.active) {
+  background: #263247;
 }
 
 html[data-theme="dark"] .file-row.active {
-  border-left-color: #4c82d9;
-  background: #3a3f47;
+  color: #ffffff;
+  background: #2f477a;
 }
 
+html[data-theme="dark"] .change-group-checkbox,
 html[data-theme="dark"] .file-row input {
   accent-color: #4c82d9;
 }
@@ -10171,6 +11867,29 @@ html[data-theme="dark"] .status-dot.renamed {
 
 html[data-theme="dark"] .status-dot.conflicted {
   background: #cc7832;
+}
+
+html[data-theme="dark"] .change-file-icon {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .change-file-icon.ext-js,
+html[data-theme="dark"] .change-file-icon.ext-jsx {
+  color: #ffc66d;
+}
+
+html[data-theme="dark"] .change-file-icon.ext-ts,
+html[data-theme="dark"] .change-file-icon.ext-tsx,
+html[data-theme="dark"] .change-file-icon.ext-css,
+html[data-theme="dark"] .change-file-icon.ext-wxss {
+  color: #78a8ff;
+}
+
+html[data-theme="dark"] .change-file-icon.ext-json,
+html[data-theme="dark"] .change-file-icon.ext-wxml,
+html[data-theme="dark"] .change-file-icon.ext-html,
+html[data-theme="dark"] .change-file-icon.ext-vue {
+  color: #a9b7c6;
 }
 
 html[data-theme="dark"] .kind-badge {
@@ -10276,6 +11995,18 @@ html[data-theme="dark"] .side-by-side-column {
 
 html[data-theme="dark"] .side-by-side-column.old {
   border-right-color: #323438;
+}
+
+html[data-theme="dark"] .side-by-side-editors::after {
+  background: linear-gradient(
+    90deg,
+    #1e1f22 0,
+    #1e1f22 2px,
+    #323438 2px,
+    #323438 3px,
+    #1e1f22 3px,
+    #1e1f22 100%
+  );
 }
 
 html[data-theme="dark"] .diff-cell {

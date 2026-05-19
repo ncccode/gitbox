@@ -849,11 +849,23 @@ pub fn get_diff_core(
         true
     })?;
 
+    let (old_text, new_text) = match normalized_path.as_deref() {
+        Some(pathspec) if staged => (
+            read_treeish_file_text(&repo, "HEAD", pathspec)?,
+            read_index_file_text(&repo, pathspec)?,
+        ),
+        Some(pathspec) => (
+            read_index_file_text(&repo, pathspec)?,
+            read_workdir_file_text(&repo, pathspec)?,
+        ),
+        None => (None, None),
+    };
+
     Ok(DiffResponse {
         path: normalized_path,
         staged,
-        old_text: None,
-        new_text: None,
+        old_text,
+        new_text,
         hunks: parse_diff_hunks(&text),
         text,
     })
@@ -4311,6 +4323,15 @@ fn read_treeish_file_text(
     let Some(blob) = object.as_blob() else {
         return Ok(None);
     };
+    Ok(bytes_to_preview_text(blob.content()))
+}
+
+fn read_index_file_text(repo: &Repository, pathspec: &str) -> Result<Option<String>, GitboxError> {
+    let index = repo.index()?;
+    let Some(entry) = index.get_path(Path::new(pathspec), 0) else {
+        return Ok(None);
+    };
+    let blob = repo.find_blob(entry.id)?;
     Ok(bytes_to_preview_text(blob.content()))
 }
 

@@ -1,16 +1,12 @@
 <script setup lang="ts">
 import {
-  Columns3,
-  FolderOpen,
   GitBranch,
   Monitor,
   Moon,
-  RefreshCw,
-  RotateCcw,
   Sun,
 } from "@lucide/vue";
 import { useSettingsStore } from "../stores/settings";
-import type { LayoutPanelKey, ThemeMode } from "../stores/settings";
+import type { ThemeMode } from "../stores/settings";
 
 defineProps<{
   brandSubtitle: string;
@@ -20,26 +16,12 @@ defineProps<{
   behind: number;
 }>();
 
-const emit = defineEmits<{
-  addRepository: [];
-  refresh: [];
-}>();
-
 const settings = useSettingsStore();
 const themeModes: Array<{ key: ThemeMode; label: string; title: string }> = [
   { key: "dark", label: "暗黑", title: "使用暗黑主题" },
   { key: "light", label: "浅色", title: "使用浅色主题" },
   { key: "system", label: "系统", title: "跟随系统外观" },
 ];
-const layoutPanels: Array<{ key: LayoutPanelKey; label: string }> = [
-  { key: "project", label: "项目栏" },
-  { key: "repo", label: "仓库上下文" },
-  { key: "changes", label: "工作区上下文" },
-];
-
-function setPanelVisibility(panel: LayoutPanelKey, event: Event) {
-  settings.setPanelVisible(panel, (event.target as HTMLInputElement).checked);
-}
 </script>
 
 <template>
@@ -58,34 +40,6 @@ function setPanelVisibility(panel: LayoutPanelKey, event: Event) {
     </div>
 
     <div class="toolbar">
-      <button class="tool-button primary" title="添加项目" @click="emit('addRepository')">
-        <FolderOpen :size="16" />
-        <span>添加</span>
-      </button>
-      <button class="tool-button" title="刷新状态" :disabled="!hasRepository" @click="emit('refresh')">
-        <RefreshCw :size="16" />
-        <span>刷新</span>
-      </button>
-      <details class="layout-menu">
-        <summary class="tool-button layout-summary" title="栏位设置">
-          <Columns3 :size="16" />
-          <span>栏位</span>
-        </summary>
-        <div class="layout-popover">
-          <label v-for="panel in layoutPanels" :key="panel.key" class="layout-option">
-            <input
-              type="checkbox"
-              :checked="settings.panelVisibility[panel.key]"
-              @change="setPanelVisibility(panel.key, $event)"
-            />
-            <span>{{ panel.label }}</span>
-          </label>
-          <button class="layout-reset" type="button" @click="settings.resetLayout">
-            <RotateCcw :size="14" />
-            <span>重置栏位</span>
-          </button>
-        </div>
-      </details>
       <div class="theme-switch" role="group" aria-label="主题">
         <button
           v-for="mode in themeModes"
