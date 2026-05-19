@@ -42,8 +42,8 @@ export const useProjectStore = defineStore("project", {
       const content = state.contents[path]?.content;
       return content !== undefined && state.drafts[path] !== undefined && state.drafts[path] !== content;
     },
-    contentLoading: (state) => state.loadingContentPath === state.selectedPath,
-    contentSaving: (state) => state.savingContentPath === state.selectedPath,
+    contentLoading: (state) => Boolean(state.selectedPath && state.loadingContentPath === state.selectedPath),
+    contentSaving: (state) => Boolean(state.selectedPath && state.savingContentPath === state.selectedPath),
     isExpanded: (state) => (path: string) => state.expandedPaths.includes(path),
   },
   actions: {

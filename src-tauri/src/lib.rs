@@ -5,7 +5,7 @@ use gitbox::{
     checkout_remote_branch_core, checkout_revision_core, cherry_pick_commit_core,
     cherry_pick_files_core, cleanup_merged_branches_core, clear_stashes_core,
     clone_repository_core, commit_details_core, commit_file_diff_core, commit_message_history_core,
-    commit_with_full_options_and_worktree_core, compare_refs_core, conflict_details_core,
+    commit_with_full_options_and_selection_core, compare_refs_core, conflict_details_core,
     copy_project_entry_core, create_branch_core, create_patch_core, create_project_directory_core,
     create_project_file_core, create_tag_core, create_worktree_core, delete_branch_core,
     delete_project_entry_core, delete_remote_branch_core, delete_remote_core,
@@ -15,18 +15,19 @@ use gitbox::{
     list_project_files_core, list_shelves_core, list_stashes_core, list_submodules_core,
     list_worktrees_core, mark_conflict_resolved_core, mark_shelf_applied, merge_branch_core,
     move_project_entry_core, open_repo_core, operation_control_core, operation_state_core,
-    pull_core, push_commit_core, push_tag_core, push_with_options_core, read_project_file_core,
-    rebase_advanced_core, rebase_branch_core, record_recent_repo, record_shelf,
-    remove_worktree_core, rename_branch_core, rename_project_entry_core, repo_status_core,
-    reset_to_commit_core, resolve_conflict_block_core, resolve_conflict_file_core,
-    revert_commit_core, revert_commit_files_core, save_conflict_result_core,
-    save_project_file_core, set_branch_upstream_core, shelve_changes_core, stage_hunks_core,
-    stage_paths_core, stash_action_core, undo_last_commit_core, unshallow_repository_core,
-    unshelve_core, unstage_paths_core, update_remote_core, update_submodules_core, BlameLine,
-    BranchList, BranchSummary, CommandResult, CommitDetails, CommitResult, CommitSummary,
-    ConflictDetails, DiffResponse, FileHistoryEntry, GitOperationState, ProjectFileContent,
-    ProjectFileEntry, ProjectFileMutation, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo,
-    StashInfo, SubmoduleInfo, WorktreeInfo,
+    pull_core, pull_preflight_core, push_commit_core, push_tag_core, push_with_options_core,
+    read_project_file_core, rebase_advanced_core, rebase_branch_core, record_recent_repo,
+    record_shelf, remove_worktree_core, rename_branch_core, rename_project_entry_core,
+    repo_status_core, reset_to_commit_core, resolve_conflict_block_core,
+    resolve_conflict_file_core, revert_commit_core, revert_commit_files_core,
+    save_conflict_result_core, save_project_file_core, set_branch_upstream_core,
+    shelve_changes_core, stage_hunks_core, stage_paths_core, stash_action_core,
+    undo_last_commit_core, unshallow_repository_core, unshelve_core, unstage_paths_core,
+    update_remote_core, update_submodules_core, BlameLine, BranchList, BranchSummary,
+    CommandResult, CommitDetails, CommitResult, CommitSummary, ConflictDetails, DiffResponse,
+    FileHistoryEntry, GitOperationState, ProjectFileContent, ProjectFileEntry, ProjectFileMutation,
+    PullPreflight, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo, StashInfo, SubmoduleInfo,
+    WorktreeInfo,
 };
 use tauri::AppHandle;
 
@@ -238,8 +239,9 @@ fn commit(
     gpg_sign: Option<bool>,
     author: Option<String>,
     include_worktree: Option<bool>,
+    selected_paths: Option<Vec<String>>,
 ) -> CommandResponse<CommitResult> {
-    commit_with_full_options_and_worktree_core(
+    commit_with_full_options_and_selection_core(
         &path,
         message,
         amend.unwrap_or(false),
@@ -247,6 +249,7 @@ fn commit(
         gpg_sign.unwrap_or(false),
         author,
         include_worktree.unwrap_or(false),
+        selected_paths,
     )
     .map_err(|err| err.command())
 }
@@ -261,8 +264,17 @@ fn fetch(
 }
 
 #[tauri::command]
-fn pull(path: String, remote_name: Option<String>) -> CommandResponse<CommandResult> {
-    pull_core(&path, remote_name).map_err(|err| err.command())
+fn pull_preflight(path: String, remote_name: Option<String>) -> CommandResponse<PullPreflight> {
+    pull_preflight_core(&path, remote_name).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn pull(
+    path: String,
+    remote_name: Option<String>,
+    smart_merge: Option<bool>,
+) -> CommandResponse<CommandResult> {
+    pull_core(&path, remote_name, smart_merge.unwrap_or(false)).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -765,6 +777,7 @@ pub fn run() {
             list_shelves,
             commit,
             fetch,
+            pull_preflight,
             pull,
             push,
             add_remote,

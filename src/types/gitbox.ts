@@ -78,6 +78,21 @@ export interface CommandResult {
   output: string;
 }
 
+export interface PullPreflight {
+  remote: string;
+  target: string;
+  currentBranch?: string | null;
+  head?: string | null;
+  targetOid?: string | null;
+  upToDate: boolean;
+  fastForward: boolean;
+  diverged: boolean;
+  localChangedPaths: string[];
+  remoteChangedPaths: string[];
+  overlappingPaths: string[];
+  needsConfirmation: boolean;
+}
+
 export interface CommitResult {
   oid: string;
   summary: BranchSummary;
@@ -222,6 +237,9 @@ export interface ConflictDetails {
   ours?: string | null;
   theirs?: string | null;
   current?: string | null;
+  currentSide?: "ours" | "theirs" | null;
+  incomingSide?: "ours" | "theirs" | null;
+  conflictSource?: string | null;
   blocks: ConflictBlock[];
 }
 

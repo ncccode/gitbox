@@ -40,6 +40,10 @@ export const useChangesStore = defineStore("changes", {
       if (state.selectedPaths.length > 0) return state.selectedPaths;
       return state.selectedFile ? [state.selectedFile] : [];
     },
+    selectedCommitPaths: (state) => {
+      const changedPaths = new Set((state.status?.files ?? []).map((file) => file.path));
+      return state.selectedPaths.filter((path, index, paths) => changedPaths.has(path) && paths.indexOf(path) === index);
+    },
   },
   actions: {
     async refresh(options: RefreshOptions = {}) {
@@ -53,6 +57,8 @@ export const useChangesStore = defineStore("changes", {
       try {
         this.status = await repoStatus(repos.path, settings.includeIgnored);
         repos.setCurrent(this.status.repo);
+        const changedPaths = new Set(this.status.files.map((file) => file.path));
+        this.selectedPaths = this.selectedPaths.filter((path) => changedPaths.has(path));
         if (this.selectedFile && !this.status.files.some((file) => file.path === this.selectedFile)) {
           this.selectedFile = null;
           this.selectedPaths = [];

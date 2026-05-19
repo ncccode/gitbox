@@ -2,7 +2,7 @@ use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusO
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -125,6 +125,23 @@ pub struct CommandResult {
     pub ok: bool,
     pub message: String,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullPreflight {
+    pub remote: String,
+    pub target: String,
+    pub current_branch: Option<String>,
+    pub head: Option<String>,
+    pub target_oid: Option<String>,
+    pub up_to_date: bool,
+    pub fast_forward: bool,
+    pub diverged: bool,
+    pub local_changed_paths: Vec<String>,
+    pub remote_changed_paths: Vec<String>,
+    pub overlapping_paths: Vec<String>,
+    pub needs_confirmation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -313,6 +330,9 @@ pub struct ConflictDetails {
     pub ours: Option<String>,
     pub theirs: Option<String>,
     pub current: Option<String>,
+    pub current_side: String,
+    pub incoming_side: String,
+    pub conflict_source: Option<String>,
     pub blocks: Vec<ConflictBlock>,
 }
 
@@ -374,10 +394,74 @@ impl GitProcessOutput {
         let combined = self.combined_output();
         if combined.trim().is_empty() {
             "git 命令执行失败".to_string()
+        } else if let Some(message) = translate_git_failure_message(&combined) {
+            message
         } else {
             combined
         }
     }
+}
+
+fn translate_git_failure_message(message: &str) -> Option<String> {
+    let lower = message.to_ascii_lowercase();
+    if !lower.contains("untracked working tree files would be overwritten") {
+        return None;
+    }
+
+    let action = if lower.contains("would be overwritten by merge") {
+        "拉取或合并"
+    } else if lower.contains("would be overwritten by checkout") {
+        "切换分支"
+    } else {
+        "Git 操作"
+    };
+    let files = extract_overwritten_untracked_files(message);
+    let mut translated = format!(
+        "本地未跟踪文件会被本次{action}覆盖，Git 已中止以保护这些文件。请先移动、删除、暂存或提交这些文件后再重试。"
+    );
+
+    if !files.is_empty() {
+        translated.push_str("\n\n受影响文件：");
+        for file in files {
+            translated.push_str("\n- ");
+            translated.push_str(&file);
+        }
+    }
+
+    Some(translated)
+}
+
+fn extract_overwritten_untracked_files(message: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut capturing = false;
+
+    for raw_line in message.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line
+            .to_ascii_lowercase()
+            .contains("untracked working tree files would be overwritten")
+        {
+            capturing = true;
+            continue;
+        }
+        if !capturing {
+            continue;
+        }
+        if line.starts_with("Please ")
+            || line.starts_with("Aborting")
+            || line.starts_with("Created autostash")
+            || line.starts_with("Applied autostash")
+        {
+            break;
+        }
+
+        files.push(line.to_string());
+    }
+
+    sorted_unique(files)
 }
 
 pub fn open_repo_core(path: &str) -> Result<RepositoryInfo, GitboxError> {
@@ -832,6 +916,9 @@ pub fn get_diff_core(
         }
         _ => None,
     };
+    if !staged && normalized_path.is_some() {
+        opts.show_untracked_content(true);
+    }
 
     let diff = if staged {
         let head_tree = repo.head().ok().and_then(|head| head.peel_to_tree().ok());
@@ -1156,11 +1243,60 @@ pub fn commit_with_full_options_and_worktree_core(
     author: Option<String>,
     include_worktree: bool,
 ) -> Result<CommitResult, GitboxError> {
+    commit_with_full_options_and_selection_core(
+        path,
+        message,
+        amend,
+        sign_off,
+        gpg_sign,
+        author,
+        include_worktree,
+        None,
+    )
+}
+
+pub fn commit_with_full_options_and_selection_core(
+    path: &str,
+    message: String,
+    amend: bool,
+    sign_off: bool,
+    gpg_sign: bool,
+    author: Option<String>,
+    include_worktree: bool,
+    selected_paths: Option<Vec<String>>,
+) -> Result<CommitResult, GitboxError> {
     if message.trim().is_empty() {
         return Err(GitboxError::Message("提交信息不能为空".to_string()));
     }
 
     let repo = Repository::discover(path)?;
+    if repo.path().join("MERGE_HEAD").exists() {
+        return commit_merge_with_git(
+            path,
+            &repo,
+            message,
+            amend,
+            sign_off,
+            gpg_sign,
+            author,
+            include_worktree,
+            selected_paths,
+        );
+    }
+
+    if let Some(selected_paths) = selected_paths {
+        return commit_selected_paths_with_git(
+            path,
+            &repo,
+            message,
+            amend,
+            sign_off,
+            gpg_sign,
+            author,
+            selected_paths,
+        );
+    }
+
     if include_worktree {
         stage_worktree_changes_for_commit(&repo)?;
     }
@@ -1252,6 +1388,106 @@ fn stage_worktree_changes_for_commit(repo: &Repository) -> Result<(), GitboxErro
     Ok(())
 }
 
+fn commit_merge_with_git(
+    path: &str,
+    repo: &Repository,
+    message: String,
+    amend: bool,
+    sign_off: bool,
+    gpg_sign: bool,
+    author: Option<String>,
+    include_worktree: bool,
+    selected_paths: Option<Vec<String>>,
+) -> Result<CommitResult, GitboxError> {
+    if amend {
+        return Err(GitboxError::Message(
+            "合并进行中不能使用“修正上次提交”，请完成或终止当前合并".to_string(),
+        ));
+    }
+
+    let workdir = repo_workdir(repo)?;
+    if let Some(selected_paths) = selected_paths {
+        let selected_paths = clean_selected_paths(repo, selected_paths)?;
+        if !selected_paths.is_empty() {
+            run_git(
+                &workdir,
+                git_args_with_paths(&["add", "-A"], &selected_paths),
+                None,
+            )?;
+        }
+    } else if include_worktree {
+        stage_worktree_changes_for_commit(repo)?;
+    }
+
+    let mut args = vec!["commit".to_string()];
+    if sign_off {
+        args.push("--signoff".to_string());
+    }
+    if gpg_sign {
+        args.push("-S".to_string());
+    }
+    if let Some(author) = clean_optional_arg(author) {
+        args.push("--author".to_string());
+        args.push(author);
+    }
+    args.push("-m".to_string());
+    args.push(message.trim().to_string());
+
+    run_git(&workdir, args, None)?;
+    Ok(CommitResult {
+        oid: repo_head_oid(path)?,
+        summary: branch_summary_core(path, false)?,
+    })
+}
+
+fn commit_selected_paths_with_git(
+    path: &str,
+    repo: &Repository,
+    message: String,
+    amend: bool,
+    sign_off: bool,
+    gpg_sign: bool,
+    author: Option<String>,
+    selected_paths: Vec<String>,
+) -> Result<CommitResult, GitboxError> {
+    let selected_paths = clean_selected_paths(repo, selected_paths)?;
+    if selected_paths.is_empty() {
+        return Err(GitboxError::Message("请选择要提交的文件".to_string()));
+    }
+
+    let workdir = repo_workdir(repo)?;
+    run_git(
+        &workdir,
+        git_args_with_paths(&["add", "-A"], &selected_paths),
+        None,
+    )?;
+
+    let mut args = vec!["commit".to_string(), "--only".to_string()];
+    if amend {
+        args.push("--amend".to_string());
+    }
+    if sign_off {
+        args.push("--signoff".to_string());
+    }
+    if gpg_sign {
+        args.push("-S".to_string());
+    }
+    if let Some(author) = clean_optional_arg(author) {
+        args.push("--author".to_string());
+        args.push(author);
+    }
+    args.push("-m".to_string());
+    args.push(message.trim().to_string());
+    args.push("--".to_string());
+    args.extend(selected_paths);
+
+    run_git(&workdir, args, None)?;
+    Ok(CommitResult {
+        oid: repo_head_oid(path)?,
+        summary: branch_summary_core(path, false)?,
+    })
+}
+
 pub fn fetch_core(
     path: &str,
     remote_name: Option<String>,
@@ -1278,19 +1514,106 @@ pub fn fetch_core(
     })
 }
 
-pub fn pull_core(path: &str, remote_name: Option<String>) -> Result<CommandResult, GitboxError> {
+pub fn pull_preflight_core(
+    path: &str,
+    remote_name: Option<String>,
+) -> Result<PullPreflight, GitboxError> {
     let repo = Repository::discover(path)?;
     let workdir = repo_workdir(&repo)?;
-    let mut args = vec!["pull".to_string(), "--ff-only".to_string()];
-    if let Some(remote) = remote_name.filter(|value| !value.trim().is_empty()) {
-        args.push(remote);
+    let (remote, target) = current_pull_remote_and_target(&repo, remote_name)?;
+    run_git(&workdir, vec!["fetch".to_string(), remote.clone()], None)?;
+
+    let repo = Repository::discover(path)?;
+    build_pull_preflight(&repo, remote, target)
+}
+
+pub fn pull_core(
+    path: &str,
+    remote_name: Option<String>,
+    smart_merge: bool,
+) -> Result<CommandResult, GitboxError> {
+    let repo = Repository::discover(path)?;
+    let workdir = repo_workdir(&repo)?;
+    let (remote, target) = current_pull_remote_and_target(&repo, remote_name)?;
+    let fetch_output = run_git(&workdir, vec!["fetch".to_string(), remote.clone()], None)?;
+
+    let repo = Repository::discover(path)?;
+    let preflight = build_pull_preflight(&repo, remote, target)?;
+    let head_oid = preflight
+        .head
+        .as_deref()
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 无法拉取".to_string()))
+        .and_then(|oid| Oid::from_str(oid).map_err(GitboxError::Git))?;
+    let target_oid = preflight
+        .target_oid
+        .as_deref()
+        .ok_or_else(|| GitboxError::Message(format!("找不到远程分支 {}", preflight.target)))
+        .and_then(|oid| Oid::from_str(oid).map_err(GitboxError::Git))?;
+
+    if preflight.needs_confirmation && !smart_merge {
+        return Err(GitboxError::Message(format!(
+            "本地未提交修改与 {} 的更新重叠，请确认后使用智能合并",
+            preflight.target
+        )));
     }
-    let output = run_git(&workdir, args, None)?;
-    Ok(CommandResult {
-        ok: true,
-        message: "已完成快进拉取".to_string(),
-        output,
-    })
+
+    if head_oid == target_oid {
+        return Ok(CommandResult {
+            ok: true,
+            message: format!("当前分支已是 {} 最新状态", preflight.target),
+            output: fetch_output,
+        });
+    }
+
+    let merge_base = repo.merge_base(head_oid, target_oid)?;
+    let use_autostash = smart_merge && !preflight.overlapping_paths.is_empty();
+    if merge_base == head_oid {
+        let mut args = vec!["merge".to_string(), "--ff-only".to_string()];
+        if use_autostash {
+            args.push("--autostash".to_string());
+        }
+        args.push(preflight.target.clone());
+        let mut result = run_git_operation(
+            path,
+            args,
+            format!("已快进拉取 {}", preflight.target),
+            format!(
+                "已拉取 {}，智能合并本地修改时产生冲突，请在三栏合并窗口解决",
+                preflight.target
+            ),
+        )?;
+        result.output = join_git_outputs(fetch_output, result.output);
+        return Ok(CommandResult {
+            ok: result.ok,
+            message: result.message,
+            output: result.output,
+        });
+    }
+
+    if merge_base == target_oid {
+        return Ok(CommandResult {
+            ok: true,
+            message: format!("当前分支已包含 {} 的更新", preflight.target),
+            output: fetch_output,
+        });
+    }
+
+    let mut args = vec!["merge".to_string(), "--no-edit".to_string()];
+    if use_autostash {
+        args.push("--autostash".to_string());
+    }
+    args.push(preflight.target.clone());
+    let mut result = run_git_operation(
+        path,
+        args,
+        format!("已拉取并合并 {}", preflight.target),
+        format!(
+            "拉取 {} 时需要合并，请在三栏合并窗口解决冲突后继续",
+            preflight.target
+        ),
+    )?;
+    result.output = join_git_outputs(fetch_output, result.output);
+    Ok(result)
 }
 
 pub fn push_with_options_core(
@@ -2749,6 +3072,7 @@ pub fn conflict_details_core(
     let base = read_index_stage(&workdir, 1, &pathspec)?;
     let ours = read_index_stage(&workdir, 2, &pathspec)?;
     let theirs = read_index_stage(&workdir, 3, &pathspec)?;
+    let display_context = conflict_display_context(&repo, &workdir, current.as_deref())?;
     let mut blocks = current
         .as_deref()
         .map(parse_conflict_blocks_for_response)
@@ -2764,6 +3088,9 @@ pub fn conflict_details_core(
         ours,
         theirs,
         current,
+        current_side: display_context.current_side.to_string(),
+        incoming_side: display_context.incoming_side.to_string(),
+        conflict_source: display_context.source.map(str::to_string),
         blocks,
     })
 }
@@ -3894,6 +4221,195 @@ fn clean_optional_args(values: impl IntoIterator<Item = String>) -> Vec<String> 
     cleaned
 }
 
+fn current_pull_remote_and_target(
+    repo: &Repository,
+    remote_name: Option<String>,
+) -> Result<(String, String), GitboxError> {
+    let branch_name = current_branch_name(repo)
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 不是本地分支，不能直接拉取".to_string()))?;
+    let configured_upstream = repo
+        .find_branch(&branch_name, BranchType::Local)
+        .ok()
+        .and_then(|branch| branch.upstream().ok())
+        .and_then(|branch| branch.name().ok().flatten().map(ToOwned::to_owned));
+
+    if let Some(remote) = clean_optional_arg(remote_name) {
+        let target = configured_upstream
+            .filter(|upstream| upstream_remote_name(upstream).as_deref() == Some(remote.as_str()))
+            .unwrap_or_else(|| format!("{remote}/{branch_name}"));
+        return Ok((remote, target));
+    }
+
+    if let Some(upstream) = configured_upstream {
+        let remote = upstream_remote_name(&upstream).unwrap_or_else(|| "origin".to_string());
+        return Ok((remote, upstream));
+    }
+
+    Ok(("origin".to_string(), format!("origin/{branch_name}")))
+}
+
+fn build_pull_preflight(
+    repo: &Repository,
+    remote: String,
+    target: String,
+) -> Result<PullPreflight, GitboxError> {
+    let current_branch = current_branch_name(repo);
+    let head_oid = repo
+        .head()?
+        .target()
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 无法拉取".to_string()))?;
+    let target_oid = repo
+        .revparse_single(&target)
+        .and_then(|object| object.peel_to_commit())
+        .map(|commit| commit.id())
+        .map_err(|_| GitboxError::Message(format!("找不到远程分支 {target}")))?;
+
+    let merge_base = if head_oid == target_oid {
+        head_oid
+    } else {
+        repo.merge_base(head_oid, target_oid)?
+    };
+    let up_to_date = head_oid == target_oid;
+    let fast_forward = !up_to_date && merge_base == head_oid;
+    let diverged = !up_to_date && merge_base != head_oid && merge_base != target_oid;
+    let remote_changed_paths = if up_to_date || merge_base == target_oid {
+        Vec::new()
+    } else {
+        changed_paths_between(repo, merge_base, target_oid)?
+    };
+    let local_changed_paths = local_uncommitted_paths(repo)?;
+    let local_set = local_changed_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let overlapping_paths = sorted_unique(
+        remote_changed_paths
+            .iter()
+            .filter(|path| local_set.contains(path.as_str()))
+            .cloned(),
+    );
+    let needs_confirmation = !overlapping_paths.is_empty();
+
+    Ok(PullPreflight {
+        remote,
+        target,
+        current_branch,
+        head: Some(head_oid.to_string()),
+        target_oid: Some(target_oid.to_string()),
+        up_to_date,
+        fast_forward,
+        diverged,
+        local_changed_paths,
+        remote_changed_paths,
+        overlapping_paths,
+        needs_confirmation,
+    })
+}
+
+fn local_uncommitted_paths(repo: &Repository) -> Result<Vec<String>, GitboxError> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .renames_head_to_index(true)
+        .renames_index_to_workdir(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let mut paths = Vec::new();
+
+    for entry in statuses.iter() {
+        let status = entry.status();
+        if status == Status::CURRENT || status.contains(Status::IGNORED) {
+            continue;
+        }
+
+        if let Some(delta) = entry.head_to_index() {
+            collect_delta_paths(delta, &mut paths);
+        }
+        if let Some(delta) = entry.index_to_workdir() {
+            collect_delta_paths(delta, &mut paths);
+        }
+        if let Some(path) = entry.path() {
+            paths.push(path.to_string());
+        }
+    }
+
+    Ok(sorted_unique(paths))
+}
+
+fn changed_paths_between(
+    repo: &Repository,
+    old_oid: Oid,
+    new_oid: Oid,
+) -> Result<Vec<String>, GitboxError> {
+    let old_tree = repo.find_commit(old_oid)?.tree()?;
+    let new_tree = repo.find_commit(new_oid)?.tree()?;
+    let diff = repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None)?;
+    let mut paths = Vec::new();
+    diff.foreach(
+        &mut |delta, _| {
+            collect_delta_paths(delta, &mut paths);
+            true
+        },
+        None,
+        None,
+        None,
+    )?;
+    Ok(sorted_unique(paths))
+}
+
+fn collect_delta_paths(delta: git2::DiffDelta<'_>, paths: &mut Vec<String>) {
+    if let Some(path) = delta.old_file().path() {
+        paths.push(repo_path_string(path));
+    }
+    if let Some(path) = delta.new_file().path() {
+        paths.push(repo_path_string(path));
+    }
+}
+
+fn sorted_unique(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut values = values
+        .into_iter()
+        .filter(|value| !value.trim().is_empty())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn upstream_remote_name(upstream: &str) -> Option<String> {
+    upstream
+        .split_once('/')
+        .map(|(remote, _)| remote.trim())
+        .filter(|remote| !remote.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn join_git_outputs(first: String, second: String) -> String {
+    match (first.trim().is_empty(), second.trim().is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => second,
+        (false, true) => first,
+        (false, false) => format!("{}\n{}", first.trim_end(), second.trim_start()),
+    }
+}
+
+fn clean_selected_paths(
+    repo: &Repository,
+    values: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>, GitboxError> {
+    let mut cleaned = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || value == "ALL" {
+            continue;
+        }
+        let rel = repo_path_string(&normalize_repo_path(repo, value)?);
+        if !cleaned.iter().any(|item| item == &rel) {
+            cleaned.push(rel);
+        }
+    }
+    Ok(cleaned)
+}
+
 fn parent_or_empty_tree(repo: &Repository, oid: &str) -> Result<String, GitboxError> {
     let object = repo.revparse_single(oid)?;
     let commit = object.peel_to_commit()?;
@@ -4024,6 +4540,69 @@ fn conflict_side_flag(side: &str) -> Result<&'static str, GitboxError> {
             "冲突处理方式只支持当前或传入".to_string(),
         )),
     }
+}
+
+struct ConflictDisplayContext {
+    current_side: &'static str,
+    incoming_side: &'static str,
+    source: Option<&'static str>,
+}
+
+fn default_conflict_display_context() -> ConflictDisplayContext {
+    ConflictDisplayContext {
+        current_side: "ours",
+        incoming_side: "theirs",
+        source: None,
+    }
+}
+
+fn conflict_display_context(
+    repo: &Repository,
+    workdir: &Path,
+    current: Option<&str>,
+) -> Result<ConflictDisplayContext, GitboxError> {
+    if is_autostash_apply_conflict(repo, workdir, current)? {
+        return Ok(ConflictDisplayContext {
+            current_side: "theirs",
+            incoming_side: "ours",
+            source: Some("autostash"),
+        });
+    }
+
+    Ok(default_conflict_display_context())
+}
+
+fn is_autostash_apply_conflict(
+    repo: &Repository,
+    workdir: &Path,
+    current: Option<&str>,
+) -> Result<bool, GitboxError> {
+    if git_operation_marker_exists(repo) {
+        return Ok(false);
+    }
+    if current.is_some_and(looks_like_stash_apply_conflict) {
+        return Ok(true);
+    }
+
+    let output = run_git_raw(
+        workdir,
+        vec!["stash".to_string(), "list".to_string(), "-1".to_string()],
+        None,
+    )?;
+    Ok(output.success && output.stdout.to_ascii_lowercase().contains("autostash"))
+}
+
+fn git_operation_marker_exists(repo: &Repository) -> bool {
+    let git_dir = repo.path();
+    git_dir.join("rebase-merge").exists()
+        || git_dir.join("rebase-apply").exists()
+        || git_dir.join("MERGE_HEAD").exists()
+        || git_dir.join("CHERRY_PICK_HEAD").exists()
+        || git_dir.join("REVERT_HEAD").exists()
+}
+
+fn looks_like_stash_apply_conflict(content: &str) -> bool {
+    content.contains("<<<<<<< Updated upstream") && content.contains(">>>>>>> Stashed changes")
 }
 
 fn read_index_stage(
@@ -4371,6 +4950,14 @@ fn run_git_operation(
     let workdir = repo_workdir(&repo)?;
     let output = run_git_raw(&workdir, args, None)?;
     if output.success {
+        let state = operation_state_core(path)?;
+        if !state.conflicted_paths.is_empty() {
+            return Ok(CommandResult {
+                ok: false,
+                message: conflict_message,
+                output: output.combined_output(),
+            });
+        }
         return Ok(CommandResult {
             ok: true,
             message: success_message,
@@ -4657,6 +5244,21 @@ mod tests {
     }
 
     #[test]
+    fn git_failure_message_translates_untracked_overwrite_error() {
+        let output = GitProcessOutput {
+            success: false,
+            stdout: "Updating 7dbcd7d..441c9cc\nCreated autostash: 99b70bc\n".to_string(),
+            stderr: "error: The following untracked working tree files would be overwritten by merge:\n\tdocs/colleague-ops-runbook.md\n\tpages/colleague-ops.html\nPlease move or remove them before you merge.\nAborting\nApplied autostash.\n".to_string(),
+        };
+
+        let message = output.failure_message();
+        assert!(message.contains("本地未跟踪文件会被本次拉取或合并覆盖"));
+        assert!(message.contains("docs/colleague-ops-runbook.md"));
+        assert!(message.contains("pages/colleague-ops.html"));
+        assert!(!message.contains("The following untracked working tree files"));
+    }
+
+    #[test]
     fn project_file_listing_keeps_root_files_before_deep_descendants() {
         let (dir, _repo) = test_repo();
         write_file(dir.path(), "src/main.rs", "fn main() {}\n");
@@ -4809,6 +5411,161 @@ mod tests {
                 .branch
                 .clean
         );
+    }
+
+    #[test]
+    fn commit_selected_paths_preserves_unchecked_staged_changes() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        write_file(dir.path(), "a.txt", "base a\n");
+        write_file(dir.path(), "b.txt", "base b\n");
+        stage_paths_core(path, vec!["a.txt".to_string(), "b.txt".to_string()]).expect("stage base");
+        commit_core(path, "base".to_string()).expect("commit base");
+
+        write_file(dir.path(), "a.txt", "selected a\n");
+        write_file(dir.path(), "b.txt", "unchecked b\n");
+        stage_paths_core(path, vec!["a.txt".to_string(), "b.txt".to_string()]).expect("stage both");
+
+        let commit = commit_with_full_options_and_selection_core(
+            path,
+            "selected only".to_string(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            Some(vec!["a.txt".to_string()]),
+        )
+        .expect("commit selected");
+
+        let details = commit_details_core(path, commit.oid).expect("details");
+        assert_eq!(details.files.len(), 1);
+        assert_eq!(details.files[0].path, "a.txt");
+
+        let status = repo_status_core(path, false).expect("status");
+        assert_eq!(status.counts.staged, 1);
+        assert!(status
+            .files
+            .iter()
+            .any(|file| file.path == "b.txt" && file.staged));
+    }
+
+    #[test]
+    fn commit_selected_paths_can_commit_untracked_worktree_file() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        initial_commit(dir.path());
+        write_file(dir.path(), "selected.txt", "selected\n");
+        write_file(dir.path(), "unchecked.txt", "unchecked\n");
+
+        let commit = commit_with_full_options_and_selection_core(
+            path,
+            "selected untracked".to_string(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            Some(vec!["selected.txt".to_string()]),
+        )
+        .expect("commit selected untracked");
+
+        let details = commit_details_core(path, commit.oid).expect("details");
+        assert_eq!(details.files.len(), 1);
+        assert_eq!(details.files[0].path, "selected.txt");
+
+        let status = repo_status_core(path, false).expect("status");
+        assert_eq!(status.counts.untracked, 1);
+        assert!(status
+            .files
+            .iter()
+            .any(|file| file.path == "unchecked.txt" && file.untracked));
+    }
+
+    #[test]
+    fn commit_selected_paths_finishes_merge_without_partial_commit() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        write_file(dir.path(), "conflict-demo.txt", "base\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage base");
+        commit_core(path, "base".to_string()).expect("commit base");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "-B".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main");
+        run_git(
+            dir.path(),
+            vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                "feature".to_string(),
+            ],
+            None,
+        )
+        .expect("checkout feature");
+        write_file(dir.path(), "conflict-demo.txt", "feature\n");
+        write_file(dir.path(), "colleague-long-path.txt", "feature side\n");
+        stage_paths_core(
+            path,
+            vec![
+                "conflict-demo.txt".to_string(),
+                "colleague-long-path.txt".to_string(),
+            ],
+        )
+        .expect("stage feature");
+        commit_core(path, "feature change".to_string()).expect("commit feature");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main again");
+        write_file(dir.path(), "conflict-demo.txt", "main\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage main");
+        commit_core(path, "main change".to_string()).expect("commit main");
+
+        let merge = run_git_raw(
+            dir.path(),
+            vec!["merge".to_string(), "feature".to_string()],
+            None,
+        )
+        .expect("merge process");
+        assert!(!merge.success);
+        assert!(Repository::open(dir.path())
+            .unwrap()
+            .path()
+            .join("MERGE_HEAD")
+            .exists());
+
+        write_file(dir.path(), "conflict-demo.txt", "resolved\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage resolution");
+
+        let commit = commit_with_full_options_and_selection_core(
+            path,
+            "merge feature".to_string(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            Some(vec!["conflict-demo.txt".to_string()]),
+        )
+        .expect("commit merge");
+
+        let repo = Repository::open(dir.path()).expect("repo");
+        let head = repo.head().expect("head").peel_to_commit().expect("commit");
+        assert_eq!(head.id().to_string(), commit.oid);
+        assert_eq!(head.parent_count(), 2);
+        assert!(!repo.path().join("MERGE_HEAD").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("colleague-long-path.txt")).unwrap(),
+            "feature side\n"
+        );
+        assert!(repo_status_core(path, false).expect("status").branch.clean);
     }
 
     #[test]
@@ -5069,6 +5826,286 @@ mod tests {
     }
 
     #[test]
+    fn pull_diverged_branch_starts_merge_conflict_flow() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        Repository::init_bare(remote_dir.path()).expect("init bare remote");
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        let path = dir.path().to_str().unwrap();
+        let branch = branch_summary_core(path, false)
+            .expect("summary")
+            .current_branch
+            .expect("current branch");
+
+        add_remote_core(path, "origin".to_string(), remote_url.clone()).expect("add local remote");
+        push_with_options_core(
+            path,
+            Some("origin".to_string()),
+            Some(branch.clone()),
+            true,
+            false,
+            false,
+        )
+        .expect("push initial");
+
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        run_git(
+            clone_parent.path(),
+            vec!["clone".to_string(), remote_url, "remote-work".to_string()],
+            None,
+        )
+        .expect("clone remote");
+        let remote_workdir = clone_parent.path().join("remote-work");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.name".to_string(),
+                "remote".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user name");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.email".to_string(),
+                "remote@example.test".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user email");
+        write_file(&remote_workdir, "README.md", "remote change\n");
+        run_git(
+            &remote_workdir,
+            vec!["add".to_string(), "README.md".to_string()],
+            None,
+        )
+        .expect("stage remote");
+        run_git(
+            &remote_workdir,
+            vec!["commit".to_string(), "-m".to_string(), "remote".to_string()],
+            None,
+        )
+        .expect("commit remote");
+        run_git(&remote_workdir, vec!["push".to_string()], None).expect("push remote");
+
+        write_file(dir.path(), "README.md", "local change\n");
+        stage_paths_core(path, vec!["README.md".to_string()]).expect("stage local");
+        commit_core(path, "local".to_string()).expect("commit local");
+
+        let result = pull_core(path, Some("origin".to_string()), false).expect("pull starts merge");
+        assert!(!result.ok);
+        assert!(result.message.contains("三栏合并窗口"));
+        assert!(!result.output.contains("Not possible to fast-forward"));
+
+        let state = operation_state_core(path).expect("operation state");
+        assert_eq!(state.operation.as_deref(), Some("merge"));
+        assert_eq!(state.conflicted_paths, vec!["README.md".to_string()]);
+
+        let details =
+            conflict_details_core(path, "README.md".to_string()).expect("conflict details");
+        assert!(details
+            .ours
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local change"));
+        assert!(details
+            .theirs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("remote change"));
+        assert_eq!(details.current_side, "ours");
+        assert_eq!(details.incoming_side, "theirs");
+        assert_eq!(details.conflict_source, None);
+    }
+
+    #[test]
+    fn pull_preflight_detects_uncommitted_remote_overlap() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        Repository::init_bare(remote_dir.path()).expect("init bare remote");
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        let path = dir.path().to_str().unwrap();
+        let branch = branch_summary_core(path, false)
+            .expect("summary")
+            .current_branch
+            .expect("current branch");
+
+        add_remote_core(path, "origin".to_string(), remote_url.clone()).expect("add local remote");
+        push_with_options_core(
+            path,
+            Some("origin".to_string()),
+            Some(branch.clone()),
+            true,
+            false,
+            false,
+        )
+        .expect("push initial");
+
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        run_git(
+            clone_parent.path(),
+            vec!["clone".to_string(), remote_url, "remote-work".to_string()],
+            None,
+        )
+        .expect("clone remote");
+        let remote_workdir = clone_parent.path().join("remote-work");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.name".to_string(),
+                "remote".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user name");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.email".to_string(),
+                "remote@example.test".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user email");
+        write_file(&remote_workdir, "README.md", "remote change\n");
+        run_git(
+            &remote_workdir,
+            vec!["add".to_string(), "README.md".to_string()],
+            None,
+        )
+        .expect("stage remote");
+        run_git(
+            &remote_workdir,
+            vec!["commit".to_string(), "-m".to_string(), "remote".to_string()],
+            None,
+        )
+        .expect("commit remote");
+        run_git(&remote_workdir, vec!["push".to_string()], None).expect("push remote");
+
+        write_file(dir.path(), "README.md", "local draft\n");
+
+        let preview =
+            pull_preflight_core(path, Some("origin".to_string())).expect("pull preflight");
+        assert!(preview.needs_confirmation);
+        assert!(preview.fast_forward);
+        assert_eq!(preview.overlapping_paths, vec!["README.md".to_string()]);
+        assert!(preview
+            .remote_changed_paths
+            .contains(&"README.md".to_string()));
+        assert!(preview
+            .local_changed_paths
+            .contains(&"README.md".to_string()));
+    }
+
+    #[test]
+    fn smart_pull_uses_three_way_conflict_for_dirty_overlap() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        Repository::init_bare(remote_dir.path()).expect("init bare remote");
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        let path = dir.path().to_str().unwrap();
+        let branch = branch_summary_core(path, false)
+            .expect("summary")
+            .current_branch
+            .expect("current branch");
+
+        add_remote_core(path, "origin".to_string(), remote_url.clone()).expect("add local remote");
+        push_with_options_core(
+            path,
+            Some("origin".to_string()),
+            Some(branch.clone()),
+            true,
+            false,
+            false,
+        )
+        .expect("push initial");
+
+        let clone_parent = tempfile::tempdir().expect("clone parent");
+        run_git(
+            clone_parent.path(),
+            vec!["clone".to_string(), remote_url, "remote-work".to_string()],
+            None,
+        )
+        .expect("clone remote");
+        let remote_workdir = clone_parent.path().join("remote-work");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.name".to_string(),
+                "remote".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user name");
+        run_git(
+            &remote_workdir,
+            vec![
+                "config".to_string(),
+                "user.email".to_string(),
+                "remote@example.test".to_string(),
+            ],
+            None,
+        )
+        .expect("remote user email");
+        write_file(&remote_workdir, "README.md", "remote change\n");
+        run_git(
+            &remote_workdir,
+            vec!["add".to_string(), "README.md".to_string()],
+            None,
+        )
+        .expect("stage remote");
+        run_git(
+            &remote_workdir,
+            vec!["commit".to_string(), "-m".to_string(), "remote".to_string()],
+            None,
+        )
+        .expect("commit remote");
+        run_git(&remote_workdir, vec!["push".to_string()], None).expect("push remote");
+
+        write_file(dir.path(), "README.md", "local draft\n");
+
+        let result = pull_core(path, Some("origin".to_string()), true).expect("smart pull");
+        assert!(!result.ok);
+        assert!(result.message.contains("三栏合并窗口"));
+        assert!(!result.output.contains("would be overwritten"));
+
+        let state = operation_state_core(path).expect("operation state");
+        assert_eq!(state.conflicted_paths, vec!["README.md".to_string()]);
+
+        let details =
+            conflict_details_core(path, "README.md".to_string()).expect("conflict details");
+        let combined = format!(
+            "{}{}",
+            details.ours.as_deref().unwrap_or_default(),
+            details.theirs.as_deref().unwrap_or_default()
+        );
+        assert!(combined.contains("remote change"));
+        assert!(combined.contains("local draft"));
+        assert_eq!(details.current_side, "theirs");
+        assert_eq!(details.incoming_side, "ours");
+        assert_eq!(details.conflict_source.as_deref(), Some("autostash"));
+        assert!(details
+            .ours
+            .as_deref()
+            .unwrap_or_default()
+            .contains("remote change"));
+        assert!(details
+            .theirs
+            .as_deref()
+            .unwrap_or_default()
+            .contains("local draft"));
+    }
+
+    #[test]
     fn checkout_remote_branch_creates_tracking_local_branch() {
         let (dir, _repo) = test_repo();
         initial_commit(dir.path());
@@ -5274,6 +6311,24 @@ mod tests {
 
         let status = repo_status_core(dir.path().to_str().unwrap(), false).expect("status");
         assert_eq!(status.counts.staged, 1);
+    }
+
+    #[test]
+    fn diff_for_untracked_file_includes_workdir_text() {
+        let (dir, _repo) = test_repo();
+        write_file(dir.path(), "notes.txt", "one\ntwo\n");
+
+        let diff = get_diff_core(
+            dir.path().to_str().unwrap(),
+            Some("notes.txt".to_string()),
+            false,
+        )
+        .expect("diff");
+
+        assert!(diff.text.contains("+one"));
+        assert_eq!(diff.old_text, None);
+        assert_eq!(diff.new_text.as_deref(), Some("one\ntwo\n"));
+        assert!(!diff.hunks.is_empty());
     }
 
     #[test]

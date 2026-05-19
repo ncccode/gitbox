@@ -33,7 +33,6 @@ import {
   Search,
   Star,
   Trash2,
-  TriangleAlert,
   Upload,
   UserRound,
   X,
@@ -63,7 +62,7 @@ import { PROJECT_ROOT_PATH, useProjectStore } from "./stores/project";
 import { useRemoteStore } from "./stores/remote";
 import { useRepositoriesStore } from "./stores/repositories";
 import { useSettingsStore } from "./stores/settings";
-import type { DirectWorktreeCommitPolicy, LayoutPanelKey, ThemeMode } from "./stores/settings";
+import type { LayoutPanelKey, ThemeMode } from "./stores/settings";
 import type {
   BranchInfo,
   ChangeSide,
@@ -72,9 +71,11 @@ import type {
   CommitFileChange,
   CommitSummary,
   ConflictBlock,
+  ConflictDetails,
   DiffHunk,
   DiffResponse,
   ProjectFileEntry,
+  PullPreflight,
   ShelfInfo,
   TagInfo,
 } from "./types/gitbox";
@@ -92,6 +93,7 @@ const project = useProjectStore();
 const remote = useRemoteStore();
 const settings = useSettingsStore();
 const shelveMessage = ref("");
+const pendingUiActions = ref<Record<string, number>>({});
 const pendingCommitAction = ref<"commit" | "push" | null>(null);
 const newBranchName = ref("");
 const newTagName = ref("");
@@ -122,7 +124,7 @@ const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
 const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
-const worktreeCommitDialog = ref<WorktreeCommitDialog | null>(null);
+const expandedSubmitConfirmDirectories = ref<Record<string, boolean>>({});
 const mergeCurrentScroller = ref<HTMLElement | null>(null);
 const mergeCurrentGutter = ref<HTMLElement | null>(null);
 const mergeResultGutter = ref<HTMLElement | null>(null);
@@ -192,6 +194,10 @@ type ProjectEditorHunkView = {
   tone: "added" | "deleted" | "modified";
   lineStart: number;
   lineCount: number;
+  changedNewStart: number;
+  changedNewEnd: number;
+  changedOldStart: number | null;
+  changedOldEnd: number | null;
   oldStart: number;
   oldLines: number;
   newStart: number;
@@ -247,11 +253,6 @@ type ProjectCloseDialog = {
   saving: boolean;
   error: string;
 };
-type WorktreeCommitChoice = "yes" | "always" | "never" | "cancel";
-type WorktreeCommitDialog = {
-  pushAfter: boolean;
-  resolve: (choice: WorktreeCommitChoice) => void;
-};
 type MergeCodeLine = {
   id: string;
   number: number;
@@ -264,6 +265,7 @@ type MergeCodeLine = {
   conflictEnd: boolean;
 };
 type MergeConflictSide = "ours" | "base" | "theirs";
+type MergeDisplaySide = "ours" | "theirs";
 type MergeConflictSelection = MergeConflictSide | "combined";
 type MergeConflictSnippet = {
   index: number;
@@ -285,12 +287,34 @@ type NoticeToast = {
   id: number;
   message: string;
 };
+type ErrorDialog = {
+  id: number;
+  message: string;
+};
+type PullConfirmDialog = {
+  preview: PullPreflight;
+  loading: boolean;
+};
+type SubmitConfirmMode = "commit" | "commit-push" | "push";
+type SubmitConfirmDialog = {
+  mode: SubmitConfirmMode;
+  paths: string[];
+  message: string;
+  remoteName: string;
+  currentBranch: string;
+  targetBranch: string;
+  options: string[];
+  loading: boolean;
+};
 
 const workbenchMode = ref<WorkbenchMode>("changes");
 const LOG_TAB_ID = "log-root";
 const activeLogTabId = ref(LOG_TAB_ID);
 const logDiffTabs = ref<LogDiffTab[]>([]);
 const noticeToast = ref<NoticeToast | null>(null);
+const errorDialog = ref<ErrorDialog | null>(null);
+const pullConfirmDialog = ref<PullConfirmDialog | null>(null);
+const submitConfirmDialog = ref<SubmitConfirmDialog | null>(null);
 const activeResizePanel = ref<LayoutPanelKey | null>(null);
 const systemPrefersDark = ref(
   typeof window !== "undefined" &&
@@ -302,9 +326,11 @@ let projectEditorResizeObserver: ResizeObserver | null = null;
 let autoFetchTimer: number | null = null;
 let noticeToastTimer: number | null = null;
 let noticeToastId = 0;
+let errorDialogId = 0;
 const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 const PROJECT_EDITOR_LINE_HEIGHT = 18;
+const MIN_OPERATION_BUSY_MS = 520;
 const PROJECT_EDITOR_PADDING_TOP = 12;
 const PROJECT_EDITOR_OVERSCAN_LINES = 32;
 const PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT = 720;
@@ -316,7 +342,7 @@ const projectKeywordCache = new Map<string, Set<string>>();
 const projectLineTokenCache = new Map<string, ProjectCodeToken[]>();
 
 const activeFiles = computed(() => {
-  return changes.filesForSide(settings.selectedSide);
+  return filesForChangeSide(settings.selectedSide);
 });
 const changeFileGroups = computed<ChangeFileGroup[]>(() => {
   if (settings.selectedSide === "staged") {
@@ -408,7 +434,7 @@ const activeError = computed(
     commit.error ||
     history.error ||
     operations.error ||
-    (workbenchMode.value === "project" ? project.error : "") ||
+    (workbenchMode.value === "project" || logFilePickerOpen.value ? project.error : "") ||
     remote.error ||
     advanced.error,
 );
@@ -428,7 +454,7 @@ const activeChangeDiffLanguage = computed(() => projectLanguageForPath(changes.s
 const activeChangeSideBySideDiffRows = computed(() =>
   buildSideBySideDiffRows(diff.current, activeChangeDiffLanguage.value),
 );
-const activeChangeDiffHasContent = computed(() => Boolean(diff.current?.text?.trim()));
+const activeChangeDiffHasContent = computed(() => hasDisplayableDiffContent(diff.current));
 const activeChangeDiffHunkCount = computed(() => diff.current?.hunks.length ?? 0);
 const currentChangeDiffHunkPosition = computed(() => {
   if (activeChangeDiffHunkCount.value === 0) return 0;
@@ -453,27 +479,72 @@ const changeDiffLeftDetail = computed(() =>
 );
 const changeDiffRightLabel = computed(() => (settings.selectedSide === "staged" ? "暂存区" : "工作区"));
 const changeDiffRightDetail = computed(() => changes.selectedFile ?? "");
-const worktreeOnlyCommit = computed(() => (counts.value?.staged ?? 0) === 0 && (counts.value?.unstaged ?? 0) > 0);
-const canCommit = computed(() =>
-  Boolean(
-    commit.message.trim() &&
-      ((counts.value?.staged ?? 0) > 0 ||
-        (counts.value?.unstaged ?? 0) > 0 ||
-        (commit.amend && branch.value?.head)),
-  ),
-);
+const selectedCommitPaths = computed(() => changes.selectedCommitPaths);
+const canCommit = computed(() => Boolean(commit.message.trim() && selectedCommitPaths.value.length > 0));
 const commitBusy = computed(
-  () => commit.loading || pendingCommitAction.value !== null || worktreeCommitDialog.value !== null,
+  () => commit.loading || pendingCommitAction.value !== null,
 );
 const commitButtonLabel = computed(() => (pendingCommitAction.value === "commit" ? "提交中" : "提交"));
 const commitPushButtonLabel = computed(() =>
   pendingCommitAction.value === "push" ? "提交并推送中" : "提交并推送",
 );
-const worktreeCommitQuestion = computed(() =>
-  worktreeCommitDialog.value?.pushAfter
-    ? "是否要暂存所有更改，提交并推送？"
-    : "是否要暂存所有更改并直接提交？",
-);
+const submitConfirmTitle = computed(() => {
+  const mode = submitConfirmDialog.value?.mode;
+  if (mode === "commit-push") return "确认提交并推送";
+  if (mode === "push") return "确认推送";
+  return "确认提交";
+});
+const submitConfirmActionLabel = computed(() => {
+  const dialog = submitConfirmDialog.value;
+  if (!dialog) return "确认";
+  if (dialog.loading) {
+    if (dialog.mode === "commit-push") return "提交并推送中";
+    if (dialog.mode === "push") return "推送中";
+    return "提交中";
+  }
+  if (dialog.mode === "commit-push") return "提交并推送";
+  if (dialog.mode === "push") return "推送";
+  return "提交";
+});
+const submitConfirmTargetLabel = computed(() => {
+  const dialog = submitConfirmDialog.value;
+  if (!dialog) return "";
+  if (dialog.mode === "commit") return dialog.currentBranch || "当前分支";
+  const remoteTarget = dialog.targetBranch || dialog.currentBranch || "当前分支";
+  return `${dialog.remoteName || "origin"}/${remoteTarget}`;
+});
+const submitConfirmFileTreeRows = computed<LogFileTreeRow[]>(() => {
+  const dialog = submitConfirmDialog.value;
+  if (!dialog?.paths.length) return [];
+
+  const files = dialog.paths.map((path) => {
+    const changed = changes.files.find((file) => file.path === path);
+    return {
+      path,
+      oldPath: changed?.oldPath,
+      status: changed?.kind ?? "modified",
+    };
+  });
+  return buildCommitFileTreeRows(files);
+});
+const visibleSubmitConfirmFileTreeRows = computed<LogFileTreeRow[]>(() => {
+  const hiddenDirectories = new Set<string>();
+  const rows: LogFileTreeRow[] = [];
+
+  for (const row of submitConfirmFileTreeRows.value) {
+    if (row.parent && hiddenDirectories.has(row.parent)) {
+      if (row.directory) hiddenDirectories.add(row.path);
+      continue;
+    }
+
+    rows.push(row);
+    if (row.directory && !isSubmitConfirmDirectoryExpanded(row.path)) {
+      hiddenDirectories.add(row.path);
+    }
+  }
+
+  return rows;
+});
 const selectedCommitTitle = computed(() => {
   if (!history.details) return "未选择提交";
   return `${history.details.commit.shortOid} · ${history.details.commit.summary}`;
@@ -483,7 +554,7 @@ const activeLogDiffLanguage = computed(() => projectLanguageForPath(activeLogDif
 const activeLogSideBySideDiffRows = computed(() =>
   buildSideBySideDiffRows(activeLogDiffTab.value?.diff ?? null, activeLogDiffLanguage.value),
 );
-const activeLogDiffHasContent = computed(() => Boolean(activeLogDiffTab.value?.diff?.text?.trim()));
+const activeLogDiffHasContent = computed(() => hasDisplayableDiffContent(activeLogDiffTab.value?.diff));
 const activeLogDiffHunkCount = computed(() => activeLogDiffTab.value?.diff?.hunks.length ?? 0);
 const currentLogDiffHunkPosition = computed(() =>
   activeLogDiffHunkCount.value > 0 ? Math.min(activeLogDiffHunkIndex.value + 1, activeLogDiffHunkCount.value) : 0,
@@ -659,9 +730,47 @@ const mergeResultStateLabel = computed(() => {
   if (resultHasConflictMarkers.value) return "结果仍包含冲突标记";
   return operations.resultDirty ? "结果有未保存修改" : "结果未修改";
 });
-const showMergeConflictWorkbench = computed(() => workbenchMode.value === "changes" && Boolean(operations.conflict));
-const mergeCurrentSourceLabel = computed(() => branch.value?.currentBranch || "当前版本");
-const mergeIncomingSourceLabel = computed(() => operations.mergeTarget.trim() || "传入版本");
+const pullConfirmPreview = computed(() => pullConfirmDialog.value?.preview ?? null);
+const pullConfirmFiles = computed(() => pullConfirmPreview.value?.overlappingPaths.slice(0, 8) ?? []);
+const pullConfirmExtraCount = computed(() => {
+  const total = pullConfirmPreview.value?.overlappingPaths.length ?? 0;
+  return Math.max(0, total - pullConfirmFiles.value.length);
+});
+const pullConfirmModeLabel = computed(() => {
+  const preview = pullConfirmPreview.value;
+  if (!preview) return "";
+  if (preview.fastForward) return "快进更新";
+  if (preview.diverged) return "分叉合并";
+  return preview.upToDate ? "已经最新" : "合并更新";
+});
+const isMergeConflictOperation = computed(() => operations.activeOperation === "merge");
+const showMergeConflictWorkbench = computed(
+  () =>
+    workbenchMode.value === "changes" &&
+    Boolean(operations.conflict) &&
+    operations.conflict?.path === changes.selectedFile,
+);
+const mergeCurrentSide = computed<MergeDisplaySide>(() =>
+  normalizeMergeDisplaySide(operations.conflict?.currentSide, "ours"),
+);
+const mergeIncomingSide = computed<MergeDisplaySide>(() => {
+  const incoming = normalizeMergeDisplaySide(operations.conflict?.incomingSide, "theirs");
+  return incoming === mergeCurrentSide.value ? oppositeMergeDisplaySide(mergeCurrentSide.value) : incoming;
+});
+const mergeCurrentSourceLabel = computed(() => {
+  const currentBranch = branch.value?.currentBranch || "当前版本";
+  if (operations.conflict?.conflictSource === "autostash" && mergeCurrentSide.value === "theirs") {
+    return `${currentBranch} 的本地修改`;
+  }
+  return currentBranch;
+});
+const mergeIncomingSourceLabel = computed(() => {
+  const target = operations.mergeTarget.trim() || "传入版本";
+  if (operations.conflict?.conflictSource === "autostash" && mergeIncomingSide.value === "ours") {
+    return `${target} 已拉取版本`;
+  }
+  return target;
+});
 const mergeLanguage = computed(() => projectLanguageForPath(operations.conflict?.path));
 const mergeResultConflictSnippets = computed<MergeConflictSnippet[]>(() =>
   buildResultMergeConflictSnippets(
@@ -671,21 +780,29 @@ const mergeResultConflictSnippets = computed<MergeConflictSnippet[]>(() =>
   ),
 );
 const mergeCurrentConflictSnippets = computed<MergeConflictSnippet[]>(() =>
-  buildComparedMergeConflictSnippets(operations.conflict?.blocks ?? [], "ours", operations.resultBlockSelections),
+  buildComparedMergeConflictSnippets(
+    operations.conflict?.blocks ?? [],
+    mergeCurrentSide.value,
+    operations.resultBlockSelections,
+  ),
 );
 const mergeIncomingConflictSnippets = computed<MergeConflictSnippet[]>(() =>
-  buildComparedMergeConflictSnippets(operations.conflict?.blocks ?? [], "theirs", operations.resultBlockSelections),
+  buildComparedMergeConflictSnippets(
+    operations.conflict?.blocks ?? [],
+    mergeIncomingSide.value,
+    operations.resultBlockSelections,
+  ),
 );
 const mergeCurrentLines = computed(() =>
   buildMergeCodeLines(
-    operations.conflict?.ours ?? "",
+    mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
     mergeCurrentConflictSnippets.value,
     mergeLanguage.value,
   ),
 );
 const mergeIncomingLines = computed(() =>
   buildMergeCodeLines(
-    operations.conflict?.theirs ?? "",
+    mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
     mergeIncomingConflictSnippets.value,
     mergeLanguage.value,
   ),
@@ -694,10 +811,18 @@ const mergeResultLines = computed(() =>
   buildMergeCodeLines(operations.resultDraft, mergeResultConflictSnippets.value, mergeLanguage.value),
 );
 const mergeCurrentConflictRanges = computed(() =>
-  buildMergeSourceConflictRanges(operations.conflict?.ours ?? "", operations.conflict?.blocks ?? [], "ours"),
+  buildMergeSourceConflictRanges(
+    mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
+    operations.conflict?.blocks ?? [],
+    mergeCurrentSide.value,
+  ),
 );
 const mergeIncomingConflictRanges = computed(() =>
-  buildMergeSourceConflictRanges(operations.conflict?.theirs ?? "", operations.conflict?.blocks ?? [], "theirs"),
+  buildMergeSourceConflictRanges(
+    mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
+    operations.conflict?.blocks ?? [],
+    mergeIncomingSide.value,
+  ),
 );
 const mergeCurrentResultConnections = computed(() =>
   buildMergeConflictConnections(
@@ -705,7 +830,7 @@ const mergeCurrentResultConnections = computed(() =>
     mergeCurrentConflictRanges.value,
     mergeResultLines.value,
     "current",
-    "ours",
+    mergeCurrentSide.value,
   ),
 );
 const mergeIncomingResultConnections = computed(() =>
@@ -714,7 +839,7 @@ const mergeIncomingResultConnections = computed(() =>
     mergeIncomingConflictRanges.value,
     mergeResultLines.value,
     "incoming",
-    "theirs",
+    mergeIncomingSide.value,
   ),
 );
 const mergeResultRenderStyle = computed(() => ({
@@ -791,11 +916,6 @@ const operationKindLabels: Record<string, string> = {
   rebase: "变基",
   "cherry-pick": "挑选提交",
   revert: "反向提交",
-};
-const resetModeLabels: Record<string, string> = {
-  soft: "软重置",
-  mixed: "混合重置",
-  hard: "硬重置",
 };
 const commitFileDiffModeLabels: Record<CommitFileDiffMode, string> = {
   commit: "储存库差异",
@@ -1212,6 +1332,16 @@ watch(
   { flush: "post" },
 );
 
+watch(
+  activeError,
+  (message) => {
+    if (!message) return;
+    showErrorDialog(message);
+    clearErrorSources();
+  },
+  { flush: "post" },
+);
+
 watch(workbenchMode, (mode) => {
   if (mode === "advanced") {
     loadAdvancedSnapshots().catch(() => undefined);
@@ -1272,12 +1402,115 @@ function dismissNoticeToast(id?: number) {
   noticeToast.value = null;
 }
 
+function showErrorDialog(message: string) {
+  const id = errorDialogId + 1;
+  errorDialogId = id;
+  errorDialog.value = { id, message };
+}
+
+function dismissErrorDialog(id?: number) {
+  if (id !== undefined && errorDialog.value?.id !== id) return;
+  errorDialog.value = null;
+}
+
+function isUiActionPending(key: string) {
+  return (pendingUiActions.value[key] ?? 0) > 0;
+}
+
+function isUiActionActive(key: string) {
+  return isUiActionPending(key);
+}
+
+function actionIcon(key: string, icon: unknown) {
+  return isUiActionActive(key) ? LoaderCircle : icon;
+}
+
+function actionIconClass(key: string) {
+  return { "button-spinner": isUiActionActive(key) };
+}
+
+function actionButtonClass(key: string) {
+  return { loading: isUiActionActive(key) };
+}
+
+function remoteActionKey(action: "fetch" | "pull" | "push") {
+  return `remote.${action}`;
+}
+
+function branchActionKey(action: string, target = "") {
+  return `branch.${action}:${target}`;
+}
+
+function nowMs() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+function waitMs(ms: number) {
+  return new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, ms);
+  });
+}
+
+function waitAnimationFrame() {
+  return new Promise<void>((resolve) => {
+    if (typeof window === "undefined" || typeof window.requestAnimationFrame !== "function") {
+      globalThis.setTimeout(resolve, 16);
+      return;
+    }
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+async function waitForOperationPaint() {
+  await nextTick();
+  await waitAnimationFrame();
+  await waitAnimationFrame();
+}
+
+async function runUiAction<T>(key: string, action: () => Promise<T>) {
+  const startedAt = nowMs();
+  pendingUiActions.value = {
+    ...pendingUiActions.value,
+    [key]: (pendingUiActions.value[key] ?? 0) + 1,
+  };
+  await waitForOperationPaint();
+  try {
+    return await action();
+  } finally {
+    const remainingMs = MIN_OPERATION_BUSY_MS - (nowMs() - startedAt);
+    if (remainingMs > 0) {
+      await waitMs(remainingMs);
+    }
+    const nextCount = (pendingUiActions.value[key] ?? 1) - 1;
+    const nextActions = { ...pendingUiActions.value };
+    if (nextCount > 0) {
+      nextActions[key] = nextCount;
+    } else {
+      delete nextActions[key];
+    }
+    pendingUiActions.value = nextActions;
+  }
+}
+
 function clearNoticeSources() {
   operations.notice = "";
   advanced.notice = "";
   branches.notice = "";
   changes.notice = "";
   remote.notice = "";
+}
+
+function clearErrorSources() {
+  repos.error = "";
+  branches.error = "";
+  changes.error = "";
+  diff.error = "";
+  commit.error = "";
+  history.error = "";
+  operations.error = "";
+  project.error = "";
+  remote.error = "";
+  advanced.error = "";
 }
 
 function normalizeSelectedPaths(selected: string | string[] | null) {
@@ -1311,40 +1544,48 @@ function parseHostedRemote(rawUrl: string) {
 }
 
 async function chooseRepository() {
-  const selected = await open({
-    directory: true,
-    multiple: true,
-    title: "添加 Git 仓库",
+  await runUiAction("repo.choose", async () => {
+    const selected = await open({
+      directory: true,
+      multiple: true,
+      title: "添加 Git 仓库",
+    });
+
+    const paths = normalizeSelectedPaths(selected);
+    if (paths.length === 0) return;
+
+    await repos.openMany(paths);
+    await loadSelectedProject();
   });
-
-  const paths = normalizeSelectedPaths(selected);
-  if (paths.length === 0) return;
-
-  await repos.openMany(paths);
-  await loadSelectedProject();
 }
 
 async function initSelectedProject() {
   if (!repos.selectedPath) return;
-  advanced.initDirectory = repos.selectedPath;
-  const repo = await advanced.initAt();
-  if (!repo) return;
-  repos.setCurrent(repo);
-  await loadCurrentRepository();
+  await runUiAction("repo.init", async () => {
+    advanced.initDirectory = repos.selectedPath;
+    const repo = await advanced.initAt();
+    if (!repo) return;
+    repos.setCurrent(repo);
+    await loadCurrentRepository();
+  });
 }
 
 async function switchRepository(path: string) {
   if (repos.selectedPath === path) return;
-  await repos.select(path);
-  await loadSelectedProject();
+  await runUiAction(`repo.switch:${path}`, async () => {
+    await repos.select(path);
+    await loadSelectedProject();
+  });
 }
 
 async function removeRepository(path: string) {
-  const wasCurrent = repos.selectedPath === path;
-  repos.remove(path);
-  if (!wasCurrent) return;
+  await runUiAction(`repo.remove:${path}`, async () => {
+    const wasCurrent = repos.selectedPath === path;
+    repos.remove(path);
+    if (!wasCurrent) return;
 
-  await loadSelectedProject();
+    await loadSelectedProject();
+  });
 }
 
 async function loadSelectedProject() {
@@ -1426,17 +1667,19 @@ function syncOperationTargets() {
 }
 
 async function refreshAll() {
-  await changes.refresh();
-  changelists.pruneMissingPaths(changes.files.map((file) => file.path));
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  branches.syncUpstreamDraft();
-  syncOperationTargets();
-  syncSelectedRemote();
-  pickFirstAvailable(settings.selectedSide);
-  await diff.loadSelected();
-  if (workbenchMode.value === "project") {
-    await project.refresh();
-  }
+  await runUiAction("workspace.refresh", async () => {
+    await changes.refresh();
+    changelists.pruneMissingPaths(changes.files.map((file) => file.path));
+    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    branches.syncUpstreamDraft();
+    syncOperationTargets();
+    syncSelectedRemote();
+    pickFirstAvailable(settings.selectedSide);
+    await diff.loadSelected();
+    if (workbenchMode.value === "project") {
+      await project.refresh();
+    }
+  });
 }
 
 async function reloadAfterGitOperation() {
@@ -1457,28 +1700,97 @@ async function reloadAfterGitOperation() {
 
 async function loadAdvancedSnapshots() {
   if (!repos.current) return;
-  await Promise.allSettled([
-    advanced.refreshWorktrees(),
-    advanced.refreshStashes(),
-    advanced.refreshSubmodules(),
-    advanced.refreshCommitMessages(),
-  ]);
+  await runUiAction("advanced.refresh", async () => {
+    await Promise.allSettled([
+      advanced.refreshWorktrees(),
+      advanced.refreshStashes(),
+      advanced.refreshSubmodules(),
+      advanced.refreshCommitMessages(),
+    ]);
+  });
+}
+
+async function refreshAfterRemoteAction() {
+  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+  branches.syncUpstreamDraft();
+  syncOperationTargets();
+  syncSelectedRemote();
+}
+
+async function executeRemoteAction(action: "fetch" | "pull" | "push", options: { smartMerge?: boolean } = {}) {
+  const result = await remote.run(action, options);
+  await refreshAfterRemoteAction();
+  if (action === "pull" && result && !result.ok) {
+    await openFirstPullConflict();
+  }
+  return result;
 }
 
 async function runRemoteAction(action: "fetch" | "pull" | "push") {
-  await remote.run(action);
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  branches.syncUpstreamDraft();
-  syncOperationTargets();
-  syncSelectedRemote();
+  const actionKey = remoteActionKey(action);
+  if (isUiActionPending(actionKey)) return;
+  if (action === "push") {
+    confirmRemotePush();
+    return;
+  }
+  await runUiAction(actionKey, async () => {
+    if (action === "pull") {
+      const preview = await remote.previewPull();
+      if (!preview) return;
+      operations.mergeTarget = preview.target;
+      if (preview.needsConfirmation) {
+        pullConfirmDialog.value = {
+          preview,
+          loading: false,
+        };
+        return;
+      }
+    }
+
+    await executeRemoteAction(action);
+  });
+}
+
+async function runRemoteActionFromPointer(event: PointerEvent, action: "fetch" | "pull" | "push") {
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  event.preventDefault();
+  await runRemoteAction(action);
 }
 
 async function fetchAllRepositories() {
-  await remote.fetchAllRepositories();
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  branches.syncUpstreamDraft();
-  syncOperationTargets();
-  syncSelectedRemote();
+  if (isUiActionPending("remote.fetchAll")) return;
+  await runUiAction("remote.fetchAll", async () => {
+    await remote.fetchAllRepositories();
+    await refreshAfterRemoteAction();
+  });
+}
+
+async function fetchAllRepositoriesFromPointer(event: PointerEvent) {
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  event.preventDefault();
+  await fetchAllRepositories();
+}
+
+function cancelPullConfirmDialog() {
+  if (pullConfirmDialog.value?.loading) return;
+  pullConfirmDialog.value = null;
+}
+
+async function confirmPullSmartMerge() {
+  const dialog = pullConfirmDialog.value;
+  if (!dialog || dialog.loading) return;
+
+  dialog.loading = true;
+  operations.mergeTarget = dialog.preview.target;
+  try {
+    await executeRemoteAction("pull", { smartMerge: true });
+    pullConfirmDialog.value = null;
+  } catch (error) {
+    const message = String(error);
+    pullConfirmDialog.value = null;
+    clearErrorSources();
+    showErrorDialog(message);
+  }
 }
 
 function clearAutoFetchTimer() {
@@ -1507,18 +1819,27 @@ async function runAutoFetch() {
 }
 
 async function resolveRejectedPush(strategy: "merge" | "rebase") {
-  const target = remote.lastRejectedTarget || remote.pushTargetRef();
-  const remoteName = remote.selectedRemote || "origin";
-  const upstream = `${remoteName}/${target}`;
-  await remote.run("fetch");
-  if (strategy === "merge") {
-    operations.mergeTarget = upstream;
-    await operations.merge();
-  } else {
-    operations.rebaseTarget = upstream;
-    await operations.rebase();
-  }
-  await reloadAfterGitOperation();
+  await runUiAction(`remote.resolve.${strategy}`, async () => {
+    const target = remote.lastRejectedTarget || remote.pushTargetRef();
+    const remoteName = remote.selectedRemote || "origin";
+    const upstream = `${remoteName}/${target}`;
+    await remote.run("fetch");
+    if (strategy === "merge") {
+      operations.mergeTarget = upstream;
+      await operations.merge();
+    } else {
+      operations.rebaseTarget = upstream;
+      await operations.rebase();
+    }
+    await reloadAfterGitOperation();
+  });
+}
+
+async function openFirstPullConflict() {
+  const firstConflict = operations.conflictedPaths[0];
+  if (!firstConflict) return;
+  workbenchMode.value = "changes";
+  await selectConflict(firstConflict);
 }
 
 function syncRemoteDraft() {
@@ -1527,85 +1848,121 @@ function syncRemoteDraft() {
 }
 
 async function saveRemoteConfig() {
-  await remote.saveRemote();
-  syncSelectedRemote(true);
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  branches.syncUpstreamDraft();
-  syncOperationTargets();
+  await runUiAction("remote.save", async () => {
+    await remote.saveRemote();
+    syncSelectedRemote(true);
+    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    branches.syncUpstreamDraft();
+    syncOperationTargets();
+  });
 }
 
 async function deleteSelectedRemote() {
   if (!remote.selectedRemote) return;
   if (!window.confirm(`删除远程 ${remote.selectedRemote}？`)) return;
-  await remote.deleteSelectedRemote();
-  syncSelectedRemote(true);
-  await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-  branches.syncUpstreamDraft(true);
-  syncOperationTargets();
+  await runUiAction("remote.delete", async () => {
+    await remote.deleteSelectedRemote();
+    syncSelectedRemote(true);
+    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    branches.syncUpstreamDraft(true);
+    syncOperationTargets();
+  });
 }
 
 async function unshallowCurrentRepository() {
-  await advanced.unshallow(remote.selectedRemote || undefined);
-  await reloadAfterGitOperation();
+  await runUiAction("advanced.unshallow", async () => {
+    await advanced.unshallow(remote.selectedRemote || undefined);
+    await reloadAfterGitOperation();
+  });
 }
 
 async function renameSelectedBranch() {
   if (!advanced.branchRenameFrom || !advanced.branchRenameTo.trim()) return;
   if (!window.confirm(`将分支 ${advanced.branchRenameFrom} 重命名为 ${advanced.branchRenameTo.trim()}？`)) return;
-  await advanced.renameSelectedBranch();
-  await loadCurrentRepository();
+  await runUiAction("advanced.branch.rename", async () => {
+    await advanced.renameSelectedBranch();
+    await loadCurrentRepository();
+  });
 }
 
 async function cleanupMergedBranches() {
   const target = branch.value?.currentBranch || "HEAD";
   if (!window.confirm(`清理已合并到 ${target} 的本地分支？`)) return;
-  await advanced.cleanupMerged(target);
-  await loadCurrentRepository();
+  await runUiAction("advanced.branch.cleanup", async () => {
+    await advanced.cleanupMerged(target);
+    await loadCurrentRepository();
+  });
 }
 
 async function runRefComparison() {
-  await advanced.loadComparison();
+  await runUiAction("advanced.compare", () => advanced.loadComparison());
 }
 
 async function generatePatch(staged = false) {
-  await advanced.generatePatch(staged);
+  await runUiAction(staged ? "advanced.patch.staged" : "advanced.patch.worktree", () =>
+    advanced.generatePatch(staged),
+  );
 }
 
 async function applyPatchDraft() {
-  await advanced.applyPatchDraft();
-  await reloadAfterGitOperation();
+  await runUiAction("advanced.patch.apply", async () => {
+    await advanced.applyPatchDraft();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function createWorktreeFromDraft() {
-  await advanced.createWorktreeFromDraft();
-  await loadAdvancedSnapshots();
+  await runUiAction("advanced.worktree.create", async () => {
+    await advanced.createWorktreeFromDraft();
+    await loadAdvancedSnapshots();
+  });
 }
 
 async function removeWorktree(path: string) {
   if (!window.confirm(`移除工作树 ${path}？`)) return;
-  await advanced.removeWorktreePath(path, true);
-  await loadAdvancedSnapshots();
+  await runUiAction(`advanced.worktree.remove:${path}`, async () => {
+    await advanced.removeWorktreePath(path, true);
+    await loadAdvancedSnapshots();
+  });
 }
 
 async function runStashAction(stashRef: string, action: "apply" | "pop" | "drop") {
   if (action === "drop" && !window.confirm(`删除 ${stashRef}？`)) return;
-  await advanced.runStashAction(stashRef, action);
-  await reloadAfterGitOperation();
+  await runUiAction(`advanced.stash.${action}:${stashRef}`, async () => {
+    await advanced.runStashAction(stashRef, action);
+    await reloadAfterGitOperation();
+  });
 }
 
 async function clearAllStashes() {
   if (!window.confirm("清空所有贮藏记录？")) return;
-  await advanced.clearAllStashes();
-  await loadAdvancedSnapshots();
+  await runUiAction("advanced.stash.clear", async () => {
+    await advanced.clearAllStashes();
+    await loadAdvancedSnapshots();
+  });
 }
 
 async function updateAllSubmodules() {
-  await advanced.updateAllSubmodules();
-  await reloadAfterGitOperation();
+  await runUiAction("advanced.submodule.update", async () => {
+    await advanced.updateAllSubmodules();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function loadLfsStatus() {
-  await advanced.refreshLfsStatus();
+  await runUiAction("advanced.lfs", () => advanced.refreshLfsStatus());
+}
+
+async function loadSelectedFileHistory() {
+  const selectedFile = changes.selectedFile;
+  if (!selectedFile) return;
+  await runUiAction("advanced.fileHistory", () => advanced.loadFileHistory(selectedFile));
+}
+
+async function loadSelectedBlame() {
+  const selectedFile = changes.selectedFile;
+  if (!selectedFile) return;
+  await runUiAction("advanced.blame", () => advanced.loadBlame(selectedFile));
 }
 
 function selectSide(side: ChangeSide) {
@@ -1653,22 +2010,45 @@ function startPanelResize(panel: LayoutPanelKey, event: PointerEvent) {
   window.addEventListener("pointercancel", stopResize);
 }
 
-function selectFile(file: ChangedFile, side: ChangeSide) {
-  if (!file.conflicted && operations.conflict) {
-    operations.conflict = null;
-    operations.resultDraft = "";
-    operations.resultDirty = false;
-    operations.selectedConflictPath = "";
+function clearMergeConflictView() {
+  if (!operations.conflict && !operations.selectedConflictPath) return;
+  operations.conflict = null;
+  operations.resultDraft = "";
+  operations.resultDirty = false;
+  operations.selectedConflictPath = "";
+}
+
+function openMergeConflictView(path: string) {
+  if (operations.conflict?.path === path && operations.selectedConflictPath === path) return;
+  operations.loadConflict(path).catch(() => undefined);
+}
+
+function selectFile(file: ChangedFile, side: ChangeSide, options: { openConflict?: boolean } = {}) {
+  if (!file.conflicted) {
+    clearMergeConflictView();
+    changes.selectFile(file, side);
+    return;
   }
+
   changes.selectFile(file, side);
+  if (options.openConflict ?? true) {
+    workbenchMode.value = "changes";
+    openMergeConflictView(file.path);
+  }
 }
 
 function selectChangeFileForContext(file: ChangedFile, side: ChangeSide) {
+  if (file.conflicted) {
+    selectFile(file, side);
+    return;
+  }
+
   if (!changes.selectedPaths.includes(file.path)) {
     selectFile(file, side);
     return;
   }
 
+  clearMergeConflictView();
   changes.selectedFile = file.path;
   changes.selectedSide = side;
   settings.setSide(side);
@@ -1967,103 +2347,225 @@ function scrollSideBySideHunkIntoView(container: HTMLElement | null, hunkIndex: 
 }
 
 function pickFirstAvailable(side: ChangeSide) {
-  const preferred = changes.filesForSide(side);
+  const preferred = filesForChangeSide(side);
   const fallbackSide: ChangeSide = side === "staged" ? "unstaged" : "staged";
-  const fallback = changes.filesForSide(fallbackSide);
+  const fallback = filesForChangeSide(fallbackSide);
   const nextSide = preferred.length > 0 ? side : fallbackSide;
   const file = preferred[0] ?? fallback[0];
   if (file) {
     selectFile(file, nextSide);
   } else {
+    clearMergeConflictView();
     changes.selectedFile = null;
     changes.selectedPaths = [];
     diff.current = null;
   }
 }
 
-async function runAndReload(action: () => Promise<unknown>) {
-  await action();
-  await diff.loadSelected();
+function filesForChangeSide(side: ChangeSide) {
+  const files = changes.filesForSide(side);
+  if (side !== "unstaged") return files;
+
+  const paths = new Set(files.map((file) => file.path));
+  const conflicted = changes.files.filter((file) => file.conflicted && !paths.has(file.path));
+  return conflicted.length > 0 ? [...files, ...conflicted] : files;
+}
+
+async function runAndReload(action: () => Promise<unknown>, key?: string) {
+  const runner = async () => {
+    await action();
+    await diff.loadSelected();
+  };
+  if (key) {
+    await runUiAction(key, runner);
+    return;
+  }
+  await runner();
+}
+
+async function stageSelected() {
+  await runAndReload(() => changes.stageSelected(), "changes.stage");
+}
+
+async function unstageSelected() {
+  await runAndReload(() => changes.unstageSelected(), "changes.unstage");
 }
 
 async function discardSelected() {
   if (changes.activePaths.length === 0) return;
   if (!window.confirm("回滚选中的本地变更？")) return;
-  await runAndReload(() => changes.discardSelected());
+  await runAndReload(() => changes.discardSelected(), "changes.discard");
 }
 
 async function shelveSelected() {
-  await runAndReload(() => changes.shelveSelected(shelveMessage.value));
+  await runAndReload(() => changes.shelveSelected(shelveMessage.value), "changes.shelve");
   shelveMessage.value = "";
 }
 
 async function deleteShelfRecord(record: ShelfInfo) {
   if (!window.confirm(`删除搁置 ${record.message}？`)) return;
-  await runAndReload(() => changes.deleteShelfRecord(record));
+  await runAndReload(() => changes.deleteShelfRecord(record), `changes.shelf.delete:${record.id ?? record.stashRef}`);
 }
 
-function setDirectWorktreeCommitPolicy(policy: DirectWorktreeCommitPolicy) {
-  settings.setDirectWorktreeCommitPolicy(policy);
+async function unshelveRecord(record: ShelfInfo) {
+  if (record.appliedAt) return;
+  await runAndReload(() => changes.unshelveRecord(record), `changes.shelf.restore:${record.id ?? record.stashRef}`);
 }
 
-function promptWorktreeCommit(pushAfter: boolean) {
-  return new Promise<WorktreeCommitChoice>((resolve) => {
-    worktreeCommitDialog.value = { pushAfter, resolve };
-  });
+function currentCommitBranchLabel() {
+  return branch.value?.currentBranch || repos.current?.branch || "游离 HEAD";
 }
 
-function answerWorktreeCommitDialog(choice: WorktreeCommitChoice) {
-  const dialog = worktreeCommitDialog.value;
-  if (!dialog) return;
-
-  dialog.resolve(choice);
-  worktreeCommitDialog.value = null;
+function selectedCommitOptionLabels() {
+  const options: string[] = [];
+  if (commit.amend) options.push("修正上次提交");
+  if (commit.signOff) options.push("追加签署");
+  if (commit.gpgSign) options.push("GPG 签名");
+  if (commit.author.trim()) options.push(`覆盖作者：${commit.author.trim()}`);
+  return options;
 }
 
-function cancelWorktreeCommitDialog() {
-  answerWorktreeCommitDialog("cancel");
+function selectedPushOptionLabels() {
+  const options: string[] = [];
+  if (remote.setUpstream) options.push("设置上游");
+  if (remote.forceWithLease) options.push("安全强推");
+  if (remote.pushTags) options.push("同步标签");
+  if (remote.isProtectedTarget()) {
+    options.push(remote.allowProtectedPush ? "允许保护分支推送" : "保护分支检查");
+  }
+  return options;
 }
 
-function rejectDirectWorktreeCommit() {
-  commit.error = "没有可提交的暂存更改。请先暂存更改后再提交。";
+function cancelSubmitConfirmDialog() {
+  if (submitConfirmDialog.value?.loading) return;
+  submitConfirmDialog.value = null;
 }
 
-async function resolveDirectWorktreeCommit(pushAfter: boolean) {
-  if (!worktreeOnlyCommit.value) return false;
+function isSubmitConfirmDirectoryExpanded(path: string) {
+  return expandedSubmitConfirmDirectories.value[path] ?? true;
+}
 
-  if (settings.directWorktreeCommitPolicy === "always") return true;
-  if (settings.directWorktreeCommitPolicy === "never") {
-    rejectDirectWorktreeCommit();
-    return null;
+function toggleSubmitConfirmDirectory(path: string) {
+  expandedSubmitConfirmDirectories.value = {
+    ...expandedSubmitConfirmDirectories.value,
+    [path]: !isSubmitConfirmDirectoryExpanded(path),
+  };
+}
+
+function stringifyError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function containsChinese(text: string) {
+  return /[\u4e00-\u9fff]/.test(text);
+}
+
+function translateGitError(error: unknown) {
+  const raw = stringifyError(error).trim();
+  const lower = raw.toLowerCase();
+
+  if (
+    lower.includes("non-fast-forward") ||
+    lower.includes("[rejected]") ||
+    lower.includes("fetch first") ||
+    lower.includes("failed to push some refs") ||
+    lower.includes("current branch is behind") ||
+    lower.includes("tip of your current branch is behind")
+  ) {
+    return "推送失败：远程分支已有新的提交，本地分支落后于远程。请先拉取远程更新，完成合并或变基后再推送。";
   }
 
-  const choice = await promptWorktreeCommit(pushAfter);
-  if (choice === "yes") return true;
-  if (choice === "always") {
-    setDirectWorktreeCommitPolicy("always");
-    return true;
-  }
-  if (choice === "never") {
-    setDirectWorktreeCommitPolicy("never");
-    rejectDirectWorktreeCommit();
+  if (lower.includes("permission denied") || lower.includes("publickey")) {
+    return "认证失败：当前 SSH 密钥或账号没有访问远程仓库的权限。请检查远程地址、SSH 密钥和仓库权限后重试。";
   }
 
-  return null;
+  if (lower.includes("authentication failed") || lower.includes("could not read username")) {
+    return "认证失败：远程仓库需要有效账号或访问令牌。请检查 Git 凭据后重试。";
+  }
+
+  if (lower.includes("repository not found")) {
+    return "远程仓库不存在或当前账号没有访问权限。请检查远程地址和仓库权限。";
+  }
+
+  if (lower.includes("could not resolve host")) {
+    return "网络连接失败：无法解析远程仓库域名。请检查网络或 DNS 后重试。";
+  }
+
+  if (lower.includes("failed to connect") || lower.includes("timed out") || lower.includes("timeout")) {
+    return "网络连接超时：无法连接远程仓库。请检查网络状态后重试。";
+  }
+
+  if (containsChinese(raw)) {
+    return raw.replace(/^error:\s*/i, "").trim();
+  }
+
+  return "操作失败：Git 返回了无法识别的错误。请检查远程仓库状态、网络和权限后重试。";
 }
 
-async function commitCurrent(pushAfter = false) {
+function commitCurrent(pushAfter = false) {
   if (commitBusy.value || !canCommit.value || (pushAfter && !remote.selectedRemote)) return;
   commit.error = "";
-  const includeWorktree = await resolveDirectWorktreeCommit(pushAfter);
-  if (includeWorktree === null || !canCommit.value || (pushAfter && !remote.selectedRemote)) return;
+  const paths = [...selectedCommitPaths.value];
+  if (paths.length === 0) {
+    commit.error = "请先勾选要提交的文件。";
+    return;
+  }
 
-  pendingCommitAction.value = pushAfter ? "push" : "commit";
+  submitConfirmDialog.value = {
+    mode: pushAfter ? "commit-push" : "commit",
+    paths,
+    message: commit.message.trim(),
+    remoteName: pushAfter ? remote.selectedRemote : "",
+    currentBranch: currentCommitBranchLabel(),
+    targetBranch: pushAfter ? currentCommitBranchLabel() : "",
+    options: selectedCommitOptionLabels(),
+    loading: false,
+  };
+  expandedSubmitConfirmDirectories.value = {};
+}
+
+function confirmRemotePush() {
+  if (!repos.current || remote.loading) return;
+  submitConfirmDialog.value = {
+    mode: "push",
+    paths: [],
+    message: "",
+    remoteName: remote.selectedRemote || "origin",
+    currentBranch: currentCommitBranchLabel(),
+    targetBranch: remote.pushTargetRef(),
+    options: selectedPushOptionLabels(),
+    loading: false,
+  };
+  expandedSubmitConfirmDirectories.value = {};
+}
+
+async function confirmSubmitAction() {
+  const dialog = submitConfirmDialog.value;
+  if (!dialog || dialog.loading) return;
+
+  dialog.loading = true;
   try {
-    await commit.commit(pushAfter ? remote.selectedRemote || undefined : undefined, includeWorktree);
-    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-    syncOperationTargets();
+    if (dialog.mode === "push") {
+      await runUiAction(remoteActionKey("push"), async () => {
+        await executeRemoteAction("push");
+      });
+    } else {
+      pendingCommitAction.value = dialog.mode === "commit-push" ? "push" : "commit";
+      await commit.commit(dialog.mode === "commit-push" ? dialog.remoteName || undefined : undefined, false, dialog.paths);
+      await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+      syncOperationTargets();
+    }
+    submitConfirmDialog.value = null;
+  } catch (error) {
+    const message = translateGitError(error);
+    clearErrorSources();
+    submitConfirmDialog.value = null;
+    showErrorDialog(message);
   } finally {
     pendingCommitAction.value = null;
+    if (submitConfirmDialog.value === dialog) {
+      dialog.loading = false;
+    }
   }
 }
 
@@ -2266,8 +2768,10 @@ function projectKeywords(language: string) {
 
 function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEditorHunkView {
   const parsed = parseProjectHunkPatch(hunk, language);
-  const lineStart = Math.max(1, hunk.newStart || 1);
-  const lineCount = Math.max(1, hunk.newLines || 0);
+  const fallbackLineStart = Math.max(1, hunk.newStart || 1);
+  const lineStart = parsed.changedNewStart ?? fallbackLineStart;
+  const changedNewEnd = parsed.changedNewEnd ?? lineStart;
+  const lineCount = Math.max(1, changedNewEnd - lineStart + 1);
   const tone =
     parsed.deletedLines > 0 && parsed.addedLines > 0
       ? "modified"
@@ -2281,6 +2785,10 @@ function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEd
     tone,
     lineStart,
     lineCount,
+    changedNewStart: lineStart,
+    changedNewEnd,
+    changedOldStart: parsed.changedOldStart,
+    changedOldEnd: parsed.changedOldEnd,
     oldStart: hunk.oldStart,
     oldLines: hunk.oldLines,
     newStart: hunk.newStart,
@@ -2294,14 +2802,31 @@ function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEd
 function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
   const originalLines: ProjectOriginalLine[] = [];
   let oldLineNumber = hunk.oldStart;
+  let newLineNumber = hunk.newStart;
   let inHunk = false;
   let addedLines = 0;
   let deletedLines = 0;
+  let changedOldStart: number | null = null;
+  let changedOldEnd: number | null = null;
+  let changedNewStart: number | null = null;
+  let changedNewEnd: number | null = null;
+
+  const markOldLine = (lineNumber: number) => {
+    changedOldStart = changedOldStart === null ? lineNumber : Math.min(changedOldStart, lineNumber);
+    changedOldEnd = changedOldEnd === null ? lineNumber : Math.max(changedOldEnd, lineNumber);
+  };
+  const markNewLine = (lineNumber: number) => {
+    const normalizedLineNumber = Math.max(1, lineNumber);
+    changedNewStart =
+      changedNewStart === null ? normalizedLineNumber : Math.min(changedNewStart, normalizedLineNumber);
+    changedNewEnd = changedNewEnd === null ? normalizedLineNumber : Math.max(changedNewEnd, normalizedLineNumber);
+  };
 
   for (const line of hunk.patch.split("\n")) {
     if (line.startsWith("@@ ")) {
       inHunk = true;
       oldLineNumber = hunk.oldStart;
+      newLineNumber = hunk.newStart;
       continue;
     }
     if (!inHunk || line.startsWith("\\ No newline")) continue;
@@ -2309,6 +2834,8 @@ function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
     const prefix = line.charAt(0);
     const content = line.slice(1);
     if (prefix === "-") {
+      markOldLine(oldLineNumber);
+      markNewLine(newLineNumber);
       originalLines.push({
         index: originalLines.length,
         lineNumber: oldLineNumber,
@@ -2318,13 +2845,24 @@ function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
       oldLineNumber += 1;
       deletedLines += 1;
     } else if (prefix === "+") {
+      markNewLine(newLineNumber);
       addedLines += 1;
+      newLineNumber += 1;
     } else if (prefix === " ") {
       oldLineNumber += 1;
+      newLineNumber += 1;
     }
   }
 
-  return { originalLines, addedLines, deletedLines };
+  return {
+    originalLines,
+    addedLines,
+    deletedLines,
+    changedOldStart,
+    changedOldEnd,
+    changedNewStart,
+    changedNewEnd,
+  };
 }
 
 function projectEditorHunkMarkerStyle(hunk: ProjectEditorHunkView) {
@@ -2357,9 +2895,16 @@ function projectEditorOriginalPanelStyle(hunk: ProjectEditorHunkView) {
 }
 
 function projectEditorHunkTitle(hunk: ProjectEditorHunkView) {
-  const currentEnd = hunk.newLines > 0 ? hunk.newStart + hunk.newLines - 1 : hunk.newStart;
-  const originalEnd = hunk.oldLines > 0 ? hunk.oldStart + hunk.oldLines - 1 : hunk.oldStart;
-  return `当前 ${hunk.newStart}-${currentEnd}，原本 ${hunk.oldStart}-${originalEnd}`;
+  const currentRange = formatProjectLineRange(hunk.changedNewStart, hunk.changedNewEnd);
+  const originalRange =
+    hunk.changedOldStart === null || hunk.changedOldEnd === null
+      ? "新增"
+      : formatProjectLineRange(hunk.changedOldStart, hunk.changedOldEnd);
+  return `当前 ${currentRange}，原本 ${originalRange}`;
+}
+
+function formatProjectLineRange(start: number, end: number) {
+  return start === end ? `${start}` : `${start}-${end}`;
 }
 
 function toggleProjectEditorHunk(index: number) {
@@ -3234,8 +3779,10 @@ async function checkoutLogRefFromContext(menu: LogRefContextMenu | null) {
   if (!tag) return;
   if (!window.confirm(`检出标签 ${tag.name} 为游离 HEAD？`)) return;
   closeLogRefContextMenu();
-  await advanced.checkoutDetached(tag.name);
-  await loadCurrentRepository();
+  await runUiAction("advanced.checkoutDetached", async () => {
+    await advanced.checkoutDetached(tag.name);
+    await loadCurrentRepository();
+  });
 }
 
 async function createBranchFromLogRefContext(menu: LogRefContextMenu | null) {
@@ -3248,8 +3795,10 @@ async function createBranchFromLogRefContext(menu: LogRefContextMenu | null) {
   const previousFilter = history.branchFilter;
   history.branchFilter = name;
   try {
-    await branches.create(name, true, startPoint);
-    await loadCurrentRepository();
+    await runUiAction(branchActionKey("create"), async () => {
+      await branches.create(name, true, startPoint);
+      await loadCurrentRepository();
+    });
   } catch (error) {
     history.branchFilter = previousFilter;
     throw error;
@@ -3265,11 +3814,13 @@ async function renameLogBranchFromContext(menu: LogRefContextMenu | null) {
   );
   if (!newName || newName === branchItem.name) return;
   if (!window.confirm(`将分支 ${branchItem.name} 重命名为 ${newName}？`)) return;
-  await branches.rename(branchItem.name, newName);
-  if (history.branchFilter === branchItem.name) {
-    history.branchFilter = newName;
-  }
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("rename", branchItem.fullName), async () => {
+    await branches.rename(branchItem.name, newName);
+    if (history.branchFilter === branchItem.name) {
+      history.branchFilter = newName;
+    }
+    await loadCurrentRepository();
+  });
 }
 
 async function deleteLogRefFromContext(menu: LogRefContextMenu | null) {
@@ -3287,12 +3838,14 @@ async function deleteLogRefFromContext(menu: LogRefContextMenu | null) {
     if (history.branchFilter === refName) history.branchFilter = "";
     closeLogRefContextMenu();
     try {
-      if (branchItem.branchType === "remote") {
-        await branches.deleteRemote(branchItem.name);
-      } else {
-        await branches.delete(branchItem.name, false);
-      }
-      await loadCurrentRepository();
+      await runUiAction(branchActionKey("delete", branchItem.fullName), async () => {
+        if (branchItem.branchType === "remote") {
+          await branches.deleteRemote(branchItem.name);
+        } else {
+          await branches.delete(branchItem.name, false);
+        }
+        await loadCurrentRepository();
+      });
     } catch (error) {
       history.branchFilter = previousFilter;
       throw error;
@@ -3304,8 +3857,10 @@ async function deleteLogRefFromContext(menu: LogRefContextMenu | null) {
   if (history.branchFilter === refName) history.branchFilter = "";
   closeLogRefContextMenu();
   try {
-    await branches.deleteTag(tag.name);
-    await loadCurrentRepository();
+    await runUiAction(branchActionKey("tag.delete", tag.name), async () => {
+      await branches.deleteTag(tag.name);
+      await loadCurrentRepository();
+    });
   } catch (error) {
     history.branchFilter = previousFilter;
     throw error;
@@ -3318,8 +3873,10 @@ async function mergeLogRefIntoCurrent(menu: LogRefContextMenu | null) {
   if (!window.confirm(`将 ${target} 合并到当前分支？`)) return;
   closeLogRefContextMenu();
   operations.mergeTarget = target;
-  await operations.merge();
-  await reloadAfterGitOperation();
+  await runUiAction("operation.merge", async () => {
+    await operations.merge();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function rebaseCurrentOntoLogRef(menu: LogRefContextMenu | null) {
@@ -3328,8 +3885,10 @@ async function rebaseCurrentOntoLogRef(menu: LogRefContextMenu | null) {
   if (!window.confirm(`将当前分支变基到 ${target}？`)) return;
   closeLogRefContextMenu();
   operations.rebaseTarget = target;
-  await operations.rebase();
-  await reloadAfterGitOperation();
+  await runUiAction("operation.rebase", async () => {
+    await operations.rebase();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function setCurrentBranchUpstreamFromContext(menu: LogRefContextMenu | null) {
@@ -3338,8 +3897,10 @@ async function setCurrentBranchUpstreamFromContext(menu: LogRefContextMenu | nul
   if (!target || !current || menu?.kind !== "remote") return;
   if (!window.confirm(`将 ${current} 的上游设置为 ${target}？`)) return;
   closeLogRefContextMenu();
-  await branches.setUpstream(current, target);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("upstream.set", current), async () => {
+    await branches.setUpstream(current, target);
+    await loadCurrentRepository();
+  });
 }
 
 function toggleLogRefFavoriteFromContext(menu: LogRefContextMenu | null) {
@@ -3397,10 +3958,12 @@ async function createLogBranchFromHead() {
   logRefPanelCollapsed.value = false;
   const name = await promptProjectName("新建分支", "", validateBranchName);
   if (!name) return;
-  await branches.create(name, true);
-  await loadCurrentRepository();
-  history.branchFilter = name;
-  await history.refresh().catch(() => undefined);
+  await runUiAction(branchActionKey("create"), async () => {
+    await branches.create(name, true);
+    await loadCurrentRepository();
+    history.branchFilter = name;
+    await history.refresh().catch(() => undefined);
+  });
 }
 
 async function deleteActiveLogBranch() {
@@ -3691,12 +4254,18 @@ function formatCommitFileStatusCode(status = "") {
   return labels[code] ?? status;
 }
 
+function formatSubmitConfirmFileStatus(status = "") {
+  return status.length === 1 ? formatCommitFileStatusCode(status) : formatStatusKind(status);
+}
+
 function buildSideBySideDiffRows(response: DiffResponse | null, language: string): SideBySideDiffRow[] {
-  if (!response?.text) return [];
+  if (!response) return [];
 
   const rows: SideBySideDiffRow[] = [];
   let rowIndex = 0;
   const anchoredHunks = new Set<number>();
+  const hasCompleteText = hasCompleteDiffText(response);
+  if (!response.text.trim() && !hasCompleteText) return [];
 
   const emptyCell = (): SideBySideDiffCell => ({
     lineNumber: null,
@@ -3806,7 +4375,7 @@ function buildSideBySideDiffRows(response: DiffResponse | null, language: string
 
       if (line.startsWith("\\")) {
         flushChanges();
-        pushRow(emptyCell(), diffCell(null, line, "meta"), "meta", hunkIndex);
+        pushRow(emptyCell(), diffCell(null, formatUnifiedDiffMetaLine(line), "meta"), "meta", hunkIndex);
       }
     }
 
@@ -3814,10 +4383,6 @@ function buildSideBySideDiffRows(response: DiffResponse | null, language: string
     return { oldLine: Math.max(oldLine, 1), newLine: Math.max(newLine, 1) };
   };
 
-  const hasCompleteText =
-    response.oldText !== undefined &&
-    response.newText !== undefined &&
-    (response.oldText !== null || response.newText !== null);
   if (hasCompleteText) {
     const oldLines = splitFileContentLines(response.oldText ?? "");
     const newLines = splitFileContentLines(response.newText ?? "");
@@ -3865,6 +4430,23 @@ function buildSideBySideDiffRows(response: DiffResponse | null, language: string
   return rows;
 }
 
+function hasDisplayableDiffContent(response: DiffResponse | null | undefined) {
+  return Boolean(response?.text?.trim()) || hasCompleteDiffText(response);
+}
+
+function hasCompleteDiffText(response: DiffResponse | null | undefined) {
+  return (
+    response?.oldText !== undefined &&
+    response?.newText !== undefined &&
+    (response.oldText !== null || response.newText !== null)
+  );
+}
+
+function formatUnifiedDiffMetaLine(line: string) {
+  if (line.startsWith("\\ No newline")) return "文件末尾缺少换行符";
+  return line;
+}
+
 function splitFileContentLines(content: string) {
   if (!content) return [];
   const lines = content.split("\n");
@@ -3884,10 +4466,6 @@ function formatOperationName(name?: string | null) {
   return name ? (operationKindLabels[name] ?? name) : "冲突";
 }
 
-function formatResetMode(mode: string) {
-  return resetModeLabels[mode] ?? mode;
-}
-
 function formatWorktreeLabel(item: { branch?: string | null; detached?: boolean }) {
   return item.branch || (item.detached ? "游离状态" : "工作树");
 }
@@ -3901,188 +4479,141 @@ async function selectCommit(oid: string) {
 async function checkoutSelectedBranch(branch: BranchInfo) {
   if (branch.current) return;
   if (!changes.branch?.clean && !window.confirm("当前有未提交变更，仍然尝试切换分支？")) return;
-  if (branch.branchType === "remote") {
-    await branches.checkoutRemote(branch.name);
-  } else {
-    await branches.checkout(branch.name);
-  }
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("checkout", branch.fullName), async () => {
+    if (branch.branchType === "remote") {
+      await branches.checkoutRemote(branch.name);
+    } else {
+      await branches.checkout(branch.name);
+    }
+    await loadCurrentRepository();
+  });
 }
 
 async function createBranchFromHead() {
   const name = newBranchName.value.trim();
   if (!name) return;
-  await branches.create(name, true);
-  newBranchName.value = "";
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("create"), async () => {
+    await branches.create(name, true);
+    newBranchName.value = "";
+    await loadCurrentRepository();
+  });
 }
 
 async function deleteLocalBranch(branch: BranchInfo) {
   if (branch.current) return;
   if (!window.confirm(`删除本地分支 ${branch.name}？`)) return;
-  await branches.delete(branch.name, false);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("delete", branch.fullName), async () => {
+    await branches.delete(branch.name, false);
+    await loadCurrentRepository();
+  });
 }
 
 async function deleteRemoteBranchItem(branch: BranchInfo) {
   if (branch.branchType !== "remote") return;
   if (!window.confirm(`删除远程分支 ${branch.name}？这会推送删除到远程仓库。`)) return;
-  await branches.deleteRemote(branch.name);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("delete", branch.fullName), async () => {
+    await branches.deleteRemote(branch.name);
+    await loadCurrentRepository();
+  });
 }
 
 async function createTagFromInput() {
   const name = newTagName.value.trim();
   if (!name) return;
-  await branches.createTag(
-    name,
-    newTagTarget.value.trim() || undefined,
-    annotatedTag.value,
-    tagMessage.value.trim() || undefined,
-  );
-  newTagName.value = "";
-  newTagTarget.value = "";
-  tagMessage.value = "";
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("tag.create", name), async () => {
+    await branches.createTag(
+      name,
+      newTagTarget.value.trim() || undefined,
+      annotatedTag.value,
+      tagMessage.value.trim() || undefined,
+    );
+    newTagName.value = "";
+    newTagTarget.value = "";
+    tagMessage.value = "";
+    await loadCurrentRepository();
+  });
 }
 
 async function deleteLocalTag(tag: TagInfo) {
   if (!window.confirm(`删除本地标签 ${tag.name}？`)) return;
-  await branches.deleteTag(tag.name);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("tag.delete", tag.name), async () => {
+    await branches.deleteTag(tag.name);
+    await loadCurrentRepository();
+  });
 }
 
 async function pushSelectedTag(tag: TagInfo) {
-  await branches.pushTag(tag.name, remote.selectedRemote || undefined);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("tag.push", tag.name), async () => {
+    await branches.pushTag(tag.name, remote.selectedRemote || undefined);
+    await loadCurrentRepository();
+  });
 }
 
 async function deleteSelectedRemoteTag(tag: TagInfo) {
   const remoteName = remote.selectedRemote || "origin";
   if (!window.confirm(`删除 ${remoteName} 上的标签 ${tag.name}？`)) return;
-  await branches.deleteRemoteTag(tag.name, remote.selectedRemote || undefined);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("tag.deleteRemote", tag.name), async () => {
+    await branches.deleteRemoteTag(tag.name, remote.selectedRemote || undefined);
+    await loadCurrentRepository();
+  });
 }
 
 async function setSelectedUpstream() {
   if (!branches.selectedLocalBranch || !branches.upstreamTarget) return;
-  await branches.setUpstream(branches.selectedLocalBranch, branches.upstreamTarget);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("upstream.set", branches.selectedLocalBranch), async () => {
+    await branches.setUpstream(branches.selectedLocalBranch, branches.upstreamTarget);
+    await loadCurrentRepository();
+  });
 }
 
 async function unsetSelectedUpstream() {
   if (!branches.selectedLocalBranch) return;
-  await branches.setUpstream(branches.selectedLocalBranch);
-  await loadCurrentRepository();
+  await runUiAction(branchActionKey("upstream.unset", branches.selectedLocalBranch), async () => {
+    await branches.setUpstream(branches.selectedLocalBranch);
+    await loadCurrentRepository();
+  });
 }
 
 async function mergeSelectedTarget() {
   if (!operations.mergeTarget) return;
   if (!window.confirm(`将 ${operations.mergeTarget} 合并到当前分支？`)) return;
-  await operations.merge();
-  await reloadAfterGitOperation();
+  await runUiAction("operation.merge", async () => {
+    await operations.merge();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function rebaseOntoSelectedTarget() {
   if (!operations.rebaseTarget) return;
   if (!window.confirm(`将当前分支变基到 ${operations.rebaseTarget}？`)) return;
-  await operations.rebase();
-  await reloadAfterGitOperation();
+  await runUiAction("operation.rebase", async () => {
+    await operations.rebase();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function rebaseWithAdvancedOptions() {
   if (!operations.rebaseTarget && !operations.rebaseRoot) return;
   if (!window.confirm("按当前高级参数执行变基？")) return;
-  await operations.rebaseWithAdvancedOptions();
-  await reloadAfterGitOperation();
+  await runUiAction("operation.rebaseAdvanced", async () => {
+    await operations.rebaseWithAdvancedOptions();
+    await reloadAfterGitOperation();
+  });
 }
 
 async function runOperationControl(action: "continue" | "abort" | "skip") {
-  if (action === "abort" && !window.confirm("终止当前 Git 操作？")) return;
-  await operations.control(action);
-  await reloadAfterGitOperation();
-}
-
-async function cherryPickSelectedCommit() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  if (!window.confirm(`cherry-pick ${oid.slice(0, 10)} 到当前分支？`)) return;
-  await operations.cherryPick(oid);
-  await reloadAfterGitOperation();
-}
-
-async function cherryPickSelectedFiles() {
-  const oid = history.selectedOid;
-  const files = selectedCommitFilePaths.value;
-  if (!oid || files.length === 0) return;
-  await operations.cherryPickFiles(oid, files);
-  workbenchMode.value = "changes";
-  await reloadAfterGitOperation();
-}
-
-async function revertSelectedCommit() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  const mode = operations.revertNoCommit ? "不自动提交" : "自动创建反向提交";
-  if (!window.confirm(`反向提交 ${oid.slice(0, 10)}？模式：${mode}`)) return;
-  await operations.revert(oid);
-  workbenchMode.value = "changes";
-  await reloadAfterGitOperation();
-}
-
-async function resetToSelectedCommit() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  const mode = operations.resetMode;
-  const warning =
-    mode === "hard"
-      ? "硬重置会丢弃工作区和暂存区里未保存到目标提交的改动。"
-      : mode === "soft"
-        ? "软重置会保留变更为已暂存状态。"
-        : "混合重置会保留变更到工作区。";
-  if (!window.confirm(`将当前分支${formatResetMode(mode)}到 ${oid.slice(0, 10)}？\n${warning}`)) return;
-  await operations.resetTo(oid);
-  await reloadAfterGitOperation();
-}
-
-async function undoLastCommit() {
-  const target = branch.value?.head?.slice(0, 10) ?? "HEAD";
-  const mode = operations.undoKeepStaged ? "暂存区" : "工作区";
-  if (!window.confirm(`撤销最后一次提交 ${target}？变更将保留在${mode}。`)) return;
-  await operations.undoLastCommit();
-  workbenchMode.value = "changes";
-  await reloadAfterGitOperation();
-}
-
-async function checkoutSelectedRevision() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  if (!window.confirm(`检出 ${oid.slice(0, 10)} 为游离 HEAD？`)) return;
-  await advanced.checkoutDetached(oid);
-  await loadCurrentRepository();
-}
-
-async function fixupSelectedCommit(squash = false) {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  const label = squash ? "压缩" : "修正";
-  if (!window.confirm(`用当前暂存区创建${label}提交到 ${oid.slice(0, 10)}？`)) return;
-  await advanced.fixupSelectedCommit(oid, squash);
-  await reloadAfterGitOperation();
-}
-
-async function dropSelectedCommit() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  if (!window.confirm(`从当前分支丢弃提交 ${oid.slice(0, 10)}？这会改写提交历史。`)) return;
-  await advanced.dropSelectedCommit(oid);
-  await reloadAfterGitOperation();
-}
-
-async function pushSelectedCommit() {
-  const oid = history.selectedOid;
-  if (!oid) return;
-  await advanced.pushSelectedCommit(oid, remote.selectedRemote || undefined, remote.targetBranch || undefined);
+  if (action === "abort") {
+    const operationLabel = formatOperationName(operations.activeOperation);
+    const message =
+      operations.activeOperation === "merge"
+        ? "中止当前合并？未应用的冲突处理结果会被丢弃，并恢复到合并前状态。"
+        : `终止当前${operationLabel}操作？`;
+    if (!window.confirm(message)) return;
+  }
+  await runUiAction(`operation.${action}`, async () => {
+    await operations.control(action);
+    await reloadAfterGitOperation();
+  });
 }
 
 function toggleCommitFile(path: string) {
@@ -4308,7 +4839,11 @@ function syncMergeEditorScroll(event: Event) {
 async function selectConflict(path: string) {
   const file = conflictedFiles.value.find((item) => item.path === path);
   if (file) {
-    selectFile(file, "unstaged");
+    selectFile(file, "unstaged", { openConflict: false });
+  } else {
+    changes.selectedFile = path;
+    changes.selectedSide = "unstaged";
+    settings.setSide("unstaged");
   }
   workbenchMode.value = "changes";
   await operations.loadConflict(path);
@@ -4321,11 +4856,24 @@ async function saveConflictResult(markResolved = false) {
   }
 }
 
-function acceptConflictSide(side: "ours" | "theirs") {
+function normalizeMergeDisplaySide(side: string | null | undefined, fallback: MergeDisplaySide): MergeDisplaySide {
+  return side === "ours" || side === "theirs" ? side : fallback;
+}
+
+function oppositeMergeDisplaySide(side: MergeDisplaySide): MergeDisplaySide {
+  return side === "ours" ? "theirs" : "ours";
+}
+
+function mergeConflictSideContent(conflict: ConflictDetails | null, side: MergeDisplaySide) {
+  if (!conflict) return "";
+  return side === "ours" ? (conflict.ours ?? "") : (conflict.theirs ?? "");
+}
+
+function acceptConflictSide(side: MergeDisplaySide) {
   operations.useAllConflictBlocks(side);
 }
 
-function acceptConflictBlock(index: number | null, side: "ours" | "theirs") {
+function acceptConflictBlock(index: number | null, side: MergeDisplaySide) {
   if (index === null) return;
   operations.replaceResultBlock(index, side);
 }
@@ -4335,17 +4883,16 @@ function mergeConflictBlockSelection(index: number | null): MergeConflictSelecti
   return (operations.resultBlockSelections[index] as MergeConflictSelection | undefined) ?? null;
 }
 
-function shouldAppendConflictBlock(index: number | null, side: "ours" | "theirs") {
+function shouldAppendConflictBlock(index: number | null, side: MergeDisplaySide) {
   const selection = mergeConflictBlockSelection(index);
   return Boolean(selection && selection !== "combined" && selection !== side);
 }
 
-function mergeConflictActionTitle(index: number | null, side: "ours" | "theirs") {
-  const sideLabel = side === "ours" ? "当前" : "传入";
+function mergeConflictActionTitle(index: number | null, side: MergeDisplaySide, sideLabel: string) {
   return shouldAppendConflictBlock(index, side) ? `追加${sideLabel}块到结果后` : `接受${sideLabel}块到结果`;
 }
 
-function applyConflictBlock(index: number | null, side: "ours" | "theirs") {
+function applyConflictBlock(index: number | null, side: MergeDisplaySide) {
   if (index === null) return;
   if (shouldAppendConflictBlock(index, side)) {
     operations.appendResultBlock(index, side);
@@ -4414,7 +4961,10 @@ function buildResultMergeConflictSnippets(
 ) {
   return blocks.flatMap((block) => {
     const selection = selections[block.index];
-    if (!selection || selection === "combined") {
+    if (selection === "combined") {
+      return [];
+    }
+    if (!selection) {
       return mergeConflictBlockSnippets(block);
     }
 
@@ -4436,7 +4986,7 @@ function buildComparedMergeConflictSnippets(
   return blocks
     .filter((block) => {
       const selection = selections[block.index];
-      return selection !== side;
+      return selection !== "combined" && selection !== side;
     })
     .map((block) => mergeConflictSnippet(block, side));
 }
@@ -4507,7 +5057,7 @@ function buildMergeConflictConnections(
   sourceRanges: Map<number, MergeConflictLineRange>,
   resultLines: MergeCodeLine[],
   source: "current" | "incoming",
-  sourceSide: "ours" | "theirs",
+  sourceSide: MergeDisplaySide,
 ) {
   const connections: MergeConflictConnection[] = [];
 
@@ -4726,6 +5276,185 @@ async function jumpMergeConflict(direction: -1 | 1) {
       </div>
     </Transition>
 
+    <div v-if="errorDialog" class="modal-backdrop" @click.self="dismissErrorDialog(errorDialog.id)">
+      <section
+        class="error-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label="错误提示"
+        tabindex="-1"
+        @keydown.esc.prevent="dismissErrorDialog(errorDialog.id)"
+      >
+        <header>
+          <h2>错误提示</h2>
+          <button class="icon-only-button" type="button" title="关闭" @click="dismissErrorDialog(errorDialog.id)">
+            <X :size="14" />
+          </button>
+        </header>
+        <p class="error-modal-message">{{ errorDialog.message }}</p>
+        <footer>
+          <button class="icon-button primary" type="button" autofocus @click="dismissErrorDialog(errorDialog.id)">
+            <Check :size="14" />
+            <span>知道了</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="pullConfirmDialog" class="modal-backdrop" @click.self="cancelPullConfirmDialog">
+      <section
+        class="pull-confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="确认拉取更新"
+        @keydown.esc.prevent="cancelPullConfirmDialog"
+      >
+        <header>
+          <div>
+            <h2>本地修改与远程更新重叠</h2>
+          </div>
+          <button
+            class="icon-only-button"
+            type="button"
+            title="关闭"
+            :disabled="pullConfirmDialog.loading"
+            @click="cancelPullConfirmDialog"
+          >
+            <X :size="14" />
+          </button>
+        </header>
+        <p>
+          {{ pullConfirmDialog.preview.target }} 将执行{{ pullConfirmModeLabel }}，并更新本地已修改的文件。
+          GitBox 可以先保护未提交修改，再执行智能合并；如果自动合并失败，会进入三栏合并编辑器。
+        </p>
+        <div class="pull-confirm-summary">
+          <span>{{ pullConfirmDialog.preview.remote }}</span>
+          <strong>{{ pullConfirmDialog.preview.target }}</strong>
+          <small>{{ pullConfirmDialog.preview.overlappingPaths.length }} 个重叠文件</small>
+        </div>
+        <div class="pull-confirm-file-list" aria-label="重叠文件">
+          <span v-for="path in pullConfirmFiles" :key="path">{{ path }}</span>
+          <span v-if="pullConfirmExtraCount > 0">还有 {{ pullConfirmExtraCount }} 个文件</span>
+        </div>
+        <footer>
+          <button class="icon-button" type="button" :disabled="pullConfirmDialog.loading" @click="cancelPullConfirmDialog">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button class="icon-button primary" type="button" :disabled="pullConfirmDialog.loading" @click="confirmPullSmartMerge">
+            <LoaderCircle v-if="pullConfirmDialog.loading" :size="14" class="button-spinner" />
+            <Check v-else :size="14" />
+            <span>{{ pullConfirmDialog.loading ? "合并中" : "智能合并" }}</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="submitConfirmDialog" class="modal-backdrop" @click.self="cancelSubmitConfirmDialog">
+      <section
+        class="submit-confirm-modal"
+        role="dialog"
+        aria-modal="true"
+        :aria-label="submitConfirmTitle"
+        tabindex="-1"
+        @keydown.esc.prevent="cancelSubmitConfirmDialog"
+      >
+        <header>
+          <div>
+            <h2>{{ submitConfirmTitle }}</h2>
+          </div>
+          <button
+            class="icon-only-button"
+            type="button"
+            title="关闭"
+            :disabled="submitConfirmDialog.loading"
+            @click="cancelSubmitConfirmDialog"
+          >
+            <X :size="14" />
+          </button>
+        </header>
+        <div class="submit-confirm-layout">
+          <div class="submit-confirm-left">
+            <div class="submit-confirm-summary">
+              <span>{{ submitConfirmDialog.mode === "commit" ? "目标分支" : "远程目标" }}</span>
+              <strong>{{ submitConfirmTargetLabel }}</strong>
+              <small v-if="submitConfirmDialog.paths.length">{{ submitConfirmDialog.paths.length }} 个文件</small>
+              <small v-else>当前分支</small>
+            </div>
+            <div class="submit-confirm-message">
+              <span>提交信息</span>
+              <strong v-if="submitConfirmDialog.message">{{ submitConfirmDialog.message }}</strong>
+              <strong v-else>推送当前分支</strong>
+            </div>
+            <div class="submit-confirm-meta">
+              <span>仓库</span>
+              <strong>{{ repos.name }}</strong>
+            </div>
+            <div class="submit-confirm-meta">
+              <span>当前分支</span>
+              <strong>{{ submitConfirmDialog.currentBranch }}</strong>
+            </div>
+            <div v-if="submitConfirmDialog.options.length" class="submit-confirm-options" aria-label="提交选项">
+              <span v-for="option in submitConfirmDialog.options" :key="option">{{ option }}</span>
+            </div>
+            <p v-else class="submit-confirm-empty">
+              {{
+                submitConfirmDialog.mode === "push"
+                  ? "将推送当前分支中尚未同步的提交。"
+                  : "没有额外提交选项。"
+              }}
+            </p>
+          </div>
+
+          <div class="submit-confirm-file-tree-panel">
+            <div class="submit-confirm-file-tree-head">
+              <span>文件树</span>
+              <strong v-if="submitConfirmDialog.paths.length">{{ submitConfirmDialog.paths.length }} 个文件</strong>
+              <strong v-else>当前分支</strong>
+            </div>
+            <div v-if="submitConfirmDialog.paths.length" class="submit-confirm-file-tree" aria-label="提交文件树">
+              <button
+                v-for="row in visibleSubmitConfirmFileTreeRows"
+                :key="row.id"
+                class="submit-confirm-file-row"
+                :class="{ directory: row.directory }"
+                type="button"
+                :title="row.directory ? row.path : `${row.path} · ${formatSubmitConfirmFileStatus(row.status)}`"
+                :style="{ paddingLeft: `${Math.max(0, row.depth) * 14 + 8}px` }"
+                @click="row.directory && toggleSubmitConfirmDirectory(row.path)"
+              >
+                <ChevronDown v-if="row.directory && isSubmitConfirmDirectoryExpanded(row.path)" :size="13" />
+                <ChevronRight v-else-if="row.directory" :size="13" />
+                <span v-else class="submit-confirm-file-toggle-placeholder" />
+                <FolderOpen v-if="row.directory && isSubmitConfirmDirectoryExpanded(row.path)" :size="14" />
+                <Folder v-else-if="row.directory" :size="14" />
+                <span v-else class="change-file-icon" :class="changeFileIconClass(row.path)">
+                  <span v-if="fileTypeLabel(row.path)">{{ fileTypeLabel(row.path) }}</span>
+                  <FileIcon v-else :size="13" />
+                </span>
+                <span class="submit-confirm-file-main">
+                  <strong>{{ row.name }}</strong>
+                  <small>{{ row.directory ? `${row.fileCount ?? 0} 个文件` : formatSubmitConfirmFileStatus(row.status) }}</small>
+                </span>
+              </button>
+            </div>
+            <p v-else class="submit-confirm-empty">没有单独的文件列表，操作对象是当前分支。</p>
+          </div>
+        </div>
+        <footer>
+          <button class="icon-button" type="button" :disabled="submitConfirmDialog.loading" @click="cancelSubmitConfirmDialog">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button class="icon-button primary" type="button" :disabled="submitConfirmDialog.loading" @click="confirmSubmitAction">
+            <LoaderCircle v-if="submitConfirmDialog.loading" :size="14" class="button-spinner" />
+            <Check v-else :size="14" />
+            <span>{{ submitConfirmActionLabel }}</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
     <section
       class="workspace"
       :class="{ 'workspace-empty': !repos.current, 'is-resizing': activeResizePanel }"
@@ -4787,8 +5516,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </div>
           <form class="branch-create" @submit.prevent="createBranchFromHead">
             <input v-model="newBranchName" placeholder="新分支名称" />
-            <button class="icon-only-button" title="从当前 HEAD 创建并切换分支" :disabled="!newBranchName.trim()">
-              <Plus :size="14" />
+            <button
+              class="icon-only-button"
+              :class="actionButtonClass(branchActionKey('create'))"
+              title="从当前 HEAD 创建并切换分支"
+              :disabled="!newBranchName.trim() || branches.loading"
+              :aria-busy="isUiActionPending(branchActionKey('create'))"
+            >
+              <component
+                :is="actionIcon(branchActionKey('create'), Plus)"
+                :class="actionIconClass(branchActionKey('create'))"
+                :size="14"
+              />
             </button>
           </form>
 
@@ -4804,12 +5543,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
               </option>
             </select>
             <div class="remote-editor-actions">
-              <button class="icon-button" :disabled="branches.loading || !branches.upstreamTarget" @click="setSelectedUpstream">
-                <Check :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass(branchActionKey('upstream.set', branches.selectedLocalBranch))"
+                :disabled="branches.loading || !branches.upstreamTarget"
+                :aria-busy="isUiActionPending(branchActionKey('upstream.set', branches.selectedLocalBranch))"
+                @click="setSelectedUpstream"
+              >
+                <component
+                  :is="actionIcon(branchActionKey('upstream.set', branches.selectedLocalBranch), Check)"
+                  :class="actionIconClass(branchActionKey('upstream.set', branches.selectedLocalBranch))"
+                  :size="14"
+                />
                 <span>设置上游</span>
               </button>
-              <button class="icon-button danger" :disabled="branches.loading || !branches.selectedLocalBranch" @click="unsetSelectedUpstream">
-                <X :size="14" />
+              <button
+                class="icon-button danger"
+                :class="actionButtonClass(branchActionKey('upstream.unset', branches.selectedLocalBranch))"
+                :disabled="branches.loading || !branches.selectedLocalBranch"
+                :aria-busy="isUiActionPending(branchActionKey('upstream.unset', branches.selectedLocalBranch))"
+                @click="unsetSelectedUpstream"
+              >
+                <component
+                  :is="actionIcon(branchActionKey('upstream.unset', branches.selectedLocalBranch), X)"
+                  :class="actionIconClass(branchActionKey('upstream.unset', branches.selectedLocalBranch))"
+                  :size="14"
+                />
                 <span>取消上游</span>
               </button>
             </div>
@@ -4823,8 +5582,20 @@ async function jumpMergeConflict(direction: -1 | 1) {
               class="branch-row"
               :class="{ active: branchItem.current }"
             >
-              <button class="branch-checkout" :title="branchItem.fullName" @click="checkoutSelectedBranch(branchItem)">
-                <span class="branch-dot" />
+              <button
+                class="branch-checkout"
+                :class="actionButtonClass(branchActionKey('checkout', branchItem.fullName))"
+                :title="branchItem.fullName"
+                :disabled="branches.loading"
+                :aria-busy="isUiActionPending(branchActionKey('checkout', branchItem.fullName))"
+                @click="checkoutSelectedBranch(branchItem)"
+              >
+                <LoaderCircle
+                  v-if="isUiActionPending(branchActionKey('checkout', branchItem.fullName))"
+                  class="branch-dot button-spinner"
+                  :size="12"
+                />
+                <span v-else class="branch-dot" />
                 <span class="branch-copy">
                   <strong>{{ branchItem.name }}</strong>
                   <small v-if="branchItem.upstream">
@@ -4842,11 +5613,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
               </button>
               <button
                 class="project-remove"
+                :class="actionButtonClass(branchActionKey('delete', branchItem.fullName))"
                 title="删除本地分支"
-                :disabled="branchItem.current"
+                :disabled="branchItem.current || branches.loading"
+                :aria-busy="isUiActionPending(branchActionKey('delete', branchItem.fullName))"
                 @click="deleteLocalBranch(branchItem)"
               >
-                <Trash2 :size="13" />
+                <component
+                  :is="actionIcon(branchActionKey('delete', branchItem.fullName), Trash2)"
+                  :class="actionIconClass(branchActionKey('delete', branchItem.fullName))"
+                  :size="13"
+                />
               </button>
             </div>
 
@@ -4858,9 +5635,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
             >
               <button
                 class="remote-branch-row"
+                :class="actionButtonClass(branchActionKey('checkout', branchItem.fullName))"
                 :title="`${branchItem.fullName} · 检出成本地跟踪分支`"
+                :disabled="branches.loading"
+                :aria-busy="isUiActionPending(branchActionKey('checkout', branchItem.fullName))"
                 @click="checkoutSelectedBranch(branchItem)"
               >
+                <LoaderCircle
+                  v-if="isUiActionPending(branchActionKey('checkout', branchItem.fullName))"
+                  class="button-spinner"
+                  :size="12"
+                />
                 {{ branchItem.name }}
               </button>
               <button
@@ -4872,10 +5657,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
               </button>
               <button
                 class="project-remove"
+                :class="actionButtonClass(branchActionKey('delete', branchItem.fullName))"
                 title="删除远程分支"
+                :disabled="branches.loading"
+                :aria-busy="isUiActionPending(branchActionKey('delete', branchItem.fullName))"
                 @click="deleteRemoteBranchItem(branchItem)"
               >
-                <Trash2 :size="13" />
+                <component
+                  :is="actionIcon(branchActionKey('delete', branchItem.fullName), Trash2)"
+                  :class="actionIconClass(branchActionKey('delete', branchItem.fullName))"
+                  :size="13"
+                />
               </button>
             </div>
 
@@ -4888,8 +5680,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 附注标签
               </label>
               <input v-if="annotatedTag" v-model="tagMessage" placeholder="标签说明，可空" />
-              <button class="icon-button" :disabled="branches.loading || !newTagName.trim()">
-                <Plus :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass(branchActionKey('tag.create', newTagName.trim()))"
+                :disabled="branches.loading || !newTagName.trim()"
+                :aria-busy="isUiActionPending(branchActionKey('tag.create', newTagName.trim()))"
+              >
+                <component
+                  :is="actionIcon(branchActionKey('tag.create', newTagName.trim()), Plus)"
+                  :class="actionIconClass(branchActionKey('tag.create', newTagName.trim()))"
+                  :size="14"
+                />
                 <span>创建标签</span>
               </button>
             </form>
@@ -4899,14 +5700,47 @@ async function jumpMergeConflict(direction: -1 | 1) {
                   <strong>{{ tag.name }}</strong>
                   <small>{{ shortHash(tag.target) }}</small>
                 </span>
-                <button class="icon-only-button" title="推送标签" :disabled="branches.loading || !remote.selectedRemote" @click="pushSelectedTag(tag)">
-                  <Upload :size="13" />
+                <button
+                  class="icon-only-button"
+                  :class="actionButtonClass(branchActionKey('tag.push', tag.name))"
+                  title="推送标签"
+                  :disabled="branches.loading || !remote.selectedRemote"
+                  :aria-busy="isUiActionPending(branchActionKey('tag.push', tag.name))"
+                  @click="pushSelectedTag(tag)"
+                >
+                  <component
+                    :is="actionIcon(branchActionKey('tag.push', tag.name), Upload)"
+                    :class="actionIconClass(branchActionKey('tag.push', tag.name))"
+                    :size="13"
+                  />
                 </button>
-                <button class="icon-only-button danger" title="删除远程标签" :disabled="branches.loading || !remote.selectedRemote" @click="deleteSelectedRemoteTag(tag)">
-                  <X :size="13" />
+                <button
+                  class="icon-only-button danger"
+                  :class="actionButtonClass(branchActionKey('tag.deleteRemote', tag.name))"
+                  title="删除远程标签"
+                  :disabled="branches.loading || !remote.selectedRemote"
+                  :aria-busy="isUiActionPending(branchActionKey('tag.deleteRemote', tag.name))"
+                  @click="deleteSelectedRemoteTag(tag)"
+                >
+                  <component
+                    :is="actionIcon(branchActionKey('tag.deleteRemote', tag.name), X)"
+                    :class="actionIconClass(branchActionKey('tag.deleteRemote', tag.name))"
+                    :size="13"
+                  />
                 </button>
-                <button class="project-remove" title="删除本地标签" :disabled="branches.loading" @click="deleteLocalTag(tag)">
-                  <Trash2 :size="13" />
+                <button
+                  class="project-remove"
+                  :class="actionButtonClass(branchActionKey('tag.delete', tag.name))"
+                  title="删除本地标签"
+                  :disabled="branches.loading"
+                  :aria-busy="isUiActionPending(branchActionKey('tag.delete', tag.name))"
+                  @click="deleteLocalTag(tag)"
+                >
+                  <component
+                    :is="actionIcon(branchActionKey('tag.delete', tag.name), Trash2)"
+                    :class="actionIconClass(branchActionKey('tag.delete', tag.name))"
+                    :size="13"
+                  />
                 </button>
               </div>
             </div>
@@ -4923,16 +5757,46 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <strong>{{ formatOperationName(operations.activeOperation) }}</strong>
             <span>{{ operations.conflictedPaths.length }} 个冲突文件</span>
             <div class="operation-actions">
-              <button class="icon-button" :disabled="operations.loading" @click="runOperationControl('continue')">
-                <Check :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('operation.continue')"
+                :disabled="operations.loading"
+                :aria-busy="isUiActionPending('operation.continue')"
+                @click="runOperationControl('continue')"
+              >
+                <component
+                  :is="actionIcon('operation.continue', Check)"
+                  :class="actionIconClass('operation.continue')"
+                  :size="14"
+                />
                 <span>继续</span>
               </button>
-              <button class="icon-button" :disabled="operations.loading || !canSkipOperation" @click="runOperationControl('skip')">
-                <Minus :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('operation.skip')"
+                :disabled="operations.loading || !canSkipOperation"
+                :aria-busy="isUiActionPending('operation.skip')"
+                @click="runOperationControl('skip')"
+              >
+                <component
+                  :is="actionIcon('operation.skip', Minus)"
+                  :class="actionIconClass('operation.skip')"
+                  :size="14"
+                />
                 <span>跳过</span>
               </button>
-              <button class="icon-button danger" :disabled="operations.loading" @click="runOperationControl('abort')">
-                <X :size="14" />
+              <button
+                class="icon-button danger"
+                :class="actionButtonClass('operation.abort')"
+                :disabled="operations.loading"
+                :aria-busy="isUiActionPending('operation.abort')"
+                @click="runOperationControl('abort')"
+              >
+                <component
+                  :is="actionIcon('operation.abort', X)"
+                  :class="actionIconClass('operation.abort')"
+                  :size="14"
+                />
                 <span>终止</span>
               </button>
             </div>
@@ -4949,8 +5813,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <label title="--no-commit"><input v-model="operations.mergeNoCommit" type="checkbox" /> 不自动提交</label>
               <label title="--squash"><input v-model="operations.mergeSquash" type="checkbox" /> 压缩合并</label>
             </div>
-            <button class="tool-button" :disabled="!operations.mergeTarget || operations.loading" @click="mergeSelectedTarget">
-              <GitBranch :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('operation.merge')"
+              :disabled="!operations.mergeTarget || operations.loading"
+              :aria-busy="isUiActionPending('operation.merge')"
+              @click="mergeSelectedTarget"
+            >
+              <component
+                :is="actionIcon('operation.merge', GitBranch)"
+                :class="actionIconClass('operation.merge')"
+                :size="14"
+              />
               <span>合并</span>
             </button>
           </div>
@@ -4964,8 +5838,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <div class="operation-options">
               <label title="--autostash"><input v-model="operations.rebaseAutostash" type="checkbox" /> 自动贮藏</label>
             </div>
-            <button class="tool-button" :disabled="!operations.rebaseTarget || operations.loading" @click="rebaseOntoSelectedTarget">
-              <RotateCcw :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('operation.rebase')"
+              :disabled="!operations.rebaseTarget || operations.loading"
+              :aria-busy="isUiActionPending('operation.rebase')"
+              @click="rebaseOntoSelectedTarget"
+            >
+              <component
+                :is="actionIcon('operation.rebase', RotateCcw)"
+                :class="actionIconClass('operation.rebase')"
+                :size="14"
+              />
               <span>变基</span>
             </button>
           </div>
@@ -4984,10 +5868,16 @@ async function jumpMergeConflict(direction: -1 | 1) {
             </div>
             <button
               class="tool-button"
+              :class="actionButtonClass('operation.rebaseAdvanced')"
               :disabled="operations.loading || (!operations.rebaseTarget && !operations.rebaseRoot)"
+              :aria-busy="isUiActionPending('operation.rebaseAdvanced')"
               @click="rebaseWithAdvancedOptions"
             >
-              <RotateCcw :size="14" />
+              <component
+                :is="actionIcon('operation.rebaseAdvanced', RotateCcw)"
+                :class="actionIconClass('operation.rebaseAdvanced')"
+                :size="14"
+              />
               <span>执行高级变基</span>
             </button>
           </details>
@@ -5016,18 +5906,30 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <div class="remote-editor-actions">
               <button
                 class="icon-button"
+                :class="actionButtonClass('remote.save')"
                 :disabled="remote.loading || !remote.remoteNameDraft.trim() || !remote.remoteUrlDraft.trim()"
+                :aria-busy="isUiActionPending('remote.save')"
                 @click="saveRemoteConfig"
               >
-                <Check :size="14" />
+                <component
+                  :is="actionIcon('remote.save', Check)"
+                  :class="actionIconClass('remote.save')"
+                  :size="14"
+                />
                 <span>保存</span>
               </button>
               <button
                 class="icon-button danger"
+                :class="actionButtonClass('remote.delete')"
                 :disabled="remote.loading || !(repos.current?.remotes.length)"
+                :aria-busy="isUiActionPending('remote.delete')"
                 @click="deleteSelectedRemote"
               >
-                <Trash2 :size="14" />
+                <component
+                  :is="actionIcon('remote.delete', Trash2)"
+                  :class="actionIconClass('remote.delete')"
+                  :size="14"
+                />
                 <span>删除</span>
               </button>
             </div>
@@ -5068,12 +5970,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <strong>推送被远程拒绝</strong>
             <span>可以先获取远程更新，再选择合并或变基到 {{ remote.lastRejectedTarget }}</span>
             <div class="remote-editor-actions">
-              <button class="icon-button" :disabled="remote.loading || operations.loading" @click="resolveRejectedPush('merge')">
-                <GitBranch :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('remote.resolve.merge')"
+                :disabled="remote.loading || operations.loading"
+                :aria-busy="isUiActionPending('remote.resolve.merge')"
+                @click="resolveRejectedPush('merge')"
+              >
+                <component
+                  :is="actionIcon('remote.resolve.merge', GitBranch)"
+                  :class="actionIconClass('remote.resolve.merge')"
+                  :size="14"
+                />
                 <span>获取后合并</span>
               </button>
-              <button class="icon-button" :disabled="remote.loading || operations.loading" @click="resolveRejectedPush('rebase')">
-                <RotateCcw :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('remote.resolve.rebase')"
+                :disabled="remote.loading || operations.loading"
+                :aria-busy="isUiActionPending('remote.resolve.rebase')"
+                @click="resolveRejectedPush('rebase')"
+              >
+                <component
+                  :is="actionIcon('remote.resolve.rebase', RotateCcw)"
+                  :class="actionIconClass('remote.resolve.rebase')"
+                  :size="14"
+                />
                 <span>获取后变基</span>
               </button>
             </div>
@@ -5113,14 +6035,35 @@ async function jumpMergeConflict(direction: -1 | 1) {
           >
             <button
               class="shelf-restore"
-              :disabled="Boolean(record.appliedAt)"
-              @click="changes.unshelveRecord(record)"
+              :class="actionButtonClass(`changes.shelf.restore:${record.id ?? record.stashRef}`)"
+              :disabled="Boolean(record.appliedAt) || changes.loading"
+              :aria-busy="isUiActionPending(`changes.shelf.restore:${record.id ?? record.stashRef}`)"
+              @click="unshelveRecord(record)"
             >
               <span>{{ record.message }}</span>
-              <small>{{ record.appliedAt ? "已恢复" : formatTime(record.createdAt) }}</small>
+              <small>
+                {{
+                  isUiActionPending(`changes.shelf.restore:${record.id ?? record.stashRef}`)
+                    ? "恢复中"
+                    : record.appliedAt
+                      ? "已恢复"
+                      : formatTime(record.createdAt)
+                }}
+              </small>
             </button>
-            <button class="project-remove" title="删除搁置" @click="deleteShelfRecord(record)">
-              <Trash2 :size="13" />
+            <button
+              class="project-remove"
+              :class="actionButtonClass(`changes.shelf.delete:${record.id ?? record.stashRef}`)"
+              title="删除搁置"
+              :disabled="changes.loading"
+              :aria-busy="isUiActionPending(`changes.shelf.delete:${record.id ?? record.stashRef}`)"
+              @click="deleteShelfRecord(record)"
+            >
+              <component
+                :is="actionIcon(`changes.shelf.delete:${record.id ?? record.stashRef}`, Trash2)"
+                :class="actionIconClass(`changes.shelf.delete:${record.id ?? record.stashRef}`)"
+                :size="13"
+              />
             </button>
           </div>
         </section>
@@ -5146,19 +6089,34 @@ async function jumpMergeConflict(direction: -1 | 1) {
           <p>{{ repos.selectedPath }}</p>
           <button
             class="tool-button primary large"
+            :class="actionButtonClass('repo.init')"
             :disabled="advanced.loading || !repos.selectedPath"
+            :aria-busy="isUiActionPending('repo.init')"
             @click="initSelectedProject"
           >
-            <Plus :size="18" />
+            <component
+              :is="actionIcon('repo.init', Plus)"
+              :class="actionIconClass('repo.init')"
+              :size="18"
+            />
             <span>{{ advanced.loading ? "初始化中" : "初始化仓库" }}</span>
           </button>
         </div>
         <div v-else class="empty-panel">
           <ListChecks :size="40" />
           <h1>选择本地 Git 仓库</h1>
-          <button class="tool-button primary large" @click="chooseRepository">
-            <FolderOpen :size="18" />
-            <span>添加项目</span>
+          <button
+            class="tool-button primary large"
+            :class="actionButtonClass('repo.choose')"
+            :aria-busy="isUiActionPending('repo.choose')"
+            @click="chooseRepository"
+          >
+            <component
+              :is="actionIcon('repo.choose', FolderOpen)"
+              :class="actionIconClass('repo.choose')"
+              :size="18"
+            />
+            <span>{{ isUiActionPending('repo.choose') ? "添加中" : "添加项目" }}</span>
           </button>
         </div>
       </section>
@@ -5183,39 +6141,62 @@ async function jumpMergeConflict(direction: -1 | 1) {
         <div class="file-actions">
           <button
             class="icon-only-button file-actions-refresh"
+            :class="actionButtonClass('workspace.refresh')"
             type="button"
             title="刷新变更"
             :disabled="workspaceRefreshBusy"
+            :aria-busy="isUiActionPending('workspace.refresh')"
             @click="refreshAll"
           >
-            <LoaderCircle v-if="workspaceRefreshBusy" class="button-spinner" :size="14" />
-            <RefreshCw v-else :size="14" />
+            <component
+              :is="actionIcon('workspace.refresh', RefreshCw)"
+              :class="actionIconClass('workspace.refresh')"
+              :size="14"
+            />
           </button>
           <button
             class="icon-button"
+            :class="actionButtonClass('changes.stage')"
             title="暂存选中文件"
-            :disabled="changes.activePaths.length === 0 || settings.selectedSide === 'staged'"
-            @click="runAndReload(() => changes.stageSelected())"
+            :disabled="changes.activePaths.length === 0 || settings.selectedSide === 'staged' || changes.loading"
+            :aria-busy="isUiActionPending('changes.stage')"
+            @click="stageSelected"
           >
-            <Check :size="15" />
+            <component
+              :is="actionIcon('changes.stage', Check)"
+              :class="actionIconClass('changes.stage')"
+              :size="15"
+            />
             <span>暂存</span>
           </button>
           <button
             class="icon-button"
+            :class="actionButtonClass('changes.unstage')"
             title="取消暂存"
-            :disabled="changes.activePaths.length === 0 || settings.selectedSide === 'unstaged'"
-            @click="runAndReload(() => changes.unstageSelected())"
+            :disabled="changes.activePaths.length === 0 || settings.selectedSide === 'unstaged' || changes.loading"
+            :aria-busy="isUiActionPending('changes.unstage')"
+            @click="unstageSelected"
           >
-            <Minus :size="15" />
+            <component
+              :is="actionIcon('changes.unstage', Minus)"
+              :class="actionIconClass('changes.unstage')"
+              :size="15"
+            />
             <span>移出</span>
           </button>
           <button
             class="icon-button danger"
+            :class="actionButtonClass('changes.discard')"
             title="回滚变更"
-            :disabled="changes.activePaths.length === 0"
+            :disabled="changes.activePaths.length === 0 || changes.loading"
+            :aria-busy="isUiActionPending('changes.discard')"
             @click="discardSelected"
           >
-            <Trash2 :size="15" />
+            <component
+              :is="actionIcon('changes.discard', Trash2)"
+              :class="actionIconClass('changes.discard')"
+              :size="15"
+            />
             <span>回滚</span>
           </button>
           <label class="toggle-row file-actions-toggle">
@@ -5358,11 +6339,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
           <input v-model="shelveMessage" placeholder="搁置说明" />
           <button
             class="icon-button"
-            :disabled="changes.activePaths.length === 0"
+            :class="actionButtonClass('changes.shelve')"
+            :disabled="changes.activePaths.length === 0 || changes.loading"
+            :aria-busy="isUiActionPending('changes.shelve')"
             title="搁置选中变更"
             @click="shelveSelected"
           >
-            <Archive :size="15" />
+            <component
+              :is="actionIcon('changes.shelve', Archive)"
+              :class="actionIconClass('changes.shelve')"
+              :size="15"
+            />
             <span>搁置</span>
           </button>
         </div>
@@ -5443,58 +6430,81 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </button>
           <button
             class="log-ref-tool-button"
+            :class="actionButtonClass('workspace.refresh')"
             type="button"
             title="刷新引用和日志"
             :disabled="history.loading || branches.loading"
+            :aria-busy="isUiActionPending('workspace.refresh')"
             @click="refreshAll"
           >
-            <RefreshCw :size="15" />
+            <component
+              :is="actionIcon('workspace.refresh', RefreshCw)"
+              :class="actionIconClass('workspace.refresh')"
+              :size="15"
+            />
           </button>
           <button
             class="log-ref-tool-button"
+            :class="actionButtonClass(remoteActionKey('fetch'))"
             type="button"
             title="获取远程引用"
             :disabled="remote.loading || !remote.selectedRemote"
+            :aria-busy="isUiActionActive(remoteActionKey('fetch'))"
+            @pointerdown="runRemoteActionFromPointer($event, 'fetch')"
             @click="runRemoteAction('fetch')"
           >
-            <Download :size="15" />
+            <component
+              :is="actionIcon(remoteActionKey('fetch'), Download)"
+              :class="actionIconClass(remoteActionKey('fetch'))"
+              :size="15"
+            />
           </button>
           <button
             class="log-ref-tool-button"
+            :class="actionButtonClass(remoteActionKey('pull'))"
             type="button"
             title="拉取代码"
             :disabled="remote.loading || !remote.selectedRemote"
+            :aria-busy="isUiActionActive(remoteActionKey('pull'))"
+            @pointerdown="runRemoteActionFromPointer($event, 'pull')"
             @click="runRemoteAction('pull')"
           >
-            <ArrowDown :size="15" />
-          </button>
-          <button
-            class="log-ref-tool-button"
-            type="button"
-            title="推送代码"
-            :disabled="remote.loading || !remote.selectedRemote"
-            @click="runRemoteAction('push')"
-          >
-            <ArrowUp :size="15" />
+            <component
+              :is="actionIcon(remoteActionKey('pull'), ArrowDown)"
+              :class="actionIconClass(remoteActionKey('pull'))"
+              :size="15"
+            />
           </button>
           <span class="log-ref-tool-separator" />
           <button
             class="log-ref-tool-button"
+            :class="actionButtonClass(branchActionKey('create'))"
             type="button"
             title="从当前 HEAD 创建并切换分支"
             :disabled="branches.loading"
+            :aria-busy="isUiActionPending(branchActionKey('create'))"
             @click="createLogBranchFromHead"
           >
-            <Plus :size="16" />
+            <component
+              :is="actionIcon(branchActionKey('create'), Plus)"
+              :class="actionIconClass(branchActionKey('create'))"
+              :size="16"
+            />
           </button>
           <button
             class="log-ref-tool-button danger"
+            :class="actionButtonClass(branchActionKey('delete', activeLogBranchRef?.fullName))"
             type="button"
             title="删除当前选中的分支"
             :disabled="branches.loading || !activeLogBranchRef || activeLogBranchRef.current"
+            :aria-busy="isUiActionPending(branchActionKey('delete', activeLogBranchRef?.fullName))"
             @click="deleteActiveLogBranch"
           >
-            <Trash2 :size="15" />
+            <component
+              :is="actionIcon(branchActionKey('delete', activeLogBranchRef?.fullName), Trash2)"
+              :class="actionIconClass(branchActionKey('delete', activeLogBranchRef?.fullName))"
+              :size="15"
+            />
           </button>
           <button
             class="log-ref-tool-button"
@@ -5674,8 +6684,19 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <FolderOpen :size="16" />
             <span>项目文件</span>
           </div>
-          <button class="icon-only-button" title="刷新项目文件" :disabled="project.loading" @click="project.refresh()">
-            <RefreshCw :size="14" />
+          <button
+            class="icon-only-button"
+            :class="actionButtonClass('project.refresh')"
+            title="刷新项目文件"
+            :disabled="project.loading"
+            :aria-busy="isUiActionPending('project.refresh')"
+            @click="runUiAction('project.refresh', () => project.refresh())"
+          >
+            <component
+              :is="actionIcon('project.refresh', RefreshCw)"
+              :class="actionIconClass('project.refresh')"
+              :size="14"
+            />
           </button>
         </div>
 
@@ -5720,15 +6741,54 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <GitBranch :size="16" />
             <span>高级工具</span>
           </div>
-          <button class="icon-only-button" title="刷新高级状态" @click="loadAdvancedSnapshots">
-            <RefreshCw :size="14" />
+          <button
+            class="icon-only-button"
+            :class="actionButtonClass('advanced.refresh')"
+            title="刷新高级状态"
+            :disabled="advanced.loading"
+            :aria-busy="isUiActionPending('advanced.refresh')"
+            @click="loadAdvancedSnapshots"
+          >
+            <component
+              :is="actionIcon('advanced.refresh', RefreshCw)"
+              :class="actionIconClass('advanced.refresh')"
+              :size="14"
+            />
           </button>
         </div>
         <div class="advanced-nav">
-          <button @click="advanced.refreshWorktrees">工作树 {{ advanced.worktrees.length }}</button>
-          <button @click="advanced.refreshStashes">贮藏 {{ advanced.stashes.length }}</button>
-          <button @click="advanced.refreshSubmodules">子模块 {{ advanced.submodules.length }}</button>
-          <button @click="advanced.refreshCommitMessages">提交信息 {{ advanced.commitMessages.length }}</button>
+          <button
+            :class="actionButtonClass('advanced.worktrees.refresh')"
+            :disabled="advanced.loading"
+            :aria-busy="isUiActionPending('advanced.worktrees.refresh')"
+            @click="runUiAction('advanced.worktrees.refresh', () => advanced.refreshWorktrees())"
+          >
+            {{ isUiActionPending('advanced.worktrees.refresh') ? "刷新中" : `工作树 ${advanced.worktrees.length}` }}
+          </button>
+          <button
+            :class="actionButtonClass('advanced.stash.refresh')"
+            :disabled="advanced.loading"
+            :aria-busy="isUiActionPending('advanced.stash.refresh')"
+            @click="runUiAction('advanced.stash.refresh', () => advanced.refreshStashes())"
+          >
+            {{ isUiActionPending('advanced.stash.refresh') ? "刷新中" : `贮藏 ${advanced.stashes.length}` }}
+          </button>
+          <button
+            :class="actionButtonClass('advanced.submodules.refresh')"
+            :disabled="advanced.loading"
+            :aria-busy="isUiActionPending('advanced.submodules.refresh')"
+            @click="runUiAction('advanced.submodules.refresh', () => advanced.refreshSubmodules())"
+          >
+            {{ isUiActionPending('advanced.submodules.refresh') ? "刷新中" : `子模块 ${advanced.submodules.length}` }}
+          </button>
+          <button
+            :class="actionButtonClass('advanced.commitMessages.refresh')"
+            :disabled="advanced.loading"
+            :aria-busy="isUiActionPending('advanced.commitMessages.refresh')"
+            @click="runUiAction('advanced.commitMessages.refresh', () => advanced.refreshCommitMessages())"
+          >
+            {{ isUiActionPending('advanced.commitMessages.refresh') ? "刷新中" : `提交信息 ${advanced.commitMessages.length}` }}
+          </button>
         </div>
       </section>
 
@@ -5756,8 +6816,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <div class="merge-conflict-summary">{{ mergeConflictSummary }}</div>
           </div>
 
-          <div v-if="activeError" class="message error">{{ activeError }}</div>
-
           <div class="merge-editor-toolbar">
             <div class="merge-toolbar-status">
               <div class="merge-conflict-jump-actions" aria-label="冲突导航">
@@ -5783,6 +6841,17 @@ async function jumpMergeConflict(direction: -1 | 1) {
               </div>
             </div>
             <div class="merge-save-actions">
+              <button
+                v-if="isMergeConflictOperation"
+                type="button"
+                class="tool-button danger"
+                :disabled="operations.loading"
+                title="中止合并"
+                @click="runOperationControl('abort')"
+              >
+                <X :size="14" />
+                <span>中止合并</span>
+              </button>
               <span class="merge-result-state" :class="{ warning: resultHasConflictMarkers }">
                 {{ mergeResultStateLabel }}
               </span>
@@ -5866,7 +6935,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
                         :disabled="operations.loading"
                         title="拒绝当前块，使用传入块"
                         aria-label="拒绝当前块，使用传入块"
-                        @click.stop="acceptConflictBlock(line.conflictIndex, 'theirs')"
+                        @click.stop="acceptConflictBlock(line.conflictIndex, mergeIncomingSide)"
                       >
                         <X :size="12" />
                       </button>
@@ -5874,11 +6943,14 @@ async function jumpMergeConflict(direction: -1 | 1) {
                         type="button"
                         class="merge-inline-action accept"
                         :disabled="operations.loading"
-                        :title="mergeConflictActionTitle(line.conflictIndex, 'ours')"
-                        :aria-label="mergeConflictActionTitle(line.conflictIndex, 'ours')"
-                        @click.stop="applyConflictBlock(line.conflictIndex, 'ours')"
+                        :title="mergeConflictActionTitle(line.conflictIndex, mergeCurrentSide, '当前')"
+                        :aria-label="mergeConflictActionTitle(line.conflictIndex, mergeCurrentSide, '当前')"
+                        @click.stop="applyConflictBlock(line.conflictIndex, mergeCurrentSide)"
                       >
-                        <CornerDownRight v-if="shouldAppendConflictBlock(line.conflictIndex, 'ours')" :size="14" />
+                        <CornerDownRight
+                          v-if="shouldAppendConflictBlock(line.conflictIndex, mergeCurrentSide)"
+                          :size="14"
+                        />
                         <ChevronsRight v-else :size="14" />
                       </button>
                     </span>
@@ -5954,11 +7026,14 @@ async function jumpMergeConflict(direction: -1 | 1) {
                         type="button"
                         class="merge-inline-action accept"
                         :disabled="operations.loading"
-                        :title="mergeConflictActionTitle(line.conflictIndex, 'theirs')"
-                        :aria-label="mergeConflictActionTitle(line.conflictIndex, 'theirs')"
-                        @click.stop="applyConflictBlock(line.conflictIndex, 'theirs')"
+                        :title="mergeConflictActionTitle(line.conflictIndex, mergeIncomingSide, '传入')"
+                        :aria-label="mergeConflictActionTitle(line.conflictIndex, mergeIncomingSide, '传入')"
+                        @click.stop="applyConflictBlock(line.conflictIndex, mergeIncomingSide)"
                       >
-                        <CornerDownLeft v-if="shouldAppendConflictBlock(line.conflictIndex, 'theirs')" :size="14" />
+                        <CornerDownLeft
+                          v-if="shouldAppendConflictBlock(line.conflictIndex, mergeIncomingSide)"
+                          :size="14"
+                        />
                         <ChevronsLeft v-else :size="14" />
                       </button>
                       <button
@@ -5967,7 +7042,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
                         :disabled="operations.loading"
                         title="拒绝传入块，使用当前块"
                         aria-label="拒绝传入块，使用当前块"
-                        @click.stop="acceptConflictBlock(line.conflictIndex, 'ours')"
+                        @click.stop="acceptConflictBlock(line.conflictIndex, mergeCurrentSide)"
                       >
                         <X :size="12" />
                       </button>
@@ -5999,8 +7074,12 @@ async function jumpMergeConflict(direction: -1 | 1) {
 
           <div class="merge-editor-footer">
             <div class="merge-accept-actions">
-              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide('ours')">接受左侧</button>
-              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide('theirs')">接受右侧</button>
+              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide(mergeCurrentSide)">
+                接受左侧
+              </button>
+              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide(mergeIncomingSide)">
+                接受右侧
+              </button>
             </div>
             <div class="merge-save-actions">
               <button class="tool-button" :disabled="operations.loading" @click="resetConflictResultDraft">取消</button>
@@ -6043,10 +7122,8 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </div>
         </div>
 
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
-
         <div class="project-editor">
-          <div v-if="project.contentLoading || project.loading" class="diff-empty">加载中</div>
+          <div v-if="project.contentLoading" class="diff-empty">加载中</div>
           <div v-else-if="project.content?.binary" class="diff-empty">
             二进制文件，大小 {{ formatBytes(project.content.size) }}
           </div>
@@ -6083,7 +7160,9 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 :style="projectEditorOriginalPanelStyle(expandedProjectHunk)"
                 @mousedown.stop
               >
-                <div class="project-original-gutter">{{ expandedProjectHunk.oldStart }}</div>
+                <div class="project-original-gutter">
+                  {{ expandedProjectHunk.changedOldStart ?? expandedProjectHunk.oldStart }}
+                </div>
                 <div class="project-original-card">
                   <div class="project-original-toolbar">
                     <span>{{ projectEditorHunkTitle(expandedProjectHunk) }}</span>
@@ -6183,8 +7262,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </div>
         </div>
 
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
-
         <div ref="changeDiffScroller" class="diff-scroller side-by-side-scroller">
           <div v-if="diff.loading" class="diff-empty">加载中</div>
           <div v-else-if="!activeChangeDiffHasContent" class="diff-empty">没有差异</div>
@@ -6261,18 +7338,36 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <h2>Git 工具箱</h2>
           </div>
           <div class="log-actions">
-            <button class="tool-button" :disabled="advanced.loading" @click="loadAdvancedSnapshots">
-              <RefreshCw :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('advanced.refresh')"
+              :disabled="advanced.loading"
+              :aria-busy="isUiActionPending('advanced.refresh')"
+              @click="loadAdvancedSnapshots"
+            >
+              <component
+                :is="actionIcon('advanced.refresh', RefreshCw)"
+                :class="actionIconClass('advanced.refresh')"
+                :size="14"
+              />
               <span>刷新</span>
             </button>
-            <button class="tool-button" :disabled="advanced.loading" @click="unshallowCurrentRepository">
-              <Download :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('advanced.unshallow')"
+              :disabled="advanced.loading"
+              :aria-busy="isUiActionPending('advanced.unshallow')"
+              @click="unshallowCurrentRepository"
+            >
+              <component
+                :is="actionIcon('advanced.unshallow', Download)"
+                :class="actionIconClass('advanced.unshallow')"
+                :size="14"
+              />
               <span>补全历史</span>
             </button>
           </div>
         </div>
-
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
 
         <div class="advanced-workbench">
           <section class="advanced-card">
@@ -6287,12 +7382,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 </option>
               </select>
               <input v-model="advanced.branchRenameTo" placeholder="新分支名称" />
-              <button class="icon-button" :disabled="advanced.loading || !advanced.branchRenameFrom || !advanced.branchRenameTo.trim()" @click="renameSelectedBranch">
-                <Check :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.branch.rename')"
+                :disabled="advanced.loading || !advanced.branchRenameFrom || !advanced.branchRenameTo.trim()"
+                :aria-busy="isUiActionPending('advanced.branch.rename')"
+                @click="renameSelectedBranch"
+              >
+                <component
+                  :is="actionIcon('advanced.branch.rename', Check)"
+                  :class="actionIconClass('advanced.branch.rename')"
+                  :size="14"
+                />
                 <span>重命名</span>
               </button>
-              <button class="icon-button danger" :disabled="advanced.loading" @click="cleanupMergedBranches">
-                <Trash2 :size="14" />
+              <button
+                class="icon-button danger"
+                :class="actionButtonClass('advanced.branch.cleanup')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.branch.cleanup')"
+                @click="cleanupMergedBranches"
+              >
+                <component
+                  :is="actionIcon('advanced.branch.cleanup', Trash2)"
+                  :class="actionIconClass('advanced.branch.cleanup')"
+                  :size="14"
+                />
                 <span>清理已合并</span>
               </button>
             </div>
@@ -6306,8 +7421,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <div class="advanced-form three">
               <input v-model="advanced.compareLeft" list="git-refs" placeholder="左侧引用，例如 main" />
               <input v-model="advanced.compareRight" list="git-refs" placeholder="右侧引用，例如 feature" />
-              <button class="icon-button" :disabled="advanced.loading || !advanced.compareLeft.trim() || !advanced.compareRight.trim()" @click="runRefComparison">
-                <Columns3 :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.compare')"
+                :disabled="advanced.loading || !advanced.compareLeft.trim() || !advanced.compareRight.trim()"
+                :aria-busy="isUiActionPending('advanced.compare')"
+                @click="runRefComparison"
+              >
+                <component
+                  :is="actionIcon('advanced.compare', Columns3)"
+                  :class="actionIconClass('advanced.compare')"
+                  :size="14"
+                />
                 <span>对比</span>
               </button>
             </div>
@@ -6328,18 +7453,48 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <span>补丁</span>
             </div>
             <div class="advanced-actions">
-              <button class="icon-button" :disabled="advanced.loading" @click="generatePatch(false)">
-                <Download :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.patch.worktree')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.patch.worktree')"
+                @click="generatePatch(false)"
+              >
+                <component
+                  :is="actionIcon('advanced.patch.worktree', Download)"
+                  :class="actionIconClass('advanced.patch.worktree')"
+                  :size="14"
+                />
                 <span>工作区补丁</span>
               </button>
-              <button class="icon-button" :disabled="advanced.loading" @click="generatePatch(true)">
-                <Download :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.patch.staged')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.patch.staged')"
+                @click="generatePatch(true)"
+              >
+                <component
+                  :is="actionIcon('advanced.patch.staged', Download)"
+                  :class="actionIconClass('advanced.patch.staged')"
+                  :size="14"
+                />
                 <span>暂存区补丁</span>
               </button>
               <label class="log-option" title="--index"><input v-model="advanced.applyPatchToIndex" type="checkbox" /> 更新索引</label>
               <label class="log-option" title="--3way"><input v-model="advanced.applyPatchThreeWay" type="checkbox" /> 三方应用</label>
-              <button class="icon-button" :disabled="advanced.loading || !advanced.patchDraft.trim()" @click="applyPatchDraft">
-                <Upload :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.patch.apply')"
+                :disabled="advanced.loading || !advanced.patchDraft.trim()"
+                :aria-busy="isUiActionPending('advanced.patch.apply')"
+                @click="applyPatchDraft"
+              >
+                <component
+                  :is="actionIcon('advanced.patch.apply', Upload)"
+                  :class="actionIconClass('advanced.patch.apply')"
+                  :size="14"
+                />
                 <span>应用补丁</span>
               </button>
             </div>
@@ -6353,12 +7508,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <span>文件历史</span>
             </div>
             <div class="advanced-actions">
-              <button class="icon-button" :disabled="!changes.selectedFile || advanced.loading" @click="advanced.loadFileHistory(changes.selectedFile)">
-                <GitCommitVertical :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.fileHistory')"
+                :disabled="!changes.selectedFile || advanced.loading"
+                :aria-busy="isUiActionPending('advanced.fileHistory')"
+                @click="loadSelectedFileHistory"
+              >
+                <component
+                  :is="actionIcon('advanced.fileHistory', GitCommitVertical)"
+                  :class="actionIconClass('advanced.fileHistory')"
+                  :size="14"
+                />
                 <span>读取历史</span>
               </button>
-              <button class="icon-button" :disabled="!changes.selectedFile || advanced.loading" @click="advanced.loadBlame(changes.selectedFile)">
-                <ListChecks :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.blame')"
+                :disabled="!changes.selectedFile || advanced.loading"
+                :aria-busy="isUiActionPending('advanced.blame')"
+                @click="loadSelectedBlame"
+              >
+                <component
+                  :is="actionIcon('advanced.blame', ListChecks)"
+                  :class="actionIconClass('advanced.blame')"
+                  :size="14"
+                />
                 <span>读取追溯</span>
               </button>
             </div>
@@ -6395,8 +7570,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <input v-model="advanced.worktreeBranch" placeholder="新分支，可空" />
               <input v-model="advanced.worktreeStartPoint" list="git-refs" placeholder="起点，可空" />
               <label class="log-option" title="--detach"><input v-model="advanced.worktreeDetach" type="checkbox" /> 游离状态</label>
-              <button class="icon-button" :disabled="advanced.loading || !advanced.worktreePath.trim()" @click="createWorktreeFromDraft">
-                <Plus :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.worktree.create')"
+                :disabled="advanced.loading || !advanced.worktreePath.trim()"
+                :aria-busy="isUiActionPending('advanced.worktree.create')"
+                @click="createWorktreeFromDraft"
+              >
+                <component
+                  :is="actionIcon('advanced.worktree.create', Plus)"
+                  :class="actionIconClass('advanced.worktree.create')"
+                  :size="14"
+                />
                 <span>创建</span>
               </button>
             </div>
@@ -6406,8 +7591,19 @@ async function jumpMergeConflict(direction: -1 | 1) {
                   <strong>{{ formatWorktreeLabel(item) }}</strong>
                   <small>{{ item.path }}</small>
                 </span>
-                <button class="project-remove" title="移除工作树" @click="removeWorktree(item.path)">
-                  <Trash2 :size="13" />
+                <button
+                  class="project-remove"
+                  :class="actionButtonClass(`advanced.worktree.remove:${item.path}`)"
+                  title="移除工作树"
+                  :disabled="advanced.loading"
+                  :aria-busy="isUiActionPending(`advanced.worktree.remove:${item.path}`)"
+                  @click="removeWorktree(item.path)"
+                >
+                  <component
+                    :is="actionIcon(`advanced.worktree.remove:${item.path}`, Trash2)"
+                    :class="actionIconClass(`advanced.worktree.remove:${item.path}`)"
+                    :size="13"
+                  />
                 </button>
               </div>
             </div>
@@ -6419,12 +7615,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <span>贮藏</span>
             </div>
             <div class="advanced-actions">
-              <button class="icon-button" :disabled="advanced.loading" @click="advanced.refreshStashes">
-                <RefreshCw :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.stash.refresh')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.stash.refresh')"
+                @click="runUiAction('advanced.stash.refresh', () => advanced.refreshStashes())"
+              >
+                <component
+                  :is="actionIcon('advanced.stash.refresh', RefreshCw)"
+                  :class="actionIconClass('advanced.stash.refresh')"
+                  :size="14"
+                />
                 <span>刷新</span>
               </button>
-              <button class="icon-button danger" :disabled="advanced.loading || !advanced.stashes.length" @click="clearAllStashes">
-                <Trash2 :size="14" />
+              <button
+                class="icon-button danger"
+                :class="actionButtonClass('advanced.stash.clear')"
+                :disabled="advanced.loading || !advanced.stashes.length"
+                :aria-busy="isUiActionPending('advanced.stash.clear')"
+                @click="clearAllStashes"
+              >
+                <component
+                  :is="actionIcon('advanced.stash.clear', Trash2)"
+                  :class="actionIconClass('advanced.stash.clear')"
+                  :size="14"
+                />
                 <span>清空</span>
               </button>
             </div>
@@ -6434,9 +7650,33 @@ async function jumpMergeConflict(direction: -1 | 1) {
                   <strong>{{ item.stashRef }}</strong>
                   <small>{{ item.message }} · {{ formatTime(item.createdAt) }}</small>
                 </span>
-                <button class="mini-button" @click="runStashAction(item.stashRef, 'apply')">应用</button>
-                <button class="mini-button" @click="runStashAction(item.stashRef, 'pop')">弹出</button>
-                <button class="mini-button danger" @click="runStashAction(item.stashRef, 'drop')">删除</button>
+                <button
+                  class="mini-button"
+                  :class="actionButtonClass(`advanced.stash.apply:${item.stashRef}`)"
+                  :disabled="advanced.loading"
+                  :aria-busy="isUiActionPending(`advanced.stash.apply:${item.stashRef}`)"
+                  @click="runStashAction(item.stashRef, 'apply')"
+                >
+                  {{ isUiActionPending(`advanced.stash.apply:${item.stashRef}`) ? "应用中" : "应用" }}
+                </button>
+                <button
+                  class="mini-button"
+                  :class="actionButtonClass(`advanced.stash.pop:${item.stashRef}`)"
+                  :disabled="advanced.loading"
+                  :aria-busy="isUiActionPending(`advanced.stash.pop:${item.stashRef}`)"
+                  @click="runStashAction(item.stashRef, 'pop')"
+                >
+                  {{ isUiActionPending(`advanced.stash.pop:${item.stashRef}`) ? "弹出中" : "弹出" }}
+                </button>
+                <button
+                  class="mini-button danger"
+                  :class="actionButtonClass(`advanced.stash.drop:${item.stashRef}`)"
+                  :disabled="advanced.loading"
+                  :aria-busy="isUiActionPending(`advanced.stash.drop:${item.stashRef}`)"
+                  @click="runStashAction(item.stashRef, 'drop')"
+                >
+                  {{ isUiActionPending(`advanced.stash.drop:${item.stashRef}`) ? "删除中" : "删除" }}
+                </button>
               </div>
             </div>
           </section>
@@ -6447,12 +7687,32 @@ async function jumpMergeConflict(direction: -1 | 1) {
               <span>子模块 / LFS</span>
             </div>
             <div class="advanced-actions">
-              <button class="icon-button" :disabled="advanced.loading" @click="updateAllSubmodules">
-                <RefreshCw :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.submodule.update')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.submodule.update')"
+                @click="updateAllSubmodules"
+              >
+                <component
+                  :is="actionIcon('advanced.submodule.update', RefreshCw)"
+                  :class="actionIconClass('advanced.submodule.update')"
+                  :size="14"
+                />
                 <span>更新子模块</span>
               </button>
-              <button class="icon-button" :disabled="advanced.loading" @click="loadLfsStatus">
-                <ListChecks :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('advanced.lfs')"
+                :disabled="advanced.loading"
+                :aria-busy="isUiActionPending('advanced.lfs')"
+                @click="loadLfsStatus"
+              >
+                <component
+                  :is="actionIcon('advanced.lfs', ListChecks)"
+                  :class="actionIconClass('advanced.lfs')"
+                  :size="14"
+                />
                 <span>LFS 状态</span>
               </button>
             </div>
@@ -6578,12 +7838,21 @@ async function jumpMergeConflict(direction: -1 | 1) {
                   <X :size="12" />
                 </button>
               </span>
-              <button class="icon-only-button" title="刷新日志" :disabled="history.loading" @click="history.refresh()">
-                <RefreshCw :size="14" />
+              <button
+                class="icon-only-button"
+                :class="actionButtonClass('history.refresh')"
+                title="刷新日志"
+                :disabled="history.loading"
+                :aria-busy="isUiActionPending('history.refresh')"
+                @click="runUiAction('history.refresh', () => history.refresh())"
+              >
+                <component
+                  :is="actionIcon('history.refresh', RefreshCw)"
+                  :class="actionIconClass('history.refresh')"
+                  :size="14"
+                />
               </button>
             </div>
-
-            <div v-if="activeError" class="message error">{{ activeError }}</div>
 
             <div class="log-table-head">
               <span />
@@ -6680,64 +7949,8 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 <div v-if="selectedCommitRefs.length" class="commit-refs">
                   <em v-for="refName in selectedCommitRefs" :key="refName">{{ refName }}</em>
                 </div>
-                <p>父提交: {{ history.details.commit.parents.length || "无" }}</p>
               </div>
               <div v-else class="diff-empty">选择一个提交</div>
-
-              <div class="log-detail-actions">
-                <button class="icon-only-button" title="挑选提交" :disabled="!history.selectedOid || operations.loading" @click="cherryPickSelectedCommit">
-                  <GitCommitVertical :size="14" />
-                </button>
-                <button class="icon-only-button" title="检出此提交" :disabled="!history.selectedOid || advanced.loading" @click="checkoutSelectedRevision">
-                  <GitBranch :size="14" />
-                </button>
-                <button class="icon-only-button" title="创建修正提交" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(false)">
-                  <Plus :size="14" />
-                </button>
-                <button class="icon-only-button" title="创建压缩提交" :disabled="!history.selectedOid || advanced.loading" @click="fixupSelectedCommit(true)">
-                  <Plus :size="14" />
-                </button>
-                <button
-                  class="icon-only-button"
-                  title="应用选中文件"
-                  :disabled="!history.selectedOid || selectedCommitFilePaths.length === 0 || operations.loading"
-                  @click="cherryPickSelectedFiles"
-                >
-                  <Download :size="14" />
-                </button>
-                <button class="icon-only-button" title="反向提交" :disabled="!history.selectedOid || operations.loading" @click="revertSelectedCommit">
-                  <RotateCcw :size="14" />
-                </button>
-                <button class="icon-only-button danger" title="重置到此提交" :disabled="!history.selectedOid || operations.loading" @click="resetToSelectedCommit">
-                  <Trash2 :size="14" />
-                </button>
-                <button class="icon-only-button danger" title="撤销最后一次提交" :disabled="!branch?.head || operations.loading" @click="undoLastCommit">
-                  <RotateCcw :size="14" />
-                </button>
-                <button class="icon-only-button danger" title="丢弃提交" :disabled="!history.selectedOid || advanced.loading" @click="dropSelectedCommit">
-                  <Trash2 :size="14" />
-                </button>
-                <button class="icon-only-button" title="推送提交" :disabled="!history.selectedOid || advanced.loading || !remote.selectedRemote" @click="pushSelectedCommit">
-                  <Upload :size="14" />
-                </button>
-              </div>
-
-              <div class="log-operation-options">
-                <label class="log-option" title="只应用反向变更，不自动创建 revert 提交">
-                  <input v-model="operations.revertNoCommit" type="checkbox" />
-                  <span>revert 不提交</span>
-                </label>
-                <label class="log-option" title="撤销提交后保留为已暂存变更">
-                  <input v-model="operations.undoKeepStaged" type="checkbox" />
-                  <span>撤销后暂存</span>
-                </label>
-                <select v-model="operations.resetMode" class="reset-select" title="重置模式">
-                  <option value="soft">软重置</option>
-                  <option value="mixed">混合重置</option>
-                  <option value="hard">硬重置</option>
-                </select>
-              </div>
-
             </section>
           </aside>
         </div>
@@ -6874,18 +8087,36 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <h2>{{ branchNameLabel(branch?.currentBranch) }}</h2>
           </div>
           <div class="log-actions">
-            <button class="tool-button" :disabled="branches.loading" @click="branches.refresh()">
-              <RefreshCw :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('branches.refresh')"
+              :disabled="branches.loading"
+              :aria-busy="isUiActionPending('branches.refresh')"
+              @click="runUiAction('branches.refresh', () => branches.refresh())"
+            >
+              <component
+                :is="actionIcon('branches.refresh', RefreshCw)"
+                :class="actionIconClass('branches.refresh')"
+                :size="14"
+              />
               <span>刷新分支</span>
             </button>
-            <button class="tool-button" :disabled="!newBranchName.trim()" @click="createBranchFromHead">
-              <Plus :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass(branchActionKey('create'))"
+              :disabled="!newBranchName.trim() || branches.loading"
+              :aria-busy="isUiActionPending(branchActionKey('create'))"
+              @click="createBranchFromHead"
+            >
+              <component
+                :is="actionIcon(branchActionKey('create'), Plus)"
+                :class="actionIconClass(branchActionKey('create'))"
+                :size="14"
+              />
               <span>创建分支</span>
             </button>
           </div>
         </div>
-
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -6934,26 +8165,68 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <h2>{{ remote.selectedRemote || "origin" }}</h2>
           </div>
           <div class="log-actions">
-            <button class="tool-button" :disabled="!repos.current || remote.loading" @click="runRemoteAction('fetch')">
-              <Download :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass(remoteActionKey('fetch'))"
+              :disabled="!repos.current || remote.loading"
+              :aria-busy="isUiActionActive(remoteActionKey('fetch'))"
+              @pointerdown="runRemoteActionFromPointer($event, 'fetch')"
+              @click="runRemoteAction('fetch')"
+            >
+              <component
+                :is="actionIcon(remoteActionKey('fetch'), Download)"
+                :class="actionIconClass(remoteActionKey('fetch'))"
+                :size="14"
+              />
               <span>获取</span>
             </button>
-            <button class="tool-button" :disabled="repos.initializedItems.length === 0 || remote.loading" @click="fetchAllRepositories">
-              <Download :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('remote.fetchAll')"
+              :disabled="repos.initializedItems.length === 0 || remote.loading"
+              :aria-busy="isUiActionActive('remote.fetchAll')"
+              @pointerdown="fetchAllRepositoriesFromPointer"
+              @click="fetchAllRepositories"
+            >
+              <component
+                :is="actionIcon('remote.fetchAll', Download)"
+                :class="actionIconClass('remote.fetchAll')"
+                :size="14"
+              />
               <span>全部获取</span>
             </button>
-            <button class="tool-button" :disabled="!repos.current || remote.loading" @click="runRemoteAction('pull')">
-              <RotateCcw :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass(remoteActionKey('pull'))"
+              :disabled="!repos.current || remote.loading"
+              :aria-busy="isUiActionActive(remoteActionKey('pull'))"
+              @pointerdown="runRemoteActionFromPointer($event, 'pull')"
+              @click="runRemoteAction('pull')"
+            >
+              <component
+                :is="actionIcon(remoteActionKey('pull'), RotateCcw)"
+                :class="actionIconClass(remoteActionKey('pull'))"
+                :size="14"
+              />
               <span>拉取</span>
             </button>
-            <button class="tool-button primary" :disabled="!repos.current || remote.loading" @click="runRemoteAction('push')">
-              <Upload :size="14" />
+            <button
+              class="tool-button primary"
+              :class="actionButtonClass(remoteActionKey('push'))"
+              :disabled="!repos.current || remote.loading"
+              :aria-busy="isUiActionActive(remoteActionKey('push'))"
+              @pointerdown="runRemoteActionFromPointer($event, 'push')"
+              @click="runRemoteAction('push')"
+            >
+              <component
+                :is="actionIcon(remoteActionKey('push'), Upload)"
+                :class="actionIconClass(remoteActionKey('push'))"
+                :size="14"
+              />
               <span>推送</span>
             </button>
           </div>
         </div>
-
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -7000,8 +8273,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <h2>{{ operations.state?.active ? formatOperationName(operations.activeOperation) : "合并 / 变基" }}</h2>
           </div>
           <div class="log-actions">
-            <button class="tool-button" :disabled="operations.loading" @click="operations.refresh()">
-              <RefreshCw :size="14" />
+            <button
+              class="tool-button"
+              :class="actionButtonClass('operations.refresh')"
+              :disabled="operations.loading"
+              :aria-busy="isUiActionPending('operations.refresh')"
+              @click="runUiAction('operations.refresh', () => operations.refresh())"
+            >
+              <component
+                :is="actionIcon('operations.refresh', RefreshCw)"
+                :class="actionIconClass('operations.refresh')"
+                :size="14"
+              />
               <span>刷新操作</span>
             </button>
             <button class="tool-button" :disabled="operations.loading" @click="workbenchMode = 'changes'">
@@ -7010,8 +8293,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
             </button>
           </div>
         </div>
-
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
 
         <div class="context-dashboard">
           <section class="dashboard-card">
@@ -7022,16 +8303,46 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <strong>{{ operations.state?.active ? formatOperationName(operations.activeOperation) : "无进行中操作" }}</strong>
             <small>{{ operations.conflictedPaths.length }} 个冲突文件</small>
             <div v-if="operations.state?.active" class="operation-actions">
-              <button class="icon-button" :disabled="operations.loading" @click="runOperationControl('continue')">
-                <Check :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('operation.continue')"
+                :disabled="operations.loading"
+                :aria-busy="isUiActionPending('operation.continue')"
+                @click="runOperationControl('continue')"
+              >
+                <component
+                  :is="actionIcon('operation.continue', Check)"
+                  :class="actionIconClass('operation.continue')"
+                  :size="14"
+                />
                 <span>继续</span>
               </button>
-              <button class="icon-button" :disabled="operations.loading || !canSkipOperation" @click="runOperationControl('skip')">
-                <Minus :size="14" />
+              <button
+                class="icon-button"
+                :class="actionButtonClass('operation.skip')"
+                :disabled="operations.loading || !canSkipOperation"
+                :aria-busy="isUiActionPending('operation.skip')"
+                @click="runOperationControl('skip')"
+              >
+                <component
+                  :is="actionIcon('operation.skip', Minus)"
+                  :class="actionIconClass('operation.skip')"
+                  :size="14"
+                />
                 <span>跳过</span>
               </button>
-              <button class="icon-button danger" :disabled="operations.loading" @click="runOperationControl('abort')">
-                <X :size="14" />
+              <button
+                class="icon-button danger"
+                :class="actionButtonClass('operation.abort')"
+                :disabled="operations.loading"
+                :aria-busy="isUiActionPending('operation.abort')"
+                @click="runOperationControl('abort')"
+              >
+                <component
+                  :is="actionIcon('operation.abort', X)"
+                  :class="actionIconClass('operation.abort')"
+                  :size="14"
+                />
                 <span>终止</span>
               </button>
             </div>
@@ -7079,7 +8390,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
 
         <div class="log-file-picker-tree">
           <div v-if="project.loading" class="diff-empty">加载中</div>
-          <div v-else-if="project.error" class="message error">{{ project.error }}</div>
           <div v-else-if="visibleLogFilePickerRows.length <= 1" class="diff-empty">没有文件</div>
           <template v-else>
             <button
@@ -7190,42 +8500,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <span>{{ projectCloseDialog.saving ? "保存中" : "保存文件" }}</span>
           </button>
         </footer>
-      </section>
-    </div>
-
-    <div v-if="worktreeCommitDialog" class="modal-backdrop" @click.self="cancelWorktreeCommitDialog">
-      <section
-        class="worktree-commit-modal"
-        role="alertdialog"
-        aria-modal="true"
-        aria-label="确认直接提交工作区更改"
-        tabindex="-1"
-        @keydown.esc.prevent="cancelWorktreeCommitDialog"
-      >
-        <TriangleAlert class="worktree-commit-warning" :size="54" />
-        <div class="worktree-commit-copy">
-          <strong>没有可提交的暂存更改。</strong>
-          <p>{{ worktreeCommitQuestion }}</p>
-        </div>
-        <div class="worktree-commit-actions">
-          <button
-            class="worktree-commit-choice primary"
-            type="button"
-            autofocus
-            @click="answerWorktreeCommitDialog('yes')"
-          >
-            是
-          </button>
-          <button class="worktree-commit-choice" type="button" @click="answerWorktreeCommitDialog('always')">
-            始终
-          </button>
-          <button class="worktree-commit-choice" type="button" @click="answerWorktreeCommitDialog('never')">
-            从不
-          </button>
-          <button class="worktree-commit-choice" type="button" @click="cancelWorktreeCommitDialog">
-            取消
-          </button>
-        </div>
       </section>
     </div>
 
@@ -7529,6 +8803,7 @@ button:disabled {
 }
 
 .app-shell {
+  position: relative;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   height: 100vh;
@@ -7875,6 +9150,16 @@ button:disabled {
   box-shadow:
     inset 0 0 0 1px rgba(255, 255, 255, 0.16),
     0 0 0 2px rgba(91, 143, 215, 0.12);
+}
+
+button.loading,
+button[aria-busy="true"] {
+  cursor: progress;
+}
+
+button.loading:disabled,
+button[aria-busy="true"]:disabled {
+  opacity: 0.86;
 }
 
 .button-spinner {
@@ -9786,6 +11071,14 @@ button:disabled {
   background: #ffffff;
 }
 
+.log-ref-tool-button.loading,
+.log-ref-tool-button[aria-busy="true"] {
+  border-color: #5b8fd7;
+  color: #ffffff;
+  background: #3f6ea5;
+  box-shadow: 0 0 0 2px rgba(91, 143, 215, 0.16);
+}
+
 .log-ref-tool-button.active {
   color: #d0a044;
 }
@@ -9797,6 +11090,12 @@ button:disabled {
 .log-ref-tool-button:disabled {
   opacity: 0.42;
   cursor: not-allowed;
+}
+
+.log-ref-tool-button.loading:disabled,
+.log-ref-tool-button[aria-busy="true"]:disabled {
+  opacity: 0.86;
+  cursor: progress;
 }
 
 .log-ref-tool-separator {
@@ -10024,7 +11323,10 @@ button:disabled {
 }
 
 .project-name-modal,
-.project-unsaved-modal {
+.project-unsaved-modal,
+.pull-confirm-modal,
+.submit-confirm-modal,
+.error-modal {
   display: grid;
   gap: 12px;
   width: min(420px, calc(100vw - 56px));
@@ -10035,10 +11337,20 @@ button:disabled {
   background: #fbfcfa;
 }
 
+.error-modal {
+  width: min(520px, calc(100vw - 56px));
+}
+
 .project-name-modal header,
 .project-name-modal footer,
 .project-unsaved-modal header,
-.project-unsaved-modal footer {
+.project-unsaved-modal footer,
+.pull-confirm-modal header,
+.pull-confirm-modal footer,
+.submit-confirm-modal header,
+.submit-confirm-modal footer,
+.error-modal header,
+.error-modal footer {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -10046,7 +11358,10 @@ button:disabled {
 }
 
 .project-name-modal h2,
-.project-unsaved-modal h2 {
+.project-unsaved-modal h2,
+.pull-confirm-modal h2,
+.submit-confirm-modal h2,
+.error-modal h2 {
   margin: 0;
   color: #26312b;
   font-size: 15px;
@@ -10060,6 +11375,8 @@ button:disabled {
   margin: -4px 0 0;
   color: #b64242;
   font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .project-name-modal footer {
@@ -10071,6 +11388,262 @@ button:disabled {
   color: #4b574f;
   font-size: 13px;
   line-height: 1.5;
+}
+
+.pull-confirm-modal {
+  width: min(560px, calc(100vw - 56px));
+}
+
+.pull-confirm-modal p,
+.submit-confirm-modal p {
+  margin: 0;
+  color: #4b574f;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.pull-confirm-summary,
+.submit-confirm-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid #dce2dd;
+  border-radius: 7px;
+  background: #f3f6f2;
+}
+
+.pull-confirm-summary span,
+.pull-confirm-summary small,
+.submit-confirm-summary span,
+.submit-confirm-summary small {
+  color: #68756d;
+  font-size: 12px;
+}
+
+.pull-confirm-summary strong,
+.submit-confirm-summary strong {
+  overflow: hidden;
+  color: #25312b;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.submit-confirm-modal {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: min(880px, calc(100vw - 56px));
+  max-height: min(760px, calc(100vh - 56px));
+}
+
+.submit-confirm-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.92fr) minmax(300px, 1.08fr);
+  gap: 12px;
+  min-height: 0;
+}
+
+.submit-confirm-left,
+.submit-confirm-file-tree-panel {
+  min-width: 0;
+  min-height: 0;
+}
+
+.submit-confirm-left {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+}
+
+.submit-confirm-file-tree-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid #dce2dd;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.submit-confirm-file-tree-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #e3e8e4;
+  background: #f5f7f5;
+}
+
+.submit-confirm-file-tree-head span {
+  color: #26312b;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.submit-confirm-file-tree-head strong {
+  color: #68756d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.submit-confirm-message {
+  display: grid;
+  gap: 5px;
+  padding: 9px 10px;
+  border: 1px solid #dce2dd;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.submit-confirm-meta {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 2px;
+}
+
+.submit-confirm-meta span {
+  color: #68756d;
+  font-size: 12px;
+}
+
+.submit-confirm-meta strong {
+  overflow: hidden;
+  color: #25312b;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.submit-confirm-message span {
+  color: #68756d;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.submit-confirm-message strong {
+  overflow-wrap: anywhere;
+  color: #25312b;
+  font-size: 13px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.submit-confirm-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.submit-confirm-options span {
+  padding: 4px 8px;
+  border: 1px solid #dce2dd;
+  border-radius: 999px;
+  color: #4b574f;
+  background: #f6f8f6;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.pull-confirm-file-list {
+  display: grid;
+  gap: 6px;
+  max-height: 178px;
+  overflow: auto;
+}
+
+.pull-confirm-file-list span {
+  overflow: hidden;
+  padding: 7px 9px;
+  border: 1px solid #e0e6e1;
+  border-radius: 6px;
+  color: #4b574f;
+  background: #ffffff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.submit-confirm-empty {
+  padding: 8px 10px;
+  border: 1px dashed #d6ded8;
+  border-radius: 7px;
+  background: #f8faf8;
+}
+
+.submit-confirm-file-tree {
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+}
+
+.submit-confirm-file-row {
+  display: grid;
+  grid-template-columns: 14px 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 30px;
+  border: 0;
+  border-radius: 5px;
+  color: #3d4942;
+  background: transparent;
+  text-align: left;
+}
+
+.submit-confirm-file-row:hover {
+  background: #eef3f0;
+}
+
+.submit-confirm-file-row:not(.directory) {
+  cursor: default;
+}
+
+.submit-confirm-file-toggle-placeholder {
+  width: 14px;
+  height: 14px;
+}
+
+.submit-confirm-file-main {
+  display: grid;
+  min-width: 0;
+}
+
+.submit-confirm-file-main strong,
+.submit-confirm-file-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.submit-confirm-file-main strong {
+  color: #26312b;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.submit-confirm-file-main small {
+  color: #68756d;
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .submit-confirm-modal {
+    max-height: calc(100vh - 32px);
+  }
+
+  .submit-confirm-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .submit-confirm-file-tree-panel {
+    min-height: 260px;
+  }
 }
 
 .project-unsaved-modal strong {
@@ -10090,6 +11663,33 @@ button:disabled {
 }
 
 .project-unsaved-modal footer {
+  justify-content: flex-end;
+}
+
+.pull-confirm-modal footer {
+  justify-content: flex-end;
+}
+
+.submit-confirm-modal footer {
+  justify-content: flex-end;
+}
+
+.error-modal-message {
+  overflow: auto;
+  max-height: min(240px, 42vh);
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid #f0c6bc;
+  border-radius: 7px;
+  color: #842c22;
+  background: #fde9e3;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error-modal footer {
   justify-content: flex-end;
 }
 
@@ -10269,9 +11869,9 @@ button:disabled {
 .log-workspace-tab::before {
   content: "";
   position: absolute;
-  left: 10px;
+  left: 0;
+  right: 0;
   bottom: 0;
-  width: 42px;
   height: 2px;
   background: transparent;
 }
@@ -10868,23 +12468,6 @@ button:disabled {
 .log-info-body p strong {
   color: #25312b;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.log-detail-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.log-operation-options {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-}
-
-.log-operation-options .reset-select {
-  height: 30px;
 }
 
 .log-diff-preview {
@@ -11916,9 +13499,9 @@ button:disabled {
 .project-tab::before {
   content: "";
   position: absolute;
-  left: 10px;
+  left: 0;
+  right: 0;
   bottom: 0;
-  width: 42px;
   height: 2px;
   background: transparent;
 }
@@ -13272,6 +14855,9 @@ html[data-theme="dark"] .modal-backdrop {
 html[data-theme="dark"] .log-file-picker-modal,
 html[data-theme="dark"] .project-name-modal,
 html[data-theme="dark"] .project-unsaved-modal,
+html[data-theme="dark"] .pull-confirm-modal,
+html[data-theme="dark"] .submit-confirm-modal,
+html[data-theme="dark"] .error-modal,
 html[data-theme="dark"] .worktree-commit-modal,
 html[data-theme="dark"] .log-filter-popover {
   border-color: #4e5258;
@@ -13281,14 +14867,64 @@ html[data-theme="dark"] .log-filter-popover {
 
 html[data-theme="dark"] .project-name-modal h2,
 html[data-theme="dark"] .project-unsaved-modal h2,
+html[data-theme="dark"] .pull-confirm-modal h2,
+html[data-theme="dark"] .submit-confirm-modal h2,
+html[data-theme="dark"] .error-modal h2,
 html[data-theme="dark"] .project-unsaved-modal strong,
+html[data-theme="dark"] .pull-confirm-summary strong,
+html[data-theme="dark"] .submit-confirm-summary strong,
+html[data-theme="dark"] .submit-confirm-message strong,
 html[data-theme="dark"] .worktree-commit-copy strong {
   color: #dfe1e5;
 }
 
 html[data-theme="dark"] .project-unsaved-modal p,
+html[data-theme="dark"] .pull-confirm-modal p,
+html[data-theme="dark"] .submit-confirm-modal p,
 html[data-theme="dark"] .worktree-commit-copy p {
   color: #a9b7c6;
+}
+
+html[data-theme="dark"] .submit-confirm-summary,
+html[data-theme="dark"] .submit-confirm-message,
+html[data-theme="dark"] .submit-confirm-file-tree-panel,
+html[data-theme="dark"] .submit-confirm-empty {
+  border-color: #3c3f41;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .submit-confirm-summary span,
+html[data-theme="dark"] .submit-confirm-summary small,
+html[data-theme="dark"] .submit-confirm-message span,
+html[data-theme="dark"] .submit-confirm-meta span,
+html[data-theme="dark"] .submit-confirm-file-tree-head strong,
+html[data-theme="dark"] .submit-confirm-file-main small,
+html[data-theme="dark"] .submit-confirm-options span {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .submit-confirm-meta strong,
+html[data-theme="dark"] .submit-confirm-file-tree-head span,
+html[data-theme="dark"] .submit-confirm-file-main strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .submit-confirm-file-tree-head {
+  border-bottom-color: #3c3f41;
+  background: #252629;
+}
+
+html[data-theme="dark"] .submit-confirm-file-row {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .submit-confirm-file-row:hover {
+  background: #313335;
+}
+
+html[data-theme="dark"] .submit-confirm-options span {
+  border-color: #4e5258;
+  background: #313438;
 }
 
 html[data-theme="dark"] .worktree-commit-choice {
@@ -13311,8 +14947,26 @@ html[data-theme="dark"] .project-unsaved-path {
   background: #1e1f22;
 }
 
+html[data-theme="dark"] .pull-confirm-summary,
+html[data-theme="dark"] .pull-confirm-file-list span {
+  border-color: #3c3f41;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .pull-confirm-summary span,
+html[data-theme="dark"] .pull-confirm-summary small,
+html[data-theme="dark"] .pull-confirm-file-list span {
+  color: #a9b7c6;
+}
+
 html[data-theme="dark"] .project-name-error {
   color: #ff8a8a;
+}
+
+html[data-theme="dark"] .error-modal-message {
+  border-color: #6b3c3a;
+  color: #ffb4a8;
+  background: #3c2525;
 }
 
 html[data-theme="dark"] .log-file-picker-tree {
@@ -13364,6 +15018,14 @@ html[data-theme="dark"] .log-ref-tool-button:hover:not(:disabled),
 html[data-theme="dark"] .log-ref-tool-button.active {
   border-color: #4e5258;
   background: #313335;
+}
+
+html[data-theme="dark"] .log-ref-tool-button.loading,
+html[data-theme="dark"] .log-ref-tool-button[aria-busy="true"] {
+  border-color: #7aa2f7;
+  color: #ffffff;
+  background: #345e9d;
+  box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.18);
 }
 
 html[data-theme="dark"] .log-ref-tool-button.active {

@@ -15,6 +15,7 @@ import type {
   ProjectFileContent,
   ProjectFileEntry,
   ProjectFileMutation,
+  PullPreflight,
   RefComparison,
   RepoStatus,
   RepositoryInfo,
@@ -130,7 +131,14 @@ export function listShelves(path: string) {
 export function commitRepo(
   path: string,
   message: string,
-  options: { amend?: boolean; signOff?: boolean; gpgSign?: boolean; author?: string; includeWorktree?: boolean } = {},
+  options: {
+    amend?: boolean;
+    signOff?: boolean;
+    gpgSign?: boolean;
+    author?: string;
+    includeWorktree?: boolean;
+    selectedPaths?: string[];
+  } = {},
 ) {
   return invoke<CommitResult>("commit", {
     path,
@@ -140,6 +148,7 @@ export function commitRepo(
     gpgSign: Boolean(options.gpgSign),
     author: options.author,
     includeWorktree: Boolean(options.includeWorktree),
+    selectedPaths: options.selectedPaths,
   });
 }
 
@@ -151,8 +160,16 @@ export function fetchRemote(path: string, remoteName?: string, options: { prune?
   });
 }
 
-export function pullRemote(path: string, remoteName?: string) {
-  return invoke<CommandResult>("pull", { path, remoteName });
+export function pullPreflight(path: string, remoteName?: string) {
+  return invoke<PullPreflight>("pull_preflight", { path, remoteName });
+}
+
+export function pullRemote(path: string, remoteName?: string, options: { smartMerge?: boolean } = {}) {
+  return invoke<CommandResult>("pull", {
+    path,
+    remoteName,
+    smartMerge: Boolean(options.smartMerge),
+  });
 }
 
 export function pushRemote(

@@ -3,12 +3,14 @@ import {
   addRemote,
   deleteRemote,
   fetchRemote,
+  pullPreflight,
   pullRemote,
   pushRemote,
   updateRemote,
 } from "../lib/gitboxCommands";
 import { useChangesStore } from "./changes";
 import { useRepositoriesStore } from "./repositories";
+import type { CommandResult } from "../types/gitbox";
 
 type RemoteAction = "fetch" | "pull" | "push";
 
@@ -54,7 +56,10 @@ export const useRemoteStore = defineStore("remote", {
     notice: "",
   }),
   actions: {
-    async run(action: RemoteAction) {
+    async run(
+      action: RemoteAction,
+      options: { smartMerge?: boolean } = {},
+    ): Promise<CommandResult | undefined> {
       const repos = useRepositoriesStore();
       const changes = useChangesStore();
       if (!repos.path) return;
@@ -73,7 +78,7 @@ export const useRemoteStore = defineStore("remote", {
           action === "fetch"
             ? await fetchRemote(repos.path, remoteName, { prune: this.fetchPrune })
             : action === "pull"
-              ? await pullRemote(repos.path, remoteName)
+              ? await pullRemote(repos.path, remoteName, { smartMerge: options.smartMerge })
               : await pushRemote(repos.path, remoteName, {
                   targetBranch: this.targetBranch,
                   setUpstream: this.setUpstream,
@@ -84,12 +89,28 @@ export const useRemoteStore = defineStore("remote", {
         changes.notice = result.message;
         await repos.select(repos.path);
         await changes.refresh();
+        return result;
       } catch (error) {
         this.error = String(error);
         if (action === "push" && looksLikeRejectedPush(this.error)) {
           this.lastPushRejected = true;
           this.lastRejectedTarget = this.pushTargetRef();
         }
+        throw error;
+      } finally {
+        this.loading = false;
+      }
+    },
+    async previewPull() {
+      const repos = useRepositoriesStore();
+      if (!repos.path) return;
+
+      this.loading = true;
+      this.error = "";
+      try {
+        return await pullPreflight(repos.path, this.selectedRemote || undefined);
+      } catch (error) {
+        this.error = String(error);
         throw error;
       } finally {
         this.loading = false;
