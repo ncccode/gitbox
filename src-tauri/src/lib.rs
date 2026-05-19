@@ -5,7 +5,7 @@ use gitbox::{
     checkout_remote_branch_core, checkout_revision_core, cherry_pick_commit_core,
     cherry_pick_files_core, cleanup_merged_branches_core, clear_stashes_core,
     clone_repository_core, commit_details_core, commit_file_diff_core, commit_message_history_core,
-    commit_with_full_options_core, compare_refs_core, conflict_details_core,
+    commit_with_full_options_and_worktree_core, compare_refs_core, conflict_details_core,
     copy_project_entry_core, create_branch_core, create_patch_core, create_project_directory_core,
     create_project_file_core, create_tag_core, create_worktree_core, delete_branch_core,
     delete_project_entry_core, delete_remote_branch_core, delete_remote_core,
@@ -237,14 +237,16 @@ fn commit(
     sign_off: Option<bool>,
     gpg_sign: Option<bool>,
     author: Option<String>,
+    include_worktree: Option<bool>,
 ) -> CommandResponse<CommitResult> {
-    commit_with_full_options_core(
+    commit_with_full_options_and_worktree_core(
         &path,
         message,
         amend.unwrap_or(false),
         sign_off.unwrap_or(false),
         gpg_sign.unwrap_or(false),
         author,
+        include_worktree.unwrap_or(false),
     )
     .map_err(|err| err.command())
 }

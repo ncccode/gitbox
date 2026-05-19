@@ -12,6 +12,10 @@ import {
   ChevronRight,
   Check,
   Columns3,
+  CornerDownLeft,
+  CornerDownRight,
+  ChevronsLeft,
+  ChevronsRight,
   Download,
   File as FileIcon,
   FileSearch,
@@ -21,6 +25,7 @@ import {
   GitCommitVertical,
   ListChecks,
   LoaderCircle,
+  Lock,
   Minus,
   Plus,
   RefreshCw,
@@ -28,6 +33,7 @@ import {
   Search,
   Star,
   Trash2,
+  TriangleAlert,
   Upload,
   UserRound,
   X,
@@ -57,7 +63,7 @@ import { PROJECT_ROOT_PATH, useProjectStore } from "./stores/project";
 import { useRemoteStore } from "./stores/remote";
 import { useRepositoriesStore } from "./stores/repositories";
 import { useSettingsStore } from "./stores/settings";
-import type { LayoutPanelKey, ThemeMode } from "./stores/settings";
+import type { DirectWorktreeCommitPolicy, LayoutPanelKey, ThemeMode } from "./stores/settings";
 import type {
   BranchInfo,
   ChangeSide,
@@ -65,6 +71,7 @@ import type {
   CommitFileDiffMode,
   CommitFileChange,
   CommitSummary,
+  ConflictBlock,
   DiffHunk,
   DiffResponse,
   ProjectFileEntry,
@@ -115,12 +122,23 @@ const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
 const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
+const worktreeCommitDialog = ref<WorktreeCommitDialog | null>(null);
+const mergeCurrentScroller = ref<HTMLElement | null>(null);
+const mergeCurrentGutter = ref<HTMLElement | null>(null);
+const mergeResultGutter = ref<HTMLElement | null>(null);
+const mergeResultTextarea = ref<HTMLTextAreaElement | null>(null);
+const mergeIncomingScroller = ref<HTMLElement | null>(null);
+const mergeIncomingGutter = ref<HTMLElement | null>(null);
+const mergeResultScrollTop = ref(0);
+const mergeResultScrollLeft = ref(0);
 const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
 const changeDiffScroller = ref<HTMLElement | null>(null);
 const logDiffScroller = ref<HTMLElement | null>(null);
 const activeChangeDiffHunkIndex = ref<number | null>(null);
 const activeLogDiffHunkIndex = ref(0);
+const activeMergeConflictOrdinal = ref(0);
 const syncingSideBySideScroll = new WeakSet<HTMLElement>();
+const syncingMergeEditorScroll = new WeakSet<HTMLElement>();
 const projectEditorScrollTop = ref(0);
 const projectEditorScrollLeft = ref(0);
 const projectEditorViewportHeight = ref(0);
@@ -136,6 +154,7 @@ type ChangeFileGroup = {
   label: string;
   side: ChangeSide;
   files: ChangedFile[];
+  conflictFiles: ChangedFile[];
   changelistId?: string;
 };
 type ProjectCodeToken = {
@@ -228,6 +247,40 @@ type ProjectCloseDialog = {
   saving: boolean;
   error: string;
 };
+type WorktreeCommitChoice = "yes" | "always" | "never" | "cancel";
+type WorktreeCommitDialog = {
+  pushAfter: boolean;
+  resolve: (choice: WorktreeCommitChoice) => void;
+};
+type MergeCodeLine = {
+  id: string;
+  number: number;
+  text: string;
+  tokens: ProjectCodeToken[];
+  conflict: boolean;
+  conflictIndex: number | null;
+  conflictSide: MergeConflictSide | null;
+  conflictStart: boolean;
+  conflictEnd: boolean;
+};
+type MergeConflictSide = "ours" | "base" | "theirs";
+type MergeConflictSelection = MergeConflictSide | "combined";
+type MergeConflictSnippet = {
+  index: number;
+  content: string;
+  side: MergeConflictSide;
+};
+type MergeConflictLineRange = {
+  startLine: number;
+  endLine: number;
+};
+type MergeConflictConnection = MergeConflictLineRange & {
+  key: string;
+  source: "current" | "incoming";
+  side: MergeConflictSide;
+  resultStartLine: number;
+  resultEndLine: number;
+};
 type NoticeToast = {
   id: number;
   message: string;
@@ -256,6 +309,9 @@ const PROJECT_EDITOR_PADDING_TOP = 12;
 const PROJECT_EDITOR_OVERSCAN_LINES = 32;
 const PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT = 720;
 const PROJECT_TOKEN_CACHE_LIMIT = 6000;
+const MERGE_EDITOR_LINE_HEIGHT = 18;
+const MERGE_EDITOR_PADDING_TOP = 12;
+const MERGE_CONNECTION_WIDTH = 46;
 const projectKeywordCache = new Map<string, Set<string>>();
 const projectLineTokenCache = new Map<string, ProjectCodeToken[]>();
 
@@ -270,6 +326,7 @@ const changeFileGroups = computed<ChangeFileGroup[]>(() => {
         label: "暂存的变更",
         side: "staged",
         files: activeFiles.value,
+        conflictFiles: [],
         changelistId: "default",
       },
     ];
@@ -285,20 +342,34 @@ const changeFileGroups = computed<ChangeFileGroup[]>(() => {
         label: list.id === "default" && list.name === "默认变更" ? "变更" : list.name,
         side: "unstaged",
         files: [],
+        conflictFiles: [],
         changelistId: list.id,
       },
     ]),
   );
   const untrackedFiles: ChangedFile[] = [];
+  const workspaceTreeFiles = [...activeFiles.value];
+  const workspaceTreePaths = new Set(workspaceTreeFiles.map((file) => file.path));
+  for (const file of changes.files) {
+    if (file.conflicted && !workspaceTreePaths.has(file.path)) {
+      workspaceTreeFiles.push(file);
+      workspaceTreePaths.add(file.path);
+    }
+  }
 
-  for (const file of activeFiles.value) {
+  for (const file of workspaceTreeFiles) {
     const list = changelists.listForPath(file.path);
     if (file.untracked && list.id === "default") {
       untrackedFiles.push(file);
       continue;
     }
 
-    listGroups.get(`changelist-${list.id}`)?.files.push(file);
+    const group = listGroups.get(`changelist-${list.id}`);
+    if (file.conflicted) {
+      group?.conflictFiles.push(file);
+    } else {
+      group?.files.push(file);
+    }
   }
 
   const unstagedGroups: ChangeFileGroup[] = [
@@ -308,11 +379,14 @@ const changeFileGroups = computed<ChangeFileGroup[]>(() => {
       label: "未纳入版本控制的文件",
       side: "unstaged",
       files: untrackedFiles,
+      conflictFiles: [],
       changelistId: "default",
     },
   ];
 
-  return unstagedGroups.filter((group) => group.key !== "untracked" || group.files.length > 0);
+  return unstagedGroups.filter(
+    (group) => group.key !== "untracked" || group.files.length + group.conflictFiles.length > 0,
+  );
 });
 const usesRepositoryContext = computed(() => repositoryContextModes.has(workbenchMode.value));
 const usesWorkbenchContext = computed(() => workbenchContextModes.has(workbenchMode.value));
@@ -346,6 +420,9 @@ const activeNotice = computed(
     changes.notice ||
     remote.notice,
 );
+const workspaceRefreshBusy = computed(
+  () => changes.loading || branches.loading || history.loading || operations.loading || diff.loading,
+);
 const selectedDiffFileTitle = computed(() => changes.selectedFile ?? "未选择文件");
 const activeChangeDiffLanguage = computed(() => projectLanguageForPath(changes.selectedFile));
 const activeChangeSideBySideDiffRows = computed(() =>
@@ -376,13 +453,26 @@ const changeDiffLeftDetail = computed(() =>
 );
 const changeDiffRightLabel = computed(() => (settings.selectedSide === "staged" ? "暂存区" : "工作区"));
 const changeDiffRightDetail = computed(() => changes.selectedFile ?? "");
+const worktreeOnlyCommit = computed(() => (counts.value?.staged ?? 0) === 0 && (counts.value?.unstaged ?? 0) > 0);
 const canCommit = computed(() =>
-  Boolean(commit.message.trim() && ((counts.value?.staged ?? 0) > 0 || (commit.amend && branch.value?.head))),
+  Boolean(
+    commit.message.trim() &&
+      ((counts.value?.staged ?? 0) > 0 ||
+        (counts.value?.unstaged ?? 0) > 0 ||
+        (commit.amend && branch.value?.head)),
+  ),
 );
-const commitBusy = computed(() => commit.loading || pendingCommitAction.value !== null);
+const commitBusy = computed(
+  () => commit.loading || pendingCommitAction.value !== null || worktreeCommitDialog.value !== null,
+);
 const commitButtonLabel = computed(() => (pendingCommitAction.value === "commit" ? "提交中" : "提交"));
 const commitPushButtonLabel = computed(() =>
   pendingCommitAction.value === "push" ? "提交并推送中" : "提交并推送",
+);
+const worktreeCommitQuestion = computed(() =>
+  worktreeCommitDialog.value?.pushAfter
+    ? "是否要暂存所有更改，提交并推送？"
+    : "是否要暂存所有更改并直接提交？",
 );
 const selectedCommitTitle = computed(() => {
   if (!history.details) return "未选择提交";
@@ -556,6 +646,80 @@ const resultHasConflictMarkers = computed(
     operations.resultDraft.includes("=======") ||
     operations.resultDraft.includes(">>>>>>> "),
 );
+const mergeConflictCount = computed(() => operations.conflict?.blocks.length ?? 0);
+const mergeConflictSummary = computed(() => {
+  const changeLabel = operations.resultDirty ? "有未保存变更" : "没有变更";
+  return `${changeLabel}。${mergeConflictCount.value} 个冲突。`;
+});
+const mergeConflictPositionLabel = computed(() => {
+  if (mergeConflictCount.value === 0) return "0/0";
+  return `${activeMergeConflictOrdinal.value + 1}/${mergeConflictCount.value}`;
+});
+const mergeResultStateLabel = computed(() => {
+  if (resultHasConflictMarkers.value) return "结果仍包含冲突标记";
+  return operations.resultDirty ? "结果有未保存修改" : "结果未修改";
+});
+const showMergeConflictWorkbench = computed(() => workbenchMode.value === "changes" && Boolean(operations.conflict));
+const mergeCurrentSourceLabel = computed(() => branch.value?.currentBranch || "当前版本");
+const mergeIncomingSourceLabel = computed(() => operations.mergeTarget.trim() || "传入版本");
+const mergeLanguage = computed(() => projectLanguageForPath(operations.conflict?.path));
+const mergeResultConflictSnippets = computed<MergeConflictSnippet[]>(() =>
+  buildResultMergeConflictSnippets(
+    operations.conflict?.blocks ?? [],
+    operations.resultBlockSelections,
+    operations.resultBlockReplacements,
+  ),
+);
+const mergeCurrentConflictSnippets = computed<MergeConflictSnippet[]>(() =>
+  buildComparedMergeConflictSnippets(operations.conflict?.blocks ?? [], "ours", operations.resultBlockSelections),
+);
+const mergeIncomingConflictSnippets = computed<MergeConflictSnippet[]>(() =>
+  buildComparedMergeConflictSnippets(operations.conflict?.blocks ?? [], "theirs", operations.resultBlockSelections),
+);
+const mergeCurrentLines = computed(() =>
+  buildMergeCodeLines(
+    operations.conflict?.ours ?? "",
+    mergeCurrentConflictSnippets.value,
+    mergeLanguage.value,
+  ),
+);
+const mergeIncomingLines = computed(() =>
+  buildMergeCodeLines(
+    operations.conflict?.theirs ?? "",
+    mergeIncomingConflictSnippets.value,
+    mergeLanguage.value,
+  ),
+);
+const mergeResultLines = computed(() =>
+  buildMergeCodeLines(operations.resultDraft, mergeResultConflictSnippets.value, mergeLanguage.value),
+);
+const mergeCurrentConflictRanges = computed(() =>
+  buildMergeSourceConflictRanges(operations.conflict?.ours ?? "", operations.conflict?.blocks ?? [], "ours"),
+);
+const mergeIncomingConflictRanges = computed(() =>
+  buildMergeSourceConflictRanges(operations.conflict?.theirs ?? "", operations.conflict?.blocks ?? [], "theirs"),
+);
+const mergeCurrentResultConnections = computed(() =>
+  buildMergeConflictConnections(
+    operations.conflict?.blocks ?? [],
+    mergeCurrentConflictRanges.value,
+    mergeResultLines.value,
+    "current",
+    "ours",
+  ),
+);
+const mergeIncomingResultConnections = computed(() =>
+  buildMergeConflictConnections(
+    operations.conflict?.blocks ?? [],
+    mergeIncomingConflictRanges.value,
+    mergeResultLines.value,
+    "incoming",
+    "theirs",
+  ),
+);
+const mergeResultRenderStyle = computed(() => ({
+  transform: `translate(${-mergeResultScrollLeft.value}px, ${-mergeResultScrollTop.value}px)`,
+}));
 const effectiveTheme = computed<Exclude<ThemeMode, "system">>(() => {
   if (settings.themeMode === "system") {
     return systemPrefersDark.value ? "dark" : "light";
@@ -941,6 +1105,26 @@ watch(
   () => activeLogDiffTab.value?.diff?.text,
   () => {
     activeLogDiffHunkIndex.value = 0;
+  },
+);
+
+watch(
+  mergeConflictCount,
+  (count) => {
+    if (count === 0) {
+      activeMergeConflictOrdinal.value = 0;
+      return;
+    }
+    activeMergeConflictOrdinal.value = Math.min(activeMergeConflictOrdinal.value, count - 1);
+  },
+);
+
+watch(
+  () => operations.selectedConflictPath,
+  () => {
+    activeMergeConflictOrdinal.value = 0;
+    mergeResultScrollTop.value = 0;
+    mergeResultScrollLeft.value = 0;
   },
 );
 
@@ -1470,6 +1654,12 @@ function startPanelResize(panel: LayoutPanelKey, event: PointerEvent) {
 }
 
 function selectFile(file: ChangedFile, side: ChangeSide) {
+  if (!file.conflicted && operations.conflict) {
+    operations.conflict = null;
+    operations.resultDraft = "";
+    operations.resultDirty = false;
+    operations.selectedConflictPath = "";
+  }
   changes.selectFile(file, side);
 }
 
@@ -1812,11 +2002,64 @@ async function deleteShelfRecord(record: ShelfInfo) {
   await runAndReload(() => changes.deleteShelfRecord(record));
 }
 
+function setDirectWorktreeCommitPolicy(policy: DirectWorktreeCommitPolicy) {
+  settings.setDirectWorktreeCommitPolicy(policy);
+}
+
+function promptWorktreeCommit(pushAfter: boolean) {
+  return new Promise<WorktreeCommitChoice>((resolve) => {
+    worktreeCommitDialog.value = { pushAfter, resolve };
+  });
+}
+
+function answerWorktreeCommitDialog(choice: WorktreeCommitChoice) {
+  const dialog = worktreeCommitDialog.value;
+  if (!dialog) return;
+
+  dialog.resolve(choice);
+  worktreeCommitDialog.value = null;
+}
+
+function cancelWorktreeCommitDialog() {
+  answerWorktreeCommitDialog("cancel");
+}
+
+function rejectDirectWorktreeCommit() {
+  commit.error = "没有可提交的暂存更改。请先暂存更改后再提交。";
+}
+
+async function resolveDirectWorktreeCommit(pushAfter: boolean) {
+  if (!worktreeOnlyCommit.value) return false;
+
+  if (settings.directWorktreeCommitPolicy === "always") return true;
+  if (settings.directWorktreeCommitPolicy === "never") {
+    rejectDirectWorktreeCommit();
+    return null;
+  }
+
+  const choice = await promptWorktreeCommit(pushAfter);
+  if (choice === "yes") return true;
+  if (choice === "always") {
+    setDirectWorktreeCommitPolicy("always");
+    return true;
+  }
+  if (choice === "never") {
+    setDirectWorktreeCommitPolicy("never");
+    rejectDirectWorktreeCommit();
+  }
+
+  return null;
+}
+
 async function commitCurrent(pushAfter = false) {
   if (commitBusy.value || !canCommit.value || (pushAfter && !remote.selectedRemote)) return;
+  commit.error = "";
+  const includeWorktree = await resolveDirectWorktreeCommit(pushAfter);
+  if (includeWorktree === null || !canCommit.value || (pushAfter && !remote.selectedRemote)) return;
+
   pendingCommitAction.value = pushAfter ? "push" : "commit";
   try {
-    await commit.commit(pushAfter ? remote.selectedRemote || undefined : undefined);
+    await commit.commit(pushAfter ? remote.selectedRemote || undefined : undefined, includeWorktree);
     await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
     syncOperationTargets();
   } finally {
@@ -2575,6 +2818,18 @@ function formatStatusKind(kind: string) {
 
 function isChangeFileGroupExpanded(key: string) {
   return expandedChangeFileGroups.value[key] ?? true;
+}
+
+function changeConflictGroupKey(group: ChangeFileGroup) {
+  return `${group.key}:conflicts`;
+}
+
+function changeFileGroupFiles(group: ChangeFileGroup) {
+  return [...group.files, ...group.conflictFiles];
+}
+
+function changeFileGroupCount(group: ChangeFileGroup) {
+  return group.files.length + group.conflictFiles.length;
 }
 
 function toggleChangeFileGroup(key: string) {
@@ -3995,37 +4250,458 @@ function setConflictResultFromEvent(event: Event) {
   operations.setResultDraft((event.target as HTMLTextAreaElement).value);
 }
 
+function mergeEditorScrollTargets() {
+  return [mergeCurrentScroller.value, mergeResultTextarea.value, mergeIncomingScroller.value].filter(
+    (target): target is HTMLElement => Boolean(target),
+  );
+}
+
+function syncMergeResultGutter(scrollTop: number) {
+  if (mergeResultGutter.value) {
+    mergeResultGutter.value.scrollTop = scrollTop;
+  }
+}
+
+function syncMergeSourceGutters(scrollTop: number) {
+  for (const gutter of [mergeCurrentGutter.value, mergeIncomingGutter.value]) {
+    if (gutter && gutter.scrollTop !== scrollTop) {
+      gutter.scrollTop = scrollTop;
+    }
+  }
+}
+
+function updateMergeResultRenderScroll(fallbackTop = 0, fallbackLeft = 0) {
+  mergeResultScrollTop.value = mergeResultTextarea.value?.scrollTop ?? fallbackTop;
+  mergeResultScrollLeft.value = mergeResultTextarea.value?.scrollLeft ?? fallbackLeft;
+  syncMergeResultGutter(mergeResultScrollTop.value);
+  syncMergeSourceGutters(mergeResultScrollTop.value);
+}
+
+function setMergeEditorScroll(top: number, left: number, source: HTMLElement | null = null) {
+  for (const target of mergeEditorScrollTargets()) {
+    if (target === source) continue;
+    if (target.scrollTop === top && target.scrollLeft === left) continue;
+    syncingMergeEditorScroll.add(target);
+    target.scrollTop = top;
+    target.scrollLeft = left;
+  }
+  updateMergeResultRenderScroll(top, left);
+  syncMergeSourceGutters(top);
+}
+
+function syncMergeEditorScroll(event: Event) {
+  const source = event.currentTarget as HTMLElement | null;
+  if (!source) return;
+  if (syncingMergeEditorScroll.has(source)) {
+    syncingMergeEditorScroll.delete(source);
+    if (source === mergeResultTextarea.value) {
+      updateMergeResultRenderScroll();
+    } else {
+      syncMergeSourceGutters(source.scrollTop);
+    }
+    return;
+  }
+
+  setMergeEditorScroll(source.scrollTop, source.scrollLeft, source);
+}
+
 async function selectConflict(path: string) {
+  const file = conflictedFiles.value.find((item) => item.path === path);
+  if (file) {
+    selectFile(file, "unstaged");
+  }
+  workbenchMode.value = "changes";
   await operations.loadConflict(path);
-}
-
-async function resolveConflictFile(side: "ours" | "theirs") {
-  await operations.resolveFile(side);
-  await reloadAfterGitOperation();
-}
-
-async function resolveConflictBlock(index: number, side: "ours" | "base" | "theirs") {
-  await operations.resolveBlock(index, side);
-  await reloadAfterGitOperation();
-}
-
-async function markConflictResolved() {
-  await operations.markResolved();
-  await reloadAfterGitOperation();
 }
 
 async function saveConflictResult(markResolved = false) {
   await operations.saveResult(markResolved);
   if (markResolved) {
     await reloadAfterGitOperation();
-  } else if (operations.selectedConflictPath) {
-    await operations.loadConflict(operations.selectedConflictPath);
   }
 }
 
-async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
+function acceptConflictSide(side: "ours" | "theirs") {
   operations.useAllConflictBlocks(side);
-  await saveConflictResult(false);
+}
+
+function acceptConflictBlock(index: number | null, side: "ours" | "theirs") {
+  if (index === null) return;
+  operations.replaceResultBlock(index, side);
+}
+
+function mergeConflictBlockSelection(index: number | null): MergeConflictSelection | null {
+  if (index === null) return null;
+  return (operations.resultBlockSelections[index] as MergeConflictSelection | undefined) ?? null;
+}
+
+function shouldAppendConflictBlock(index: number | null, side: "ours" | "theirs") {
+  const selection = mergeConflictBlockSelection(index);
+  return Boolean(selection && selection !== "combined" && selection !== side);
+}
+
+function mergeConflictActionTitle(index: number | null, side: "ours" | "theirs") {
+  const sideLabel = side === "ours" ? "当前" : "传入";
+  return shouldAppendConflictBlock(index, side) ? `追加${sideLabel}块到结果后` : `接受${sideLabel}块到结果`;
+}
+
+function applyConflictBlock(index: number | null, side: "ours" | "theirs") {
+  if (index === null) return;
+  if (shouldAppendConflictBlock(index, side)) {
+    operations.appendResultBlock(index, side);
+    return;
+  }
+  acceptConflictBlock(index, side);
+}
+
+function mergeConflictLineClasses(line: MergeCodeLine) {
+  return {
+    conflict: line.conflict,
+    "conflict-start": line.conflictStart,
+    "conflict-end": line.conflictEnd,
+    "conflict-ours": line.conflictSide === "ours",
+    "conflict-base": line.conflictSide === "base",
+    "conflict-theirs": line.conflictSide === "theirs",
+  };
+}
+
+async function resetConflictResultDraft() {
+  await operations.restoreInitialResult();
+}
+
+function splitMergeLines(content: string) {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+  if (lines.length > 1 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines.length ? lines : [""];
+}
+
+function findLineRange(lines: string[], needle: string[], startAt: number) {
+  if (needle.length === 0) return -1;
+  for (let index = startAt; index <= lines.length - needle.length; index += 1) {
+    const matches = needle.every((line, offset) => lines[index + offset] === line);
+    if (matches) return index;
+  }
+  return -1;
+}
+
+function mergeConflictBlockContent(block: ConflictBlock, side: MergeConflictSide) {
+  if (side === "base") return block.base ?? "";
+  return block[side];
+}
+
+function mergeConflictSnippet(block: ConflictBlock, side: MergeConflictSide): MergeConflictSnippet {
+  return {
+    index: block.index,
+    content: mergeConflictBlockContent(block, side),
+    side,
+  };
+}
+
+function mergeConflictBlockSnippets(block: ConflictBlock) {
+  const snippets = [mergeConflictSnippet(block, "ours")];
+  if (block.base) snippets.push(mergeConflictSnippet(block, "base"));
+  snippets.push(mergeConflictSnippet(block, "theirs"));
+  return snippets;
+}
+
+function buildResultMergeConflictSnippets(
+  blocks: ConflictBlock[],
+  selections: Record<number, MergeConflictSelection>,
+  replacements: Record<number, string>,
+) {
+  return blocks.flatMap((block) => {
+    const selection = selections[block.index];
+    if (!selection || selection === "combined") {
+      return mergeConflictBlockSnippets(block);
+    }
+
+    return [
+      {
+        index: block.index,
+        content: replacements[block.index] ?? mergeConflictBlockContent(block, selection),
+        side: selection,
+      },
+    ];
+  });
+}
+
+function buildComparedMergeConflictSnippets(
+  blocks: ConflictBlock[],
+  side: MergeConflictSide,
+  selections: Record<number, MergeConflictSelection>,
+) {
+  return blocks
+    .filter((block) => {
+      const selection = selections[block.index];
+      return selection !== side;
+    })
+    .map((block) => mergeConflictSnippet(block, side));
+}
+
+function buildMergeSourceConflictRanges(
+  content: string,
+  blocks: ConflictBlock[],
+  side: MergeConflictSide,
+) {
+  const lines = splitMergeLines(content);
+  const ranges = new Map<number, MergeConflictLineRange>();
+  let searchFrom = 0;
+
+  for (const block of blocks) {
+    const snippetLines = splitMergeLines(mergeConflictBlockContent(block, side));
+    if (!snippetLines.some((line) => line.length > 0)) continue;
+
+    const foundAt = findLineRange(lines, snippetLines, searchFrom);
+    if (foundAt < 0) continue;
+
+    ranges.set(block.index, {
+      startLine: foundAt + 1,
+      endLine: foundAt + snippetLines.length,
+    });
+    searchFrom = foundAt + snippetLines.length;
+  }
+
+  return ranges;
+}
+
+function mergeResultConflictSideRanges(lines: MergeCodeLine[], conflictIndex: number) {
+  const ranges: (MergeConflictLineRange & { side: MergeConflictSide })[] = [];
+  let activeRange: (MergeConflictLineRange & { side: MergeConflictSide }) | null = null;
+
+  for (const line of lines) {
+    if (line.conflictIndex !== conflictIndex || !line.conflictSide) {
+      if (activeRange) {
+        ranges.push(activeRange);
+        activeRange = null;
+      }
+      continue;
+    }
+
+    if (activeRange && activeRange.side === line.conflictSide && activeRange.endLine + 1 === line.number) {
+      activeRange.endLine = line.number;
+      continue;
+    }
+
+    if (activeRange) {
+      ranges.push(activeRange);
+    }
+    activeRange = {
+      side: line.conflictSide,
+      startLine: line.number,
+      endLine: line.number,
+    };
+  }
+
+  if (activeRange) {
+    ranges.push(activeRange);
+  }
+
+  return ranges;
+}
+
+function buildMergeConflictConnections(
+  blocks: ConflictBlock[],
+  sourceRanges: Map<number, MergeConflictLineRange>,
+  resultLines: MergeCodeLine[],
+  source: "current" | "incoming",
+  sourceSide: "ours" | "theirs",
+) {
+  const connections: MergeConflictConnection[] = [];
+
+  for (const block of blocks) {
+    const sourceRange = sourceRanges.get(block.index);
+    if (!sourceRange) continue;
+
+    const resultRanges = mergeResultConflictSideRanges(resultLines, block.index).filter(
+      (range) => range.side === sourceSide || range.side === "base",
+    );
+    for (const resultRange of resultRanges) {
+      connections.push({
+        key: `${source}-${block.index}-${resultRange.side}-${resultRange.startLine}`,
+        source,
+        side: resultRange.side,
+        startLine: sourceRange.startLine,
+        endLine: sourceRange.endLine,
+        resultStartLine: resultRange.startLine,
+        resultEndLine: resultRange.endLine,
+      });
+    }
+  }
+
+  return connections;
+}
+
+function mergeConnectionLineTop(lineNumber: number) {
+  return MERGE_EDITOR_PADDING_TOP + (lineNumber - 1) * MERGE_EDITOR_LINE_HEIGHT - mergeResultScrollTop.value;
+}
+
+function mergeConnectionLineBottom(lineNumber: number) {
+  return mergeConnectionLineTop(lineNumber) + MERGE_EDITOR_LINE_HEIGHT;
+}
+
+function mergeConflictConnectionBounds(connection: MergeConflictConnection) {
+  const sourceTop = mergeConnectionLineTop(connection.startLine);
+  const sourceBottom = mergeConnectionLineBottom(connection.endLine);
+  const resultTop = mergeConnectionLineTop(connection.resultStartLine);
+  const resultBottom = mergeConnectionLineBottom(connection.resultEndLine);
+  const top = Math.min(sourceTop, resultTop);
+  const bottom = Math.max(sourceBottom, resultBottom);
+
+  return {
+    sourceTop,
+    sourceBottom,
+    resultTop,
+    resultBottom,
+    top,
+    height: Math.max(1, bottom - top),
+  };
+}
+
+function mergeConflictConnectionStyle(connection: MergeConflictConnection) {
+  const bounds = mergeConflictConnectionBounds(connection);
+  const edgeStyle =
+    connection.source === "current"
+      ? { right: `${-MERGE_CONNECTION_WIDTH / 2}px` }
+      : { left: `${-MERGE_CONNECTION_WIDTH / 2}px` };
+
+  return {
+    ...edgeStyle,
+    top: `${bounds.top}px`,
+    width: `${MERGE_CONNECTION_WIDTH}px`,
+    height: `${bounds.height}px`,
+  };
+}
+
+function mergeConflictConnectionViewBox(connection: MergeConflictConnection) {
+  return `0 0 ${MERGE_CONNECTION_WIDTH} ${mergeConflictConnectionBounds(connection).height}`;
+}
+
+function mergeConflictConnectionPath(connection: MergeConflictConnection) {
+  const bounds = mergeConflictConnectionBounds(connection);
+  const width = MERGE_CONNECTION_WIDTH;
+  const sourceTop = sourceConnectionTop(bounds.sourceTop, bounds.top);
+  const sourceBottom = sourceConnectionTop(bounds.sourceBottom, bounds.top);
+  const resultTop = sourceConnectionTop(bounds.resultTop, bounds.top);
+  const resultBottom = sourceConnectionTop(bounds.resultBottom, bounds.top);
+  const sourceRadius = mergeConnectionRadius(sourceBottom - sourceTop);
+  const resultRadius = mergeConnectionRadius(resultBottom - resultTop);
+  const leftControl = width * 0.34;
+  const rightControl = width * 0.66;
+
+  if (connection.source === "current") {
+    return [
+      `M 0 ${sourceTop + sourceRadius}`,
+      `Q 0 ${sourceTop} ${sourceRadius} ${sourceTop}`,
+      `C ${leftControl} ${sourceTop} ${rightControl} ${resultTop} ${width - resultRadius} ${resultTop}`,
+      `Q ${width} ${resultTop} ${width} ${resultTop + resultRadius}`,
+      `L ${width} ${resultBottom - resultRadius}`,
+      `Q ${width} ${resultBottom} ${width - resultRadius} ${resultBottom}`,
+      `C ${rightControl} ${resultBottom} ${leftControl} ${sourceBottom} ${sourceRadius} ${sourceBottom}`,
+      `Q 0 ${sourceBottom} 0 ${sourceBottom - sourceRadius}`,
+      "Z",
+    ].join(" ");
+  }
+
+  return [
+    `M 0 ${resultTop + resultRadius}`,
+    `Q 0 ${resultTop} ${resultRadius} ${resultTop}`,
+    `C ${leftControl} ${resultTop} ${rightControl} ${sourceTop} ${width - sourceRadius} ${sourceTop}`,
+    `Q ${width} ${sourceTop} ${width} ${sourceTop + sourceRadius}`,
+    `L ${width} ${sourceBottom - sourceRadius}`,
+    `Q ${width} ${sourceBottom} ${width - sourceRadius} ${sourceBottom}`,
+    `C ${rightControl} ${sourceBottom} ${leftControl} ${resultBottom} ${resultRadius} ${resultBottom}`,
+    `Q 0 ${resultBottom} 0 ${resultBottom - resultRadius}`,
+    "Z",
+  ].join(" ");
+}
+
+function sourceConnectionTop(lineTop: number, boundsTop: number) {
+  return lineTop - boundsTop;
+}
+
+function mergeConnectionRadius(height: number) {
+  return Math.min(7, Math.max(2, height / 2));
+}
+
+function buildMergeCodeLines(
+  content: string,
+  conflictSnippets: MergeConflictSnippet[],
+  language: string,
+): MergeCodeLine[] {
+  const lines = splitMergeLines(content);
+  const conflictLines = new Map<
+    number,
+    { index: number; side: MergeConflictSide; start: boolean; end: boolean }
+  >();
+  let searchFrom = 0;
+
+  conflictSnippets
+    .map((snippet) => ({
+      index: snippet.index,
+      side: snippet.side,
+      lines: splitMergeLines(snippet.content),
+    }))
+    .filter((snippet) => snippet.lines.some((line) => line.length > 0))
+    .forEach((snippet) => {
+      const foundAt = findLineRange(lines, snippet.lines, searchFrom);
+      if (foundAt < 0) return;
+      snippet.lines.forEach((_, offset) =>
+        conflictLines.set(foundAt + offset, {
+          index: snippet.index,
+          side: snippet.side,
+          start: offset === 0,
+          end: offset === snippet.lines.length - 1,
+        }),
+      );
+      searchFrom = foundAt + snippet.lines.length;
+    });
+
+  return lines.map((line, index) => ({
+    id: `${index}-${line}`,
+    number: index + 1,
+    text: line || " ",
+    tokens: tokenizeProjectLine(line || " ", language),
+    conflict: conflictLines.has(index),
+    conflictIndex: conflictLines.get(index)?.index ?? null,
+    conflictSide: conflictLines.get(index)?.side ?? null,
+    conflictStart: conflictLines.get(index)?.start ?? false,
+    conflictEnd: conflictLines.get(index)?.end ?? false,
+  }));
+}
+
+function firstMergeConflictLine(lines: MergeCodeLine[], conflictIndex: number) {
+  const line = lines.find((item) => item.conflictIndex === conflictIndex);
+  return line ? line.number - 1 : null;
+}
+
+function mergeLineScrollTop(target: HTMLElement, lineIndex: number) {
+  const style = window.getComputedStyle(target);
+  const lineHeight = Number.parseFloat(style.lineHeight) || 18;
+  const paddingTop = Number.parseFloat(style.paddingTop) || 0;
+  return Math.max(0, paddingTop + lineIndex * lineHeight - target.clientHeight / 2 + lineHeight / 2);
+}
+
+async function jumpMergeConflict(direction: -1 | 1) {
+  const count = mergeConflictCount.value;
+  if (count === 0) return;
+
+  activeMergeConflictOrdinal.value = (activeMergeConflictOrdinal.value + direction + count) % count;
+  await nextTick();
+
+  const conflictIndex = operations.conflict?.blocks[activeMergeConflictOrdinal.value]?.index;
+  const source = mergeResultTextarea.value ?? mergeCurrentScroller.value ?? mergeIncomingScroller.value;
+  if (conflictIndex === undefined || !source) return;
+
+  const lineIndex =
+    firstMergeConflictLine(mergeResultLines.value, conflictIndex) ??
+    firstMergeConflictLine(mergeCurrentLines.value, conflictIndex) ??
+    firstMergeConflictLine(mergeIncomingLines.value, conflictIndex);
+  if (lineIndex === null) return;
+
+  setMergeEditorScroll(mergeLineScrollTop(source, lineIndex), source.scrollLeft);
 }
 
 </script>
@@ -4504,59 +5180,17 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
           </button>
         </div>
 
-        <section v-if="conflictedFiles.length" class="conflict-panel">
-          <div class="conflict-header">
-            <strong>冲突 {{ conflictedFiles.length }}</strong>
-            <span>{{ operations.activeOperation ? formatOperationName(operations.activeOperation) : "待处理" }}</span>
-          </div>
-
-          <div class="conflict-file-tabs">
-            <button
-              v-for="file in conflictedFiles"
-              :key="file.path"
-              :class="{ active: operations.selectedConflictPath === file.path }"
-              @click="selectConflict(file.path)"
-            >
-              {{ file.path }}
-            </button>
-          </div>
-
-          <div v-if="operations.conflict" class="conflict-actions">
-            <button class="icon-button" @click="resolveConflictFile('ours')">
-              <Check :size="14" />
-              <span>整文件当前</span>
-            </button>
-            <button class="icon-button" @click="resolveConflictFile('theirs')">
-              <Download :size="14" />
-              <span>整文件传入</span>
-            </button>
-            <button class="icon-button" @click="markConflictResolved">
-              <ListChecks :size="14" />
-              <span>标记解决</span>
-            </button>
-            <button class="icon-button" @click="applyAllConflictBlocks('ours')">
-              <Check :size="14" />
-              <span>全部当前</span>
-            </button>
-            <button class="icon-button" @click="applyAllConflictBlocks('theirs')">
-              <Download :size="14" />
-              <span>全部传入</span>
-            </button>
-          </div>
-
-          <div v-if="operations.conflict?.blocks.length" class="conflict-blocks">
-            <div v-for="block in operations.conflict.blocks" :key="block.index" class="conflict-block">
-              <div class="conflict-block-title">冲突块 {{ block.index + 1 }}</div>
-              <div class="conflict-block-actions">
-                <button class="mini-button" @click="resolveConflictBlock(block.index, 'ours')">当前</button>
-                <button v-if="block.base" class="mini-button" @click="resolveConflictBlock(block.index, 'base')">基线</button>
-                <button class="mini-button" @click="resolveConflictBlock(block.index, 'theirs')">传入</button>
-              </div>
-            </div>
-          </div>
-        </section>
-
         <div class="file-actions">
+          <button
+            class="icon-only-button file-actions-refresh"
+            type="button"
+            title="刷新变更"
+            :disabled="workspaceRefreshBusy"
+            @click="refreshAll"
+          >
+            <LoaderCircle v-if="workspaceRefreshBusy" class="button-spinner" :size="14" />
+            <RefreshCw v-else :size="14" />
+          </button>
           <button
             class="icon-button"
             title="暂存选中文件"
@@ -4614,18 +5248,78 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
                 <input
                   class="change-group-checkbox"
                   type="checkbox"
-                  :checked="isChangeFileGroupSelected(group.files)"
-                  :disabled="group.files.length === 0"
-                  :indeterminate.prop="isChangeFileGroupPartiallySelected(group.files)"
-                  @change="toggleChangeFileGroupSelection(group.files)"
+                  :checked="isChangeFileGroupSelected(changeFileGroupFiles(group))"
+                  :disabled="changeFileGroupCount(group) === 0"
+                  :indeterminate.prop="isChangeFileGroupPartiallySelected(changeFileGroupFiles(group))"
+                  @change="toggleChangeFileGroupSelection(changeFileGroupFiles(group))"
                 />
                 <button class="change-group-title" type="button" @click="toggleChangeFileGroup(group.key)">
                   <span>{{ group.label }}</span>
-                  <small>{{ group.files.length }} 个文件</small>
+                  <small>{{ changeFileGroupCount(group) }} 个文件</small>
                 </button>
               </div>
               <div v-if="isChangeFileGroupExpanded(group.key)" class="change-file-group-list">
-                <div v-if="group.files.length === 0" class="change-file-group-empty">没有文件</div>
+                <div v-if="changeFileGroupCount(group) === 0" class="change-file-group-empty">没有文件</div>
+                <div v-if="group.conflictFiles.length" class="change-conflict-tree">
+                  <div class="change-conflict-header">
+                    <button
+                      class="change-group-toggle"
+                      type="button"
+                      @click="toggleChangeFileGroup(changeConflictGroupKey(group))"
+                    >
+                      <ChevronDown v-if="isChangeFileGroupExpanded(changeConflictGroupKey(group))" :size="14" />
+                      <ChevronRight v-else :size="14" />
+                    </button>
+                    <input
+                      class="change-group-checkbox"
+                      type="checkbox"
+                      :checked="isChangeFileGroupSelected(group.conflictFiles)"
+                      :indeterminate.prop="isChangeFileGroupPartiallySelected(group.conflictFiles)"
+                      @change="toggleChangeFileGroupSelection(group.conflictFiles)"
+                    />
+                    <button
+                      class="change-group-title conflict"
+                      type="button"
+                      @click="toggleChangeFileGroup(changeConflictGroupKey(group))"
+                    >
+                      <span>合并冲突</span>
+                    </button>
+                  </div>
+                  <div
+                    v-if="isChangeFileGroupExpanded(changeConflictGroupKey(group))"
+                    class="change-conflict-file-list"
+                  >
+                    <button
+                      v-for="file in group.conflictFiles"
+                      :key="`${group.side}-conflict-${file.path}`"
+                      class="file-row conflict-file-row"
+                      :class="{
+                        active: changes.selectedFile === file.path,
+                        selected: changes.selectedPaths.includes(file.path),
+                        [`status-${file.kind.split('|')[0]}`]: true,
+                      }"
+                      :title="`${file.path} · ${formatStatusKind(file.kind)}`"
+                      @click="selectConflict(file.path)"
+                      @contextmenu.prevent.stop="openChangeFileContextMenu(file, group.side, $event)"
+                    >
+                      <input
+                        type="checkbox"
+                        :checked="changes.selectedPaths.includes(file.path)"
+                        @click.stop
+                        @change="changes.togglePath(file.path)"
+                      />
+                      <span class="status-dot" :class="file.kind.split('|')[0]" />
+                      <span class="change-file-icon" :class="changeFileIconClass(file.path)">
+                        <span v-if="fileTypeLabel(file.path)">{{ fileTypeLabel(file.path) }}</span>
+                        <FileIcon v-else :size="13" />
+                      </span>
+                      <span class="file-main">
+                        <strong>{{ fileBaseName(file.path) }}</strong>
+                        <small>{{ fileContextPath(file.path) }}</small>
+                      </span>
+                    </button>
+                  </div>
+                </div>
                 <button
                   v-for="file in group.files"
                   :key="`${group.side}-${file.path}`"
@@ -5052,84 +5746,275 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
       />
 
       <main class="diff-pane">
-        <template v-if="operations.conflict">
-        <div class="diff-header merge-header">
-          <div>
-            <span class="eyebrow">三方合并</span>
-            <h2>{{ operations.conflict.path }}</h2>
+        <template v-if="showMergeConflictWorkbench">
+        <div class="merge-workbench">
+          <div class="diff-header merge-header">
+            <div class="merge-title-block">
+              <span class="eyebrow">合并</span>
+              <h2>{{ operations.conflict?.path }}</h2>
+            </div>
+            <div class="merge-conflict-summary">{{ mergeConflictSummary }}</div>
           </div>
-          <div class="merge-header-actions">
-            <button class="tool-button" @click="operations.useResultSource('ours')">
-              <Check :size="14" />
-              <span>结果=当前</span>
-            </button>
-            <button class="tool-button" :disabled="!operations.conflict.base" @click="operations.useResultSource('base')">
-              <ListChecks :size="14" />
-              <span>结果=基线</span>
-            </button>
-            <button class="tool-button" @click="operations.useResultSource('theirs')">
-              <Download :size="14" />
-              <span>结果=传入</span>
-            </button>
+
+          <div v-if="activeError" class="message error">{{ activeError }}</div>
+
+          <div class="merge-editor-toolbar">
+            <div class="merge-toolbar-status">
+              <div class="merge-conflict-jump-actions" aria-label="冲突导航">
+                <button
+                  class="icon-only-button"
+                  :disabled="mergeConflictCount === 0"
+                  aria-label="上一个冲突"
+                  title="上一个冲突"
+                  @click="jumpMergeConflict(-1)"
+                >
+                  <ArrowUp :size="14" />
+                </button>
+                <button
+                  class="icon-only-button"
+                  :disabled="mergeConflictCount === 0"
+                  aria-label="下一个冲突"
+                  title="下一个冲突"
+                  @click="jumpMergeConflict(1)"
+                >
+                  <ArrowDown :size="14" />
+                </button>
+                <small class="merge-conflict-position">{{ mergeConflictPositionLabel }}</small>
+              </div>
+            </div>
+            <div class="merge-save-actions">
+              <span class="merge-result-state" :class="{ warning: resultHasConflictMarkers }">
+                {{ mergeResultStateLabel }}
+              </span>
+              <button class="tool-button" :disabled="operations.loading || !operations.resultDirty" @click="saveConflictResult(false)">
+                <RefreshCw :size="14" />
+                <span>保存结果</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="merge-editor">
+            <div class="merge-connection-layer" aria-hidden="true">
+              <div class="merge-connection-column current">
+                <svg
+                  v-for="connection in mergeCurrentResultConnections"
+                  :key="connection.key"
+                  class="merge-connection"
+                  :class="[`merge-connection-${connection.source}`, `conflict-${connection.side}`]"
+                  :style="mergeConflictConnectionStyle(connection)"
+                  :viewBox="mergeConflictConnectionViewBox(connection)"
+                  preserveAspectRatio="none"
+                >
+                  <path :d="mergeConflictConnectionPath(connection)" />
+                </svg>
+              </div>
+              <div class="merge-connection-column result"></div>
+              <div class="merge-connection-column incoming">
+                <svg
+                  v-for="connection in mergeIncomingResultConnections"
+                  :key="connection.key"
+                  class="merge-connection"
+                  :class="[`merge-connection-${connection.source}`, `conflict-${connection.side}`]"
+                  :style="mergeConflictConnectionStyle(connection)"
+                  :viewBox="mergeConflictConnectionViewBox(connection)"
+                  preserveAspectRatio="none"
+                >
+                  <path :d="mergeConflictConnectionPath(connection)" />
+                </svg>
+              </div>
+            </div>
+            <section class="merge-column current">
+              <div class="merge-column-title">
+                <div>
+                  <strong>当前</strong>
+                  <span><Lock :size="12" /> 来自 {{ mergeCurrentSourceLabel }}</span>
+                </div>
+              </div>
+              <div
+                class="merge-source-body current"
+              >
+                <div
+                  ref="mergeCurrentScroller"
+                  class="merge-code-view"
+                  aria-label="当前版本内容"
+                  @scroll="syncMergeEditorScroll"
+                >
+                  <div
+                    v-for="line in mergeCurrentLines"
+                    :key="line.id"
+                    class="merge-code-line"
+                    :class="mergeConflictLineClasses(line)"
+                    :data-merge-conflict-index="line.conflictIndex ?? undefined"
+                  >
+                    <span class="merge-line-content"><template
+                      v-for="(token, tokenIndex) in line.tokens"
+                      :key="tokenIndex"
+                    ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                  </div>
+                </div>
+                <div ref="mergeCurrentGutter" class="merge-source-gutter current" aria-label="当前版本行号">
+                  <div
+                    v-for="line in mergeCurrentLines"
+                    :key="`current-gutter-${line.id}`"
+                    class="merge-source-gutter-line"
+                    :class="mergeConflictLineClasses(line)"
+                  >
+                    <span v-if="line.conflictStart" class="merge-line-actions current">
+                      <button
+                        type="button"
+                        class="merge-inline-action clear"
+                        :disabled="operations.loading"
+                        title="拒绝当前块，使用传入块"
+                        aria-label="拒绝当前块，使用传入块"
+                        @click.stop="acceptConflictBlock(line.conflictIndex, 'theirs')"
+                      >
+                        <X :size="12" />
+                      </button>
+                      <button
+                        type="button"
+                        class="merge-inline-action accept"
+                        :disabled="operations.loading"
+                        :title="mergeConflictActionTitle(line.conflictIndex, 'ours')"
+                        :aria-label="mergeConflictActionTitle(line.conflictIndex, 'ours')"
+                        @click.stop="applyConflictBlock(line.conflictIndex, 'ours')"
+                      >
+                        <CornerDownRight v-if="shouldAppendConflictBlock(line.conflictIndex, 'ours')" :size="14" />
+                        <ChevronsRight v-else :size="14" />
+                      </button>
+                    </span>
+                    <span class="merge-line-number-text">{{ line.number }}</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <section class="merge-column result">
+              <div class="merge-column-title">
+                <div>
+                  <strong>结果</strong>
+                  <span>{{ operations.resultDirty ? "已修改" : "未修改" }}</span>
+                </div>
+              </div>
+              <div class="merge-result-body">
+                <div ref="mergeResultGutter" class="merge-result-gutter" aria-hidden="true">
+                  <span
+                    v-for="line in mergeResultLines"
+                    :key="`result-gutter-${line.id}`"
+                    class="merge-result-gutter-line"
+                    :class="mergeConflictLineClasses(line)"
+                  >
+                    {{ line.number }}
+                  </span>
+                </div>
+                <div class="merge-result-editor">
+                  <div class="merge-result-render" aria-hidden="true">
+                    <div class="merge-result-render-content" :style="mergeResultRenderStyle">
+                      <div
+                        v-for="line in mergeResultLines"
+                        :key="`result-render-${line.id}`"
+                        class="merge-result-render-line"
+                        :class="mergeConflictLineClasses(line)"
+                      ><template
+                        v-for="(token, tokenIndex) in line.tokens"
+                        :key="tokenIndex"
+                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></div>
+                    </div>
+                  </div>
+                <textarea
+                  ref="mergeResultTextarea"
+                  :value="operations.resultDraft"
+                  spellcheck="false"
+                  @input="setConflictResultFromEvent"
+                  @scroll="syncMergeEditorScroll"
+                />
+                </div>
+              </div>
+            </section>
+
+            <section class="merge-column incoming">
+              <div class="merge-column-title">
+                <div>
+                  <strong>传入</strong>
+                  <span><Lock :size="12" /> 来自 {{ mergeIncomingSourceLabel }}</span>
+                </div>
+              </div>
+              <div
+                class="merge-source-body incoming"
+              >
+                <div ref="mergeIncomingGutter" class="merge-source-gutter incoming" aria-label="传入版本行号">
+                  <div
+                    v-for="line in mergeIncomingLines"
+                    :key="`incoming-gutter-${line.id}`"
+                    class="merge-source-gutter-line"
+                    :class="mergeConflictLineClasses(line)"
+                  >
+                    <span class="merge-line-number-text">{{ line.number }}</span>
+                    <span v-if="line.conflictStart" class="merge-line-actions incoming">
+                      <button
+                        type="button"
+                        class="merge-inline-action accept"
+                        :disabled="operations.loading"
+                        :title="mergeConflictActionTitle(line.conflictIndex, 'theirs')"
+                        :aria-label="mergeConflictActionTitle(line.conflictIndex, 'theirs')"
+                        @click.stop="applyConflictBlock(line.conflictIndex, 'theirs')"
+                      >
+                        <CornerDownLeft v-if="shouldAppendConflictBlock(line.conflictIndex, 'theirs')" :size="14" />
+                        <ChevronsLeft v-else :size="14" />
+                      </button>
+                      <button
+                        type="button"
+                        class="merge-inline-action clear"
+                        :disabled="operations.loading"
+                        title="拒绝传入块，使用当前块"
+                        aria-label="拒绝传入块，使用当前块"
+                        @click.stop="acceptConflictBlock(line.conflictIndex, 'ours')"
+                      >
+                        <X :size="12" />
+                      </button>
+                    </span>
+                  </div>
+                </div>
+                <div
+                  ref="mergeIncomingScroller"
+                  class="merge-code-view"
+                  aria-label="传入版本内容"
+                  @scroll="syncMergeEditorScroll"
+                >
+                  <div
+                    v-for="line in mergeIncomingLines"
+                    :key="line.id"
+                    class="merge-code-line"
+                    :class="mergeConflictLineClasses(line)"
+                    :data-merge-conflict-index="line.conflictIndex ?? undefined"
+                  >
+                    <span class="merge-line-content"><template
+                      v-for="(token, tokenIndex) in line.tokens"
+                      :key="tokenIndex"
+                    ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                  </div>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="merge-editor-footer">
+            <div class="merge-accept-actions">
+              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide('ours')">接受左侧</button>
+              <button class="tool-button" :disabled="operations.loading" @click="acceptConflictSide('theirs')">接受右侧</button>
+            </div>
+            <div class="merge-save-actions">
+              <button class="tool-button" :disabled="operations.loading" @click="resetConflictResultDraft">取消</button>
+              <button
+                class="tool-button primary"
+                :disabled="operations.loading || resultHasConflictMarkers"
+                @click="saveConflictResult(true)"
+              >
+                <Check :size="14" />
+                <span>应用</span>
+              </button>
+            </div>
           </div>
         </div>
-
-        <div v-if="activeError" class="message error">{{ activeError }}</div>
-
-        <div class="merge-editor-toolbar">
-          <span :class="{ warning: resultHasConflictMarkers }">
-            {{ resultHasConflictMarkers ? "结果仍包含冲突标记" : "结果可标记为解决" }}
-          </span>
-          <div class="merge-save-actions">
-            <button class="tool-button" :disabled="operations.loading || !operations.resultDirty" @click="saveConflictResult(false)">
-              <RefreshCw :size="14" />
-              <span>保存结果</span>
-            </button>
-            <button
-              class="tool-button primary"
-              :disabled="operations.loading || resultHasConflictMarkers"
-              @click="saveConflictResult(true)"
-            >
-              <Check :size="14" />
-              <span>保存并标记解决</span>
-            </button>
-          </div>
-        </div>
-
-        <div class="merge-editor">
-          <section class="merge-column">
-            <div class="merge-column-title">
-              <strong>当前</strong>
-              <span>当前版本</span>
-            </div>
-            <pre>{{ operations.conflict.ours || "" }}</pre>
-          </section>
-
-          <section class="merge-column result">
-            <div class="merge-column-title">
-              <strong>结果</strong>
-              <span>{{ operations.resultDirty ? "已修改" : "未修改" }}</span>
-            </div>
-            <textarea
-              :value="operations.resultDraft"
-              spellcheck="false"
-              @input="setConflictResultFromEvent"
-            />
-          </section>
-
-          <section class="merge-column">
-            <div class="merge-column-title">
-              <strong>传入</strong>
-              <span>传入版本</span>
-            </div>
-            <pre>{{ operations.conflict.theirs || "" }}</pre>
-          </section>
-        </div>
-
-        <details v-if="operations.conflict.base" class="merge-base-panel">
-          <summary>基线版本</summary>
-          <pre>{{ operations.conflict.base }}</pre>
-        </details>
         </template>
 
         <template v-else-if="workbenchMode === 'project'">
@@ -6305,6 +7190,42 @@ async function applyAllConflictBlocks(side: "ours" | "base" | "theirs") {
             <span>{{ projectCloseDialog.saving ? "保存中" : "保存文件" }}</span>
           </button>
         </footer>
+      </section>
+    </div>
+
+    <div v-if="worktreeCommitDialog" class="modal-backdrop" @click.self="cancelWorktreeCommitDialog">
+      <section
+        class="worktree-commit-modal"
+        role="alertdialog"
+        aria-modal="true"
+        aria-label="确认直接提交工作区更改"
+        tabindex="-1"
+        @keydown.esc.prevent="cancelWorktreeCommitDialog"
+      >
+        <TriangleAlert class="worktree-commit-warning" :size="54" />
+        <div class="worktree-commit-copy">
+          <strong>没有可提交的暂存更改。</strong>
+          <p>{{ worktreeCommitQuestion }}</p>
+        </div>
+        <div class="worktree-commit-actions">
+          <button
+            class="worktree-commit-choice primary"
+            type="button"
+            autofocus
+            @click="answerWorktreeCommitDialog('yes')"
+          >
+            是
+          </button>
+          <button class="worktree-commit-choice" type="button" @click="answerWorktreeCommitDialog('always')">
+            始终
+          </button>
+          <button class="worktree-commit-choice" type="button" @click="answerWorktreeCommitDialog('never')">
+            从不
+          </button>
+          <button class="worktree-commit-choice" type="button" @click="cancelWorktreeCommitDialog">
+            取消
+          </button>
+        </div>
       </section>
     </div>
 
@@ -8161,16 +9082,46 @@ button:disabled {
   white-space: pre-wrap;
 }
 
-.merge-header {
+.merge-workbench {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  background: #fbfcfa;
+}
+
+.diff-header.merge-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px 14px;
+  padding: 11px 16px 10px;
+  background: #fbfcfa;
+}
+
+.merge-title-block {
+  min-width: 0;
+}
+
+.diff-header.merge-header h2 {
+  margin: 2px 0 0;
+  max-width: none;
+}
+
+.merge-save-actions,
+.merge-accept-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   flex-wrap: wrap;
 }
 
-.merge-header-actions,
-.merge-save-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
+.merge-conflict-summary {
+  grid-column: 2;
+  justify-self: end;
+  color: #526158;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 .merge-editor-toolbar {
@@ -8178,8 +9129,9 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 16px;
-  border-bottom: 1px solid #eef1ed;
+  min-height: 42px;
+  padding: 0 16px;
+  border-bottom: 1px solid #e5ebe7;
   color: #526158;
   font-size: 12px;
 }
@@ -8189,18 +9141,98 @@ button:disabled {
   font-weight: 700;
 }
 
+.merge-toolbar-status,
+.merge-conflict-jump-actions {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.merge-toolbar-status {
+  gap: 12px;
+}
+
+.merge-result-state {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-conflict-jump-actions {
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.merge-conflict-jump-actions .icon-only-button {
+  width: 28px;
+  height: 28px;
+}
+
+.merge-conflict-position {
+  min-width: 34px;
+  color: #738077;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
 .merge-editor {
+  position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) minmax(0, 1fr);
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.24fr) minmax(220px, 1fr);
   gap: 1px;
   flex: 1 1 auto;
   min-height: 0;
-  background: #dce2dd;
+  overflow: hidden;
+  background: #d7dfda;
+}
+
+.merge-connection-layer {
+  position: absolute;
+  inset: 40px 0 0;
+  z-index: 2;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(260px, 1.24fr) minmax(220px, 1fr);
+  gap: 1px;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.merge-connection-column {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: visible;
+}
+
+.merge-connection {
+  position: absolute;
+  display: block;
+  opacity: 0.72;
+  overflow: visible;
+}
+
+.merge-connection path {
+  fill: currentColor;
+}
+
+.merge-connection.conflict-ours {
+  color: rgba(159, 86, 67, 0.2);
+}
+
+.merge-connection.conflict-base {
+  color: rgba(191, 145, 37, 0.22);
+}
+
+.merge-connection.conflict-theirs {
+  color: rgba(62, 139, 114, 0.22);
 }
 
 .merge-column {
+  position: relative;
+  z-index: 1;
   display: grid;
-  grid-template-rows: 38px minmax(0, 1fr);
+  grid-template-rows: 40px minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
   background: #fbfcfa;
@@ -8214,24 +9246,315 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 12px;
+  min-width: 0;
   padding: 0 12px;
-  border-bottom: 1px solid #e5ebe7;
+  border-bottom: 1px solid #dce4df;
   color: #25312b;
   font-size: 12px;
 }
 
-.merge-column-title span {
-  color: #738077;
-  font-size: 11px;
-  text-transform: uppercase;
+.merge-column-title div {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
 }
 
-.merge-column pre,
-.merge-column textarea,
-.merge-base-panel pre {
+.merge-column-title strong {
+  flex: 0 0 auto;
+}
+
+.merge-column-title strong,
+.merge-column-title span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-column-title span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: #738077;
+  font-size: 11px;
+}
+
+.merge-code-view,
+.merge-result-body {
   margin: 0;
   min-width: 0;
+  color: #26312c;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.merge-code-view {
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 0;
+}
+
+.merge-source-body {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+.merge-source-body.current {
+  grid-template-columns: minmax(0, 1fr) 96px;
+}
+
+.merge-source-body.incoming {
+  grid-template-columns: 96px minmax(0, 1fr);
+}
+
+.merge-source-gutter {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 0;
+  color: #8d9991;
+  background: #fbfcfa;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 18px;
+  tab-size: 2;
+}
+
+.merge-source-gutter.current {
+  border-left: 1px solid #edf1ee;
+}
+
+.merge-source-gutter.incoming {
+  border-right: 1px solid #edf1ee;
+}
+
+.merge-source-gutter-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 18px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  user-select: none;
+}
+
+.merge-source-gutter.current .merge-source-gutter-line {
+  justify-content: flex-end;
+}
+
+.merge-source-gutter.incoming .merge-source-gutter-line {
+  justify-content: flex-start;
+}
+
+.merge-code-line {
+  display: block;
+  width: max-content;
+  min-width: 100%;
+  min-height: 18px;
+}
+
+.merge-code-line.conflict,
+.merge-result-gutter-line.conflict,
+.merge-source-gutter-line.conflict {
+  --merge-conflict-edge: rgba(159, 86, 67, 0.18);
+  background: #f7e1dc;
+}
+
+.merge-column.current .merge-code-line.conflict {
+  background: #f7ded8;
+}
+
+.merge-source-gutter.current .merge-source-gutter-line.conflict {
+  background: #f7ded8;
+}
+
+.merge-column.incoming .merge-code-line.conflict {
+  background: #ddf0e8;
+}
+
+.merge-source-gutter.incoming .merge-source-gutter-line.conflict {
+  background: #ddf0e8;
+}
+
+.merge-column.result .merge-result-render-line.conflict,
+.merge-column.result .merge-result-gutter-line.conflict {
+  background: #fff0bd;
+}
+
+.merge-column.result .merge-result-render-line.conflict-ours,
+.merge-column.result .merge-result-gutter-line.conflict-ours {
+  --merge-conflict-edge: rgba(159, 86, 67, 0.2);
+  background: #f7ded8;
+}
+
+.merge-column.result .merge-result-render-line.conflict-base,
+.merge-column.result .merge-result-gutter-line.conflict-base {
+  --merge-conflict-edge: rgba(191, 145, 37, 0.26);
+  background: #fff0bd;
+}
+
+.merge-column.result .merge-result-render-line.conflict-theirs,
+.merge-column.result .merge-result-gutter-line.conflict-theirs {
+  --merge-conflict-edge: rgba(62, 139, 114, 0.24);
+  background: #ddf0e8;
+}
+
+.merge-code-line.conflict-theirs,
+.merge-source-gutter-line.conflict-theirs {
+  --merge-conflict-edge: rgba(62, 139, 114, 0.24);
+}
+
+.merge-code-line.conflict-base,
+.merge-source-gutter-line.conflict-base {
+  --merge-conflict-edge: rgba(191, 145, 37, 0.26);
+}
+
+.merge-code-line.conflict-start,
+.merge-result-render-line.conflict-start,
+.merge-result-gutter-line.conflict-start,
+.merge-source-gutter-line.conflict-start {
+  box-shadow: inset 0 1px var(--merge-conflict-edge);
+}
+
+.merge-code-line.conflict-end,
+.merge-result-render-line.conflict-end,
+.merge-result-gutter-line.conflict-end,
+.merge-source-gutter-line.conflict-end {
+  box-shadow: inset 0 -1px var(--merge-conflict-edge);
+}
+
+.merge-result-gutter-line {
+  user-select: none;
+  color: #8d9991;
+  text-align: right;
+}
+
+.merge-line-number-text {
+  flex: 0 0 26px;
+  overflow: hidden;
+  text-align: right;
+}
+
+.merge-column.incoming .merge-line-number-text {
+  flex-basis: 24px;
+}
+
+.merge-line-content {
+  display: block;
+  overflow: visible;
+  min-width: max-content;
+  padding: 0 12px;
+}
+
+.merge-line-actions {
+  z-index: 4;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.merge-inline-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(157, 98, 82, 0.42);
+  border-radius: 4px;
+  color: #8b4a3e;
+  background: rgba(255, 249, 245, 0.92);
+  cursor: pointer;
+}
+
+.merge-inline-action.accept {
+  color: #255f51;
+  border-color: rgba(62, 139, 114, 0.45);
+  background: rgba(244, 253, 249, 0.94);
+}
+
+.merge-inline-action:hover:not(:disabled) {
+  border-color: #a94f3c;
+  color: #7c3327;
+  background: #fff5ef;
+}
+
+.merge-inline-action.accept:hover:not(:disabled) {
+  border-color: #2f8067;
+  color: #145541;
+  background: #eefbf5;
+}
+
+.merge-inline-action:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.merge-result-body {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.merge-result-gutter {
+  min-height: 0;
+  overflow: hidden;
+  padding: 12px 0;
+  border-right: 1px solid #edf1ee;
+  background: #fbfcfa;
+}
+
+.merge-result-editor {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.merge-result-render {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  padding: 12px;
+  pointer-events: none;
+}
+
+.merge-result-render-content {
+  width: max-content;
+  min-width: 100%;
+  will-change: transform;
+}
+
+.merge-result-render-line {
+  min-height: 18px;
+  padding-right: 12px;
+  white-space: pre;
+}
+
+.merge-result-render-line.conflict {
+  background: #f6e7e4;
+}
+
+.merge-result-gutter-line {
+  display: block;
+  min-height: 18px;
+  padding: 0 10px 0 4px;
+}
+
+.merge-column textarea {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  margin: 0;
   overflow: auto;
   padding: 12px;
   border: 0;
@@ -8240,31 +9563,31 @@ button:disabled {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   line-height: 18px;
+  outline: none;
   resize: none;
   tab-size: 2;
   white-space: pre;
 }
 
-.merge-column textarea {
-  width: 100%;
-  height: 100%;
-  outline: none;
+.merge-column .merge-result-editor textarea {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  color: transparent;
+  caret-color: #26312c;
+  background: transparent;
+  -webkit-text-fill-color: transparent;
 }
 
-.merge-base-panel {
+.merge-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   flex: 0 0 auto;
-  max-height: 220px;
-  overflow: auto;
+  padding: 10px 16px;
   border-top: 1px solid #dce2dd;
-  background: #f8faf8;
-}
-
-.merge-base-panel summary {
-  cursor: pointer;
-  padding: 8px 16px;
-  color: #526158;
-  font-size: 12px;
-  font-weight: 700;
+  background: #fbfcfa;
 }
 
 .history-pane {
@@ -8768,6 +10091,73 @@ button:disabled {
 
 .project-unsaved-modal footer {
   justify-content: flex-end;
+}
+
+.worktree-commit-modal {
+  display: grid;
+  gap: 12px;
+  width: min(250px, calc(100vw - 56px));
+  padding: 20px 14px 12px;
+  border: 1px solid rgba(184, 190, 187, 0.82);
+  border-radius: 18px;
+  color: #252b27;
+  background: rgba(244, 245, 244, 0.96);
+  box-shadow: 0 24px 70px rgba(23, 28, 25, 0.34);
+}
+
+.worktree-commit-warning {
+  justify-self: start;
+  margin-left: 4px;
+  color: #f1cc35;
+  fill: rgba(241, 204, 53, 0.16);
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.22));
+}
+
+.worktree-commit-copy {
+  display: grid;
+  gap: 8px;
+  padding: 0 4px;
+}
+
+.worktree-commit-copy strong,
+.worktree-commit-copy p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.worktree-commit-copy strong {
+  font-weight: 800;
+}
+
+.worktree-commit-actions {
+  display: grid;
+  gap: 7px;
+}
+
+.worktree-commit-choice {
+  display: grid;
+  place-items: center;
+  min-height: 24px;
+  border: 0;
+  border-radius: 999px;
+  color: #1f2421;
+  background: #dedede;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.worktree-commit-choice:hover:not(:disabled) {
+  background: #d4d4d4;
+}
+
+.worktree-commit-choice.primary {
+  color: #ffffff;
+  background: #0a84ff;
+}
+
+.worktree-commit-choice.primary:hover:not(:disabled) {
+  background: #0072e6;
 }
 
 .log-file-picker-head,
@@ -9538,11 +10928,16 @@ button:disabled {
 
 .file-actions {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
+  grid-template-columns: 32px repeat(3, minmax(0, 1fr));
   align-items: stretch;
   gap: 6px;
   padding: 6px 8px;
   border-bottom: 1px solid #dce2dd;
+}
+
+.file-actions-refresh {
+  width: 32px;
+  height: 32px;
 }
 
 .file-actions .icon-button {
@@ -9595,6 +10990,34 @@ button:disabled {
   background: #edf1ec;
 }
 
+.change-conflict-tree {
+  display: grid;
+}
+
+.change-conflict-header {
+  display: grid;
+  grid-template-columns: 15px 16px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+  width: 100%;
+  min-height: 24px;
+  padding: 0 10px 0 28px;
+  border: 0;
+  color: #8a2e20;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+}
+
+.change-conflict-header:hover {
+  background: #fff0e8;
+}
+
+.change-conflict-file-list {
+  display: grid;
+}
+
 .change-group-toggle,
 .change-group-title {
   display: inline-flex;
@@ -9629,6 +11052,10 @@ button:disabled {
   font-weight: 500;
 }
 
+.change-group-title.conflict small {
+  color: #a85a32;
+}
+
 .change-group-checkbox,
 .file-row input {
   width: 14px;
@@ -9660,6 +11087,10 @@ button:disabled {
   text-align: left;
   color: #25312b;
   background: transparent;
+}
+
+.file-row.conflict-file-row {
+  padding-left: 50px;
 }
 
 .file-row:hover,
@@ -11533,11 +12964,21 @@ html[data-theme="dark"] .conflict-block-preview pre {
   background: #1e1f22;
 }
 
+html[data-theme="dark"] .merge-workbench,
+html[data-theme="dark"] .diff-header.merge-header,
 html[data-theme="dark"] .merge-editor-toolbar,
-html[data-theme="dark"] .merge-base-panel {
+html[data-theme="dark"] .merge-editor-footer {
   border-color: #3c3f41;
   color: #8f949b;
   background: #2b2d30;
+}
+
+html[data-theme="dark"] .merge-conflict-summary {
+  color: #b8bec7;
+}
+
+html[data-theme="dark"] .merge-conflict-position {
+  color: #8f949b;
 }
 
 html[data-theme="dark"] .merge-editor-toolbar .warning {
@@ -11546,6 +12987,18 @@ html[data-theme="dark"] .merge-editor-toolbar .warning {
 
 html[data-theme="dark"] .merge-editor {
   background: #3c3f41;
+}
+
+html[data-theme="dark"] .merge-connection.conflict-ours {
+  color: rgba(183, 100, 78, 0.26);
+}
+
+html[data-theme="dark"] .merge-connection.conflict-base {
+  color: rgba(192, 151, 54, 0.24);
+}
+
+html[data-theme="dark"] .merge-connection.conflict-theirs {
+  color: rgba(71, 153, 125, 0.26);
 }
 
 html[data-theme="dark"] .merge-column,
@@ -11559,16 +13012,101 @@ html[data-theme="dark"] .merge-column-title {
   background: #2b2d30;
 }
 
-html[data-theme="dark"] .merge-column-title span,
-html[data-theme="dark"] .merge-base-panel summary {
+html[data-theme="dark"] .merge-column-title span {
   color: #8f949b;
 }
 
-html[data-theme="dark"] .merge-column pre,
-html[data-theme="dark"] .merge-column textarea,
-html[data-theme="dark"] .merge-base-panel pre {
+html[data-theme="dark"] .merge-code-view,
+html[data-theme="dark"] .merge-source-gutter,
+html[data-theme="dark"] .merge-result-render,
+html[data-theme="dark"] .merge-column textarea {
   color: #dfe1e5;
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .merge-column .merge-result-editor textarea {
+  color: transparent;
+  caret-color: #dfe1e5;
+  background: transparent;
+  -webkit-text-fill-color: transparent;
+}
+
+html[data-theme="dark"] .merge-result-gutter {
+  border-color: #2f3235;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .merge-source-gutter {
+  border-color: #2f3235;
+}
+
+html[data-theme="dark"] .merge-code-line.conflict,
+html[data-theme="dark"] .merge-source-gutter-line.conflict,
+html[data-theme="dark"] .merge-result-render-line.conflict,
+html[data-theme="dark"] .merge-result-gutter-line.conflict {
+  background: #4a302d;
+}
+
+html[data-theme="dark"] .merge-column.current .merge-code-line.conflict,
+html[data-theme="dark"] .merge-source-gutter.current .merge-source-gutter-line.conflict {
+  background: #4a302d;
+}
+
+html[data-theme="dark"] .merge-column.incoming .merge-code-line.conflict,
+html[data-theme="dark"] .merge-source-gutter.incoming .merge-source-gutter-line.conflict {
+  background: #243f36;
+}
+
+html[data-theme="dark"] .merge-column.result .merge-result-render-line.conflict,
+html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.conflict {
+  background: #403722;
+}
+
+html[data-theme="dark"] .merge-column.result .merge-result-render-line.conflict-ours,
+html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.conflict-ours {
+  --merge-conflict-edge: rgba(183, 100, 78, 0.28);
+  background: #4a302d;
+}
+
+html[data-theme="dark"] .merge-column.result .merge-result-render-line.conflict-base,
+html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.conflict-base {
+  --merge-conflict-edge: rgba(192, 151, 54, 0.28);
+  background: #403722;
+}
+
+html[data-theme="dark"] .merge-column.result .merge-result-render-line.conflict-theirs,
+html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.conflict-theirs {
+  --merge-conflict-edge: rgba(71, 153, 125, 0.3);
+  background: #243f36;
+}
+
+html[data-theme="dark"] .merge-source-gutter,
+html[data-theme="dark"] .merge-result-gutter-line {
+  color: #737980;
+}
+
+html[data-theme="dark"] .merge-inline-action {
+  border-color: rgba(214, 136, 117, 0.5);
+  color: #f0b1a3;
+  background: rgba(43, 45, 48, 0.92);
+}
+
+html[data-theme="dark"] .merge-inline-action.accept {
+  border-color: rgba(109, 186, 159, 0.52);
+  color: #9ce0c7;
+  background: rgba(31, 45, 40, 0.94);
+}
+
+html[data-theme="dark"] .merge-inline-action:hover:not(:disabled) {
+  border-color: #f09b87;
+  color: #ffd0c5;
+  background: #3a2b2a;
+}
+
+html[data-theme="dark"] .merge-inline-action.accept:hover:not(:disabled) {
+  border-color: #7bd5b7;
+  color: #c8f4e4;
+  background: #263d35;
 }
 
 html[data-theme="dark"] .shelf-row {
@@ -11734,6 +13272,7 @@ html[data-theme="dark"] .modal-backdrop {
 html[data-theme="dark"] .log-file-picker-modal,
 html[data-theme="dark"] .project-name-modal,
 html[data-theme="dark"] .project-unsaved-modal,
+html[data-theme="dark"] .worktree-commit-modal,
 html[data-theme="dark"] .log-filter-popover {
   border-color: #4e5258;
   background: #2b2d30;
@@ -11742,12 +13281,28 @@ html[data-theme="dark"] .log-filter-popover {
 
 html[data-theme="dark"] .project-name-modal h2,
 html[data-theme="dark"] .project-unsaved-modal h2,
-html[data-theme="dark"] .project-unsaved-modal strong {
+html[data-theme="dark"] .project-unsaved-modal strong,
+html[data-theme="dark"] .worktree-commit-copy strong {
   color: #dfe1e5;
 }
 
-html[data-theme="dark"] .project-unsaved-modal p {
+html[data-theme="dark"] .project-unsaved-modal p,
+html[data-theme="dark"] .worktree-commit-copy p {
   color: #a9b7c6;
+}
+
+html[data-theme="dark"] .worktree-commit-choice {
+  color: #dfe1e5;
+  background: #3c3f41;
+}
+
+html[data-theme="dark"] .worktree-commit-choice:hover:not(:disabled) {
+  background: #45494d;
+}
+
+html[data-theme="dark"] .worktree-commit-choice.primary {
+  color: #ffffff;
+  background: #0a84ff;
 }
 
 html[data-theme="dark"] .project-unsaved-path {
@@ -11996,8 +13551,20 @@ html[data-theme="dark"] .change-file-group-header:hover {
   background: #313335;
 }
 
+html[data-theme="dark"] .change-conflict-header {
+  color: #ffb86c;
+}
+
+html[data-theme="dark"] .change-conflict-header:hover {
+  background: #3a3028;
+}
+
 html[data-theme="dark"] .change-file-group-header small {
   color: #8f949b;
+}
+
+html[data-theme="dark"] .change-group-title.conflict small {
+  color: #d99a60;
 }
 
 html[data-theme="dark"] .change-file-group-empty {

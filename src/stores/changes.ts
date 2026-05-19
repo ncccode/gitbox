@@ -74,7 +74,6 @@ export const useChangesStore = defineStore("changes", {
     },
     selectFile(file: ChangedFile, side: ChangeSide) {
       this.selectedFile = file.path;
-      this.selectedPaths = [file.path];
       this.selectedSide = side;
       useSettingsStore().setSide(side);
     },

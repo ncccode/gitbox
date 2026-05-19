@@ -130,7 +130,7 @@ export function listShelves(path: string) {
 export function commitRepo(
   path: string,
   message: string,
-  options: { amend?: boolean; signOff?: boolean; gpgSign?: boolean; author?: string } = {},
+  options: { amend?: boolean; signOff?: boolean; gpgSign?: boolean; author?: string; includeWorktree?: boolean } = {},
 ) {
   return invoke<CommitResult>("commit", {
     path,
@@ -139,6 +139,7 @@ export function commitRepo(
     signOff: Boolean(options.signOff),
     gpgSign: Boolean(options.gpgSign),
     author: options.author,
+    includeWorktree: Boolean(options.includeWorktree),
   });
 }
 

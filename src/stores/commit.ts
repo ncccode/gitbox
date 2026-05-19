@@ -15,7 +15,7 @@ export const useCommitStore = defineStore("commit", {
     lastCommit: "",
   }),
   actions: {
-    async commit(remoteName?: string) {
+    async commit(remoteName?: string, includeWorktree = false) {
       const repos = useRepositoriesStore();
       const changes = useChangesStore();
       if (!repos.path || !this.message.trim()) return;
@@ -28,6 +28,7 @@ export const useCommitStore = defineStore("commit", {
           signOff: this.signOff,
           gpgSign: this.gpgSign,
           author: this.author.trim() || undefined,
+          includeWorktree,
         });
         this.lastCommit = result.oid.slice(0, 12);
         this.message = "";

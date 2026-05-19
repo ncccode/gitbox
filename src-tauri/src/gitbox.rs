@@ -1142,14 +1142,37 @@ pub fn commit_with_full_options_core(
     gpg_sign: bool,
     author: Option<String>,
 ) -> Result<CommitResult, GitboxError> {
+    commit_with_full_options_and_worktree_core(
+        path, message, amend, sign_off, gpg_sign, author, false,
+    )
+}
+
+pub fn commit_with_full_options_and_worktree_core(
+    path: &str,
+    message: String,
+    amend: bool,
+    sign_off: bool,
+    gpg_sign: bool,
+    author: Option<String>,
+    include_worktree: bool,
+) -> Result<CommitResult, GitboxError> {
     if message.trim().is_empty() {
         return Err(GitboxError::Message("提交信息不能为空".to_string()));
     }
 
     let repo = Repository::discover(path)?;
+    if include_worktree {
+        stage_worktree_changes_for_commit(&repo)?;
+    }
+
     let staged_diff = get_diff_core(path, None, true)?;
     if !amend && staged_diff.text.trim().is_empty() {
-        return Err(GitboxError::Message("没有已暂存的变更可提交".to_string()));
+        let message = if include_worktree {
+            "没有可提交的变更"
+        } else {
+            "没有已暂存的变更可提交"
+        };
+        return Err(GitboxError::Message(message.to_string()));
     }
 
     let author = clean_optional_arg(author);
@@ -1221,6 +1244,12 @@ pub fn commit_with_full_options_core(
         oid: oid.to_string(),
         summary: branch_summary_core(path, false)?,
     })
+}
+
+fn stage_worktree_changes_for_commit(repo: &Repository) -> Result<(), GitboxError> {
+    let workdir = repo_workdir(repo)?;
+    run_git(&workdir, vec!["add".to_string(), "-A".to_string()], None)?;
+    Ok(())
 }
 
 pub fn fetch_core(
@@ -2717,16 +2746,23 @@ pub fn conflict_details_core(
     let rel = normalize_repo_path(&repo, &file_path)?;
     let pathspec = repo_path_string(&rel);
     let current = fs::read_to_string(workdir.join(&rel)).ok();
-    let blocks = current
+    let base = read_index_stage(&workdir, 1, &pathspec)?;
+    let ours = read_index_stage(&workdir, 2, &pathspec)?;
+    let theirs = read_index_stage(&workdir, 3, &pathspec)?;
+    let mut blocks = current
         .as_deref()
         .map(parse_conflict_blocks_for_response)
         .unwrap_or_default();
+    if blocks.is_empty() {
+        blocks =
+            derive_conflict_blocks_from_stages(base.as_deref(), ours.as_deref(), theirs.as_deref());
+    }
 
     Ok(ConflictDetails {
         path: pathspec.clone(),
-        base: read_index_stage(&workdir, 1, &pathspec)?,
-        ours: read_index_stage(&workdir, 2, &pathspec)?,
-        theirs: read_index_stage(&workdir, 3, &pathspec)?,
+        base,
+        ours,
+        theirs,
         current,
         blocks,
     })
@@ -4042,6 +4078,91 @@ fn parse_conflict_blocks_for_response(content: &str) -> Vec<ConflictBlock> {
         .collect()
 }
 
+fn derive_conflict_blocks_from_stages(
+    base: Option<&str>,
+    ours: Option<&str>,
+    theirs: Option<&str>,
+) -> Vec<ConflictBlock> {
+    let Some(ours) = ours else {
+        return Vec::new();
+    };
+    let Some(theirs) = theirs else {
+        return Vec::new();
+    };
+    if ours == theirs {
+        return Vec::new();
+    }
+
+    let base_lines = split_preserving_newlines(base.unwrap_or_default());
+    let ours_lines = split_preserving_newlines(ours);
+    let theirs_lines = split_preserving_newlines(theirs);
+    let anchors = common_stage_anchors(&base_lines, &ours_lines, &theirs_lines);
+    let mut blocks = Vec::new();
+    let mut base_start = 0usize;
+    let mut ours_start = 0usize;
+    let mut theirs_start = 0usize;
+
+    for (base_anchor, ours_anchor, theirs_anchor) in anchors.into_iter().chain(std::iter::once((
+        base_lines.len(),
+        ours_lines.len(),
+        theirs_lines.len(),
+    ))) {
+        let base_part = &base_lines[base_start..base_anchor];
+        let ours_part = &ours_lines[ours_start..ours_anchor];
+        let theirs_part = &theirs_lines[theirs_start..theirs_anchor];
+        if ours_part != theirs_part {
+            blocks.push(ConflictBlock {
+                index: blocks.len(),
+                ours: ours_part.concat(),
+                base: if base_part.is_empty() {
+                    None
+                } else {
+                    Some(base_part.concat())
+                },
+                theirs: theirs_part.concat(),
+            });
+        }
+
+        base_start = base_anchor.saturating_add(1);
+        ours_start = ours_anchor.saturating_add(1);
+        theirs_start = theirs_anchor.saturating_add(1);
+    }
+
+    blocks
+}
+
+fn common_stage_anchors(
+    base_lines: &[String],
+    ours_lines: &[String],
+    theirs_lines: &[String],
+) -> Vec<(usize, usize, usize)> {
+    let mut anchors = Vec::new();
+    let mut ours_from = 0usize;
+    let mut theirs_from = 0usize;
+
+    for (base_index, line) in base_lines.iter().enumerate() {
+        let Some(ours_index) = find_line_after(ours_lines, line, ours_from) else {
+            continue;
+        };
+        let Some(theirs_index) = find_line_after(theirs_lines, line, theirs_from) else {
+            continue;
+        };
+        anchors.push((base_index, ours_index, theirs_index));
+        ours_from = ours_index + 1;
+        theirs_from = theirs_index + 1;
+    }
+
+    anchors
+}
+
+fn find_line_after(lines: &[String], needle: &str, start: usize) -> Option<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find_map(|(index, line)| (line == needle).then_some(index))
+}
+
 fn parse_conflict_blocks(lines: &[String]) -> Vec<ParsedConflictBlock> {
     let mut blocks = Vec::new();
     let mut index = 0;
@@ -4656,6 +4777,31 @@ mod tests {
 
         let commit =
             commit_core(dir.path().to_str().unwrap(), "add main".to_string()).expect("commit");
+        assert_eq!(commit.oid.len(), 40);
+        assert!(
+            repo_status_core(dir.path().to_str().unwrap(), false)
+                .expect("status")
+                .branch
+                .clean
+        );
+    }
+
+    #[test]
+    fn commit_can_include_worktree_changes_when_requested() {
+        let (dir, _repo) = test_repo();
+        write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+
+        let commit = commit_with_full_options_and_worktree_core(
+            dir.path().to_str().unwrap(),
+            "add main directly".to_string(),
+            false,
+            false,
+            false,
+            None,
+            true,
+        )
+        .expect("commit worktree");
+
         assert_eq!(commit.oid.len(), 40);
         assert!(
             repo_status_core(dir.path().to_str().unwrap(), false)
@@ -5470,6 +5616,70 @@ mod tests {
             fs::read_to_string(dir.path().join("README.md")).unwrap(),
             "master\n"
         );
+    }
+
+    #[test]
+    fn conflict_details_derives_blocks_after_markers_are_removed() {
+        let (dir, _repo) = test_repo();
+        write_file(
+            dir.path(),
+            "README.md",
+            "Multiline merge conflict demo\n\nRelease checklist:\n- update the parser\n- refresh the sidebar\n- run merge viewer tests\n- write release notes\n\nOwner:\nname = base owner\nreview = pending\n",
+        );
+        stage_paths_core(dir.path().to_str().unwrap(), vec!["README.md".to_string()])
+            .expect("stage base");
+        commit_core(dir.path().to_str().unwrap(), "base".to_string()).expect("commit base");
+
+        create_branch_core(
+            dir.path().to_str().unwrap(),
+            "feature/multiline-conflict".to_string(),
+            true,
+            None,
+        )
+        .expect("create feature");
+        write_file(
+            dir.path(),
+            "README.md",
+            "Multiline merge conflict demo\n\nRelease checklist:\n- replace the parser flow with incoming\n- rebuild the sidebar badges\n- run merge viewer tests again\n- publish release notes from incoming\n\nOwner:\nname = incoming branch owner\nreview = blocked until remote check\n",
+        );
+        stage_paths_core(dir.path().to_str().unwrap(), vec!["README.md".to_string()])
+            .expect("stage feature");
+        commit_core(dir.path().to_str().unwrap(), "incoming change".to_string())
+            .expect("commit feature");
+
+        checkout_branch_core(dir.path().to_str().unwrap(), "master".to_string())
+            .expect("checkout master");
+        write_file(
+            dir.path(),
+            "README.md",
+            "Multiline merge conflict demo\n\nRelease checklist:\n- update the parser with current branch notes\n- refresh the sidebar after tests\n- run merge viewer tests in current branch\n- write release notes from local QA\n\nOwner:\nname = current branch owner\nreview = ready after local QA\n",
+        );
+        stage_paths_core(dir.path().to_str().unwrap(), vec!["README.md".to_string()])
+            .expect("stage master");
+        commit_core(dir.path().to_str().unwrap(), "current change".to_string())
+            .expect("commit master");
+
+        merge_branch_core(
+            dir.path().to_str().unwrap(),
+            "feature/multiline-conflict".to_string(),
+            false,
+            false,
+            false,
+        )
+        .expect("merge conflict");
+        write_file(
+            dir.path(),
+            "README.md",
+            "Multiline merge conflict demo\n\nRelease checklist:\n- update the parser\n- refresh the sidebar\n- run merge viewer tests\n- write release notes\n\nOwner:\nname = base owner\nreview = pending\n",
+        );
+
+        let details = conflict_details_core(dir.path().to_str().unwrap(), "README.md".to_string())
+            .expect("conflict details");
+        assert_eq!(details.blocks.len(), 2);
+        assert!(details.blocks[0].ours.contains("current branch notes"));
+        assert!(details.blocks[0].theirs.contains("incoming"));
+        assert!(details.blocks[1].ours.contains("current branch owner"));
+        assert!(details.blocks[1].theirs.contains("incoming branch owner"));
     }
 
     #[test]

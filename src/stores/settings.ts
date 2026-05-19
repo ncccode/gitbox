@@ -3,6 +3,7 @@ import type { ChangeSide } from "../types/gitbox";
 
 export type LayoutPanelKey = "project" | "repo" | "changes";
 export type ThemeMode = "system" | "dark" | "light";
+export type DirectWorktreeCommitPolicy = "ask" | "always" | "never";
 
 const STORAGE_KEY = "gitbox.settings";
 
@@ -29,6 +30,7 @@ interface StoredSettings {
   selectedSide: ChangeSide;
   compactMode: boolean;
   themeMode: ThemeMode;
+  directWorktreeCommitPolicy: DirectWorktreeCommitPolicy;
   projectPaneCollapsed: boolean;
   panelWidths: Record<LayoutPanelKey, number>;
   panelVisibility: Record<LayoutPanelKey, boolean>;
@@ -42,6 +44,10 @@ function isThemeMode(value: unknown): value is ThemeMode {
   return value === "system" || value === "dark" || value === "light";
 }
 
+function isDirectWorktreeCommitPolicy(value: unknown): value is DirectWorktreeCommitPolicy {
+  return value === "ask" || value === "always" || value === "never";
+}
+
 function clampPanelWidth(panel: LayoutPanelKey, width: number) {
   const limits = PANEL_WIDTH_LIMITS[panel];
   return Math.min(limits.max, Math.max(limits.min, Math.round(width)));
@@ -53,6 +59,7 @@ function readStoredSettings(): StoredSettings {
     selectedSide: "unstaged",
     compactMode: true,
     themeMode: "system",
+    directWorktreeCommitPolicy: "ask",
     projectPaneCollapsed: false,
     panelWidths: { ...DEFAULT_PANEL_WIDTHS },
     panelVisibility: { ...DEFAULT_PANEL_VISIBILITY },
@@ -76,6 +83,9 @@ function readStoredSettings(): StoredSettings {
       compactMode:
         typeof parsed.compactMode === "boolean" ? parsed.compactMode : defaults.compactMode,
       themeMode: isThemeMode(parsed.themeMode) ? parsed.themeMode : defaults.themeMode,
+      directWorktreeCommitPolicy: isDirectWorktreeCommitPolicy(parsed.directWorktreeCommitPolicy)
+        ? parsed.directWorktreeCommitPolicy
+        : defaults.directWorktreeCommitPolicy,
       projectPaneCollapsed:
         typeof parsed.projectPaneCollapsed === "boolean"
           ? parsed.projectPaneCollapsed
@@ -120,6 +130,7 @@ export const useSettingsStore = defineStore("settings", {
           selectedSide: this.selectedSide,
           compactMode: this.compactMode,
           themeMode: this.themeMode,
+          directWorktreeCommitPolicy: this.directWorktreeCommitPolicy,
           projectPaneCollapsed: this.projectPaneCollapsed,
           panelWidths: this.panelWidths,
           panelVisibility: this.panelVisibility,
@@ -136,6 +147,10 @@ export const useSettingsStore = defineStore("settings", {
     },
     setThemeMode(themeMode: ThemeMode) {
       this.themeMode = themeMode;
+      this.persist();
+    },
+    setDirectWorktreeCommitPolicy(policy: DirectWorktreeCommitPolicy) {
+      this.directWorktreeCommitPolicy = policy;
       this.persist();
     },
     setProjectPaneCollapsed(collapsed: boolean) {
