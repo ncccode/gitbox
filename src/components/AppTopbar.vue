@@ -18,7 +18,7 @@ defineProps<{
 
 const settings = useSettingsStore();
 const themeModes: Array<{ key: ThemeMode; label: string; title: string }> = [
-  { key: "dark", label: "暗黑", title: "使用暗黑主题" },
+  { key: "dark", label: "深色", title: "使用深色主题" },
   { key: "light", label: "浅色", title: "使用浅色主题" },
   { key: "system", label: "系统", title: "跟随系统外观" },
 ];

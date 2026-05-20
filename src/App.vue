@@ -95,6 +95,7 @@ const settings = useSettingsStore();
 const shelveMessage = ref("");
 const pendingUiActions = ref<Record<string, number>>({});
 const pendingCommitAction = ref<"commit" | "push" | null>(null);
+const activeRemoteAction = ref<"fetch" | "pull" | "push" | "fetchAll" | null>(null);
 const newBranchName = ref("");
 const newTagName = ref("");
 const newTagTarget = ref("");
@@ -144,7 +145,7 @@ const syncingMergeEditorScroll = new WeakSet<HTMLElement>();
 const projectEditorScrollTop = ref(0);
 const projectEditorScrollLeft = ref(0);
 const projectEditorViewportHeight = ref(0);
-const expandedProjectHunkIndex = ref<number | null>(null);
+const expandedProjectHunkIndex = ref<string | null>(null);
 const expandedChangeFileGroups = ref<Record<string, boolean>>({
   staged: true,
   tracked: true,
@@ -186,10 +187,17 @@ type ProjectOriginalLine = {
   index: number;
   lineNumber: number;
   content: string;
-  tokens: ProjectCodeToken[];
+  tokens: ProjectOriginalLineToken[];
+  tone: "deleted" | "modified";
+};
+type ProjectOriginalLineToken = ProjectCodeToken & {
+  diff?: boolean;
+  insertMarker?: boolean;
 };
 type ProjectEditorHunkView = {
-  index: number;
+  id: string;
+  hunkIndex: number;
+  blockIndex: number;
   header: string;
   tone: "added" | "deleted" | "modified";
   lineStart: number;
@@ -198,6 +206,34 @@ type ProjectEditorHunkView = {
   changedNewEnd: number;
   changedOldStart: number | null;
   changedOldEnd: number | null;
+  oldStart: number;
+  oldLines: number;
+  newStart: number;
+  newLines: number;
+  patch: string;
+  addedLines: number;
+  deletedLines: number;
+  originalLines: ProjectOriginalLine[];
+};
+type ProjectHunkEntry = {
+  index: number;
+  prefix: " " | "+" | "-";
+  content: string;
+  oldLineNumber: number | null;
+  newLineNumber: number | null;
+  oldAnchorLineNumber: number;
+  newAnchorLineNumber: number;
+};
+type ProjectHunkChangeBlock = {
+  blockIndex: number;
+  startEntryIndex: number;
+  endEntryIndex: number;
+  entries: ProjectHunkEntry[];
+  patch: string;
+  changedOldStart: number | null;
+  changedOldEnd: number | null;
+  changedNewStart: number | null;
+  changedNewEnd: number | null;
   oldStart: number;
   oldLines: number;
   newStart: number;
@@ -263,6 +299,9 @@ type MergeCodeLine = {
   conflictSide: MergeConflictSide | null;
   conflictStart: boolean;
   conflictEnd: boolean;
+  autoMerge: boolean;
+  autoMergeStart: boolean;
+  autoMergeEnd: boolean;
 };
 type MergeConflictSide = "ours" | "base" | "theirs";
 type MergeDisplaySide = "ours" | "theirs";
@@ -272,9 +311,18 @@ type MergeConflictSnippet = {
   content: string;
   side: MergeConflictSide;
 };
+type MergeAutoMergeSnippet = {
+  lines: string[];
+};
 type MergeConflictLineRange = {
   startLine: number;
   endLine: number;
+};
+type MergeLineDiffRange = {
+  leftStartLine: number;
+  leftEndLine: number;
+  rightStartLine: number;
+  rightEndLine: number;
 };
 type MergeConflictConnection = MergeConflictLineRange & {
   key: string;
@@ -334,6 +382,7 @@ const MIN_OPERATION_BUSY_MS = 520;
 const PROJECT_EDITOR_PADDING_TOP = 12;
 const PROJECT_EDITOR_OVERSCAN_LINES = 32;
 const PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT = 720;
+const PROJECT_HUNK_PATCH_CONTEXT_LINES = 3;
 const PROJECT_TOKEN_CACHE_LIMIT = 6000;
 const MERGE_EDITOR_LINE_HEIGHT = 18;
 const MERGE_EDITOR_PADDING_TOP = 12;
@@ -610,10 +659,10 @@ const projectEditorLines = computed<ProjectEditorLine[]>(() => {
 });
 const projectEditorHunks = computed<ProjectEditorHunkView[]>(() => {
   if (!project.content || project.content.binary || !project.diff?.hunks.length) return [];
-  return project.diff.hunks.map((hunk) => buildProjectEditorHunkView(hunk, projectLanguage.value));
+  return project.diff.hunks.flatMap((hunk) => buildProjectEditorHunkViews(hunk, projectLanguage.value));
 });
 const expandedProjectHunk = computed(
-  () => projectEditorHunks.value.find((hunk) => hunk.index === expandedProjectHunkIndex.value) ?? null,
+  () => projectEditorHunks.value.find((hunk) => hunk.id === expandedProjectHunkIndex.value) ?? null,
 );
 const projectEditorRenderStyle = computed(() => ({
   "--project-editor-scroll-left-offset": `${-projectEditorScrollLeft.value}px`,
@@ -711,12 +760,7 @@ const conflictedFiles = computed(() => changes.files.filter((file) => file.confl
 const canSkipOperation = computed(() =>
   ["rebase", "cherry-pick", "revert"].includes(operations.activeOperation),
 );
-const resultHasConflictMarkers = computed(
-  () =>
-    operations.resultDraft.includes("<<<<<<< ") ||
-    operations.resultDraft.includes("=======") ||
-    operations.resultDraft.includes(">>>>>>> "),
-);
+const resultHasConflictMarkers = computed(() => hasGitConflictMarkers(operations.resultDraft));
 const mergeConflictCount = computed(() => operations.conflict?.blocks.length ?? 0);
 const mergeConflictSummary = computed(() => {
   const changeLabel = operations.resultDirty ? "有未保存变更" : "没有变更";
@@ -793,23 +837,6 @@ const mergeIncomingConflictSnippets = computed<MergeConflictSnippet[]>(() =>
     operations.resultBlockSelections,
   ),
 );
-const mergeCurrentLines = computed(() =>
-  buildMergeCodeLines(
-    mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
-    mergeCurrentConflictSnippets.value,
-    mergeLanguage.value,
-  ),
-);
-const mergeIncomingLines = computed(() =>
-  buildMergeCodeLines(
-    mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
-    mergeIncomingConflictSnippets.value,
-    mergeLanguage.value,
-  ),
-);
-const mergeResultLines = computed(() =>
-  buildMergeCodeLines(operations.resultDraft, mergeResultConflictSnippets.value, mergeLanguage.value),
-);
 const mergeCurrentConflictRanges = computed(() =>
   buildMergeSourceConflictRanges(
     mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
@@ -822,6 +849,45 @@ const mergeIncomingConflictRanges = computed(() =>
     mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
     operations.conflict?.blocks ?? [],
     mergeIncomingSide.value,
+  ),
+);
+const mergeAutoMergeDiff = computed(() =>
+  buildMergeAutoMergeDiff(
+    mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
+    mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
+    [...mergeCurrentConflictRanges.value.values()],
+    [...mergeIncomingConflictRanges.value.values()],
+  ),
+);
+const mergeResultAutoMergeRanges = computed(() =>
+  buildMergeResultAutoMergeRanges(
+    operations.resultDraft,
+    mergeAutoMergeDiff.value.resultSnippets,
+    mergeResultConflictSnippets.value,
+  ),
+);
+const mergeCurrentLines = computed(() =>
+  buildMergeCodeLines(
+    mergeConflictSideContent(operations.conflict, mergeCurrentSide.value),
+    mergeCurrentConflictSnippets.value,
+    mergeAutoMergeDiff.value.currentRanges,
+    mergeLanguage.value,
+  ),
+);
+const mergeIncomingLines = computed(() =>
+  buildMergeCodeLines(
+    mergeConflictSideContent(operations.conflict, mergeIncomingSide.value),
+    mergeIncomingConflictSnippets.value,
+    mergeAutoMergeDiff.value.incomingRanges,
+    mergeLanguage.value,
+  ),
+);
+const mergeResultLines = computed(() =>
+  buildMergeCodeLines(
+    operations.resultDraft,
+    mergeResultConflictSnippets.value,
+    mergeResultAutoMergeRanges.value,
+    mergeLanguage.value,
   ),
 );
 const mergeCurrentResultConnections = computed(() =>
@@ -1284,7 +1350,7 @@ watch(
     projectEditorScrollTop.value = projectEditorTextarea.value?.scrollTop ?? 0;
     if (
       expandedProjectHunkIndex.value !== null &&
-      !projectEditorHunks.value.some((hunk) => hunk.index === expandedProjectHunkIndex.value)
+      !projectEditorHunks.value.some((hunk) => hunk.id === expandedProjectHunkIndex.value)
     ) {
       expandedProjectHunkIndex.value = null;
     }
@@ -1418,7 +1484,32 @@ function isUiActionPending(key: string) {
 }
 
 function isUiActionActive(key: string) {
-  return isUiActionPending(key);
+  if (isUiActionPending(key)) return true;
+
+  switch (key) {
+    case "workspace.refresh":
+      return workspaceRefreshBusy.value;
+    case "project.refresh":
+      return project.loading;
+    case "advanced.refresh":
+      return advanced.loading;
+    case "history.refresh":
+      return history.loading;
+    case "branches.refresh":
+      return branches.loading;
+    case "operations.refresh":
+      return operations.loading;
+    case "remote.fetch":
+      return activeRemoteAction.value === "fetch" || remote.activeAction === "fetch";
+    case "remote.pull":
+      return activeRemoteAction.value === "pull" || remote.activeAction === "pull";
+    case "remote.push":
+      return activeRemoteAction.value === "push" || remote.activeAction === "push";
+    case "remote.fetchAll":
+      return activeRemoteAction.value === "fetchAll" || remote.activeAction === "fetchAll";
+    default:
+      return false;
+  }
 }
 
 function actionIcon(key: string, icon: unknown) {
@@ -1733,22 +1824,29 @@ async function runRemoteAction(action: "fetch" | "pull" | "push") {
     confirmRemotePush();
     return;
   }
-  await runUiAction(actionKey, async () => {
-    if (action === "pull") {
-      const preview = await remote.previewPull();
-      if (!preview) return;
-      operations.mergeTarget = preview.target;
-      if (preview.needsConfirmation) {
-        pullConfirmDialog.value = {
-          preview,
-          loading: false,
-        };
-        return;
+  activeRemoteAction.value = action;
+  try {
+    await runUiAction(actionKey, async () => {
+      if (action === "pull") {
+        const preview = await remote.previewPull();
+        if (!preview) return;
+        operations.mergeTarget = preview.target;
+        if (preview.needsConfirmation) {
+          pullConfirmDialog.value = {
+            preview,
+            loading: false,
+          };
+          return;
+        }
       }
-    }
 
-    await executeRemoteAction(action);
-  });
+      await executeRemoteAction(action);
+    });
+  } finally {
+    if (activeRemoteAction.value === action) {
+      activeRemoteAction.value = null;
+    }
+  }
 }
 
 async function runRemoteActionFromPointer(event: PointerEvent, action: "fetch" | "pull" | "push") {
@@ -1759,10 +1857,17 @@ async function runRemoteActionFromPointer(event: PointerEvent, action: "fetch" |
 
 async function fetchAllRepositories() {
   if (isUiActionPending("remote.fetchAll")) return;
-  await runUiAction("remote.fetchAll", async () => {
-    await remote.fetchAllRepositories();
-    await refreshAfterRemoteAction();
-  });
+  activeRemoteAction.value = "fetchAll";
+  try {
+    await runUiAction("remote.fetchAll", async () => {
+      await remote.fetchAllRepositories();
+      await refreshAfterRemoteAction();
+    });
+  } finally {
+    if (activeRemoteAction.value === "fetchAll") {
+      activeRemoteAction.value = null;
+    }
+  }
 }
 
 async function fetchAllRepositoriesFromPointer(event: PointerEvent) {
@@ -2766,61 +2871,58 @@ function projectKeywords(language: string) {
   return keywords;
 }
 
-function buildProjectEditorHunkView(hunk: DiffHunk, language: string): ProjectEditorHunkView {
-  const parsed = parseProjectHunkPatch(hunk, language);
-  const fallbackLineStart = Math.max(1, hunk.newStart || 1);
-  const lineStart = parsed.changedNewStart ?? fallbackLineStart;
-  const changedNewEnd = parsed.changedNewEnd ?? lineStart;
-  const lineCount = Math.max(1, changedNewEnd - lineStart + 1);
-  const tone =
-    parsed.deletedLines > 0 && parsed.addedLines > 0
-      ? "modified"
-      : parsed.deletedLines > 0
-        ? "deleted"
-        : "added";
+function buildProjectEditorHunkViews(hunk: DiffHunk, language: string): ProjectEditorHunkView[] {
+  return parseProjectHunkPatch(hunk, language).map((block) => {
+    const fallbackLineStart = Math.max(1, block.newStart || hunk.newStart || 1);
+    const lineStart = block.changedNewStart ?? fallbackLineStart;
+    const changedNewEnd = block.changedNewEnd ?? lineStart;
+    const lineCount = block.addedLines === 0 ? 1 : Math.max(1, changedNewEnd - lineStart + 1);
+    const tone =
+      block.deletedLines > 0 && block.addedLines > 0
+        ? "modified"
+        : block.deletedLines > 0
+          ? "deleted"
+          : "added";
 
-  return {
-    index: hunk.index,
-    header: hunk.header,
-    tone,
-    lineStart,
-    lineCount,
-    changedNewStart: lineStart,
-    changedNewEnd,
-    changedOldStart: parsed.changedOldStart,
-    changedOldEnd: parsed.changedOldEnd,
-    oldStart: hunk.oldStart,
-    oldLines: hunk.oldLines,
-    newStart: hunk.newStart,
-    newLines: hunk.newLines,
-    addedLines: parsed.addedLines,
-    deletedLines: parsed.deletedLines,
-    originalLines: parsed.originalLines,
-  };
+    return {
+      id: `${hunk.index}:${block.blockIndex}`,
+      hunkIndex: hunk.index,
+      blockIndex: block.blockIndex,
+      header: hunk.header,
+      tone,
+      lineStart,
+      lineCount,
+      changedNewStart: lineStart,
+      changedNewEnd,
+      changedOldStart: block.changedOldStart,
+      changedOldEnd: block.changedOldEnd,
+      oldStart: block.changedOldStart ?? block.oldStart,
+      oldLines: block.deletedLines,
+      newStart: lineStart,
+      newLines: block.addedLines,
+      patch: block.patch,
+      addedLines: block.addedLines,
+      deletedLines: block.deletedLines,
+      originalLines: block.originalLines,
+    };
+  });
 }
 
-function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
-  const originalLines: ProjectOriginalLine[] = [];
+function parseProjectHunkPatch(hunk: DiffHunk, language: string): ProjectHunkChangeBlock[] {
+  const { fileHeader, entries } = parseProjectHunkEntries(hunk);
+  const ranges = projectHunkChangeRanges(entries);
+
+  return ranges.map((range, blockIndex) =>
+    buildProjectHunkChangeBlock(hunk, language, fileHeader, entries, range, blockIndex),
+  );
+}
+
+function parseProjectHunkEntries(hunk: DiffHunk) {
+  const fileHeader: string[] = [];
+  const entries: ProjectHunkEntry[] = [];
   let oldLineNumber = hunk.oldStart;
   let newLineNumber = hunk.newStart;
   let inHunk = false;
-  let addedLines = 0;
-  let deletedLines = 0;
-  let changedOldStart: number | null = null;
-  let changedOldEnd: number | null = null;
-  let changedNewStart: number | null = null;
-  let changedNewEnd: number | null = null;
-
-  const markOldLine = (lineNumber: number) => {
-    changedOldStart = changedOldStart === null ? lineNumber : Math.min(changedOldStart, lineNumber);
-    changedOldEnd = changedOldEnd === null ? lineNumber : Math.max(changedOldEnd, lineNumber);
-  };
-  const markNewLine = (lineNumber: number) => {
-    const normalizedLineNumber = Math.max(1, lineNumber);
-    changedNewStart =
-      changedNewStart === null ? normalizedLineNumber : Math.min(changedNewStart, normalizedLineNumber);
-    changedNewEnd = changedNewEnd === null ? normalizedLineNumber : Math.max(changedNewEnd, normalizedLineNumber);
-  };
 
   for (const line of hunk.patch.split("\n")) {
     if (line.startsWith("@@ ")) {
@@ -2829,40 +2931,290 @@ function parseProjectHunkPatch(hunk: DiffHunk, language: string) {
       newLineNumber = hunk.newStart;
       continue;
     }
-    if (!inHunk || line.startsWith("\\ No newline")) continue;
+    if (!inHunk) {
+      if (line) fileHeader.push(line);
+      continue;
+    }
+    if (!line || line.startsWith("\\ No newline")) continue;
 
     const prefix = line.charAt(0);
-    const content = line.slice(1);
-    if (prefix === "-") {
-      markOldLine(oldLineNumber);
-      markNewLine(newLineNumber);
-      originalLines.push({
-        index: originalLines.length,
-        lineNumber: oldLineNumber,
-        content,
-        tokens: tokenizeProjectLine(content || " ", language),
-      });
-      oldLineNumber += 1;
-      deletedLines += 1;
-    } else if (prefix === "+") {
-      markNewLine(newLineNumber);
-      addedLines += 1;
-      newLineNumber += 1;
-    } else if (prefix === " ") {
-      oldLineNumber += 1;
-      newLineNumber += 1;
-    }
+    if (prefix !== " " && prefix !== "+" && prefix !== "-") continue;
+
+    const oldAnchorLineNumber = oldLineNumber;
+    const newAnchorLineNumber = newLineNumber;
+    const entry: ProjectHunkEntry = {
+      index: entries.length,
+      prefix,
+      content: line.slice(1),
+      oldLineNumber: prefix === "+" ? null : oldLineNumber,
+      newLineNumber: prefix === "-" ? null : newLineNumber,
+      oldAnchorLineNumber,
+      newAnchorLineNumber,
+    };
+    entries.push(entry);
+
+    if (prefix !== "+") oldLineNumber += 1;
+    if (prefix !== "-") newLineNumber += 1;
   }
 
+  return { fileHeader, entries };
+}
+
+function projectHunkChangeRanges(entries: ProjectHunkEntry[]) {
+  const ranges: { startEntryIndex: number; endEntryIndex: number }[] = [];
+  let activeStart: number | null = null;
+  let activeEnd: number | null = null;
+
+  for (const entry of entries) {
+    if (entry.prefix === " ") {
+      if (activeStart !== null && activeEnd !== null) {
+        ranges.push({ startEntryIndex: activeStart, endEntryIndex: activeEnd });
+        activeStart = null;
+        activeEnd = null;
+      }
+      continue;
+    }
+
+    activeStart = activeStart ?? entry.index;
+    activeEnd = entry.index;
+  }
+
+  if (activeStart !== null && activeEnd !== null) {
+    ranges.push({ startEntryIndex: activeStart, endEntryIndex: activeEnd });
+  }
+
+  return ranges;
+}
+
+function buildProjectHunkChangeBlock(
+  hunk: DiffHunk,
+  language: string,
+  fileHeader: string[],
+  entries: ProjectHunkEntry[],
+  range: { startEntryIndex: number; endEntryIndex: number },
+  blockIndex: number,
+): ProjectHunkChangeBlock {
+  const changeEntries = entries.slice(range.startEntryIndex, range.endEntryIndex + 1);
+  const deletedEntries = changeEntries.filter((entry) => entry.prefix === "-");
+  const addedEntries = changeEntries.filter((entry) => entry.prefix === "+");
+  const changedOldStart = minEntryLine(deletedEntries, "oldLineNumber");
+  const changedOldEnd = maxEntryLine(deletedEntries, "oldLineNumber");
+  const changedNewStart = minEntryLine(addedEntries, "newLineNumber") ?? changeEntries[0]?.newAnchorLineNumber ?? hunk.newStart;
+  const changedNewEnd = maxEntryLine(addedEntries, "newLineNumber") ?? changedNewStart;
+  const originalLines = deletedEntries.map((entry, index) => {
+    const pairedEntry = addedEntries[index] ?? null;
+    return {
+      index,
+      lineNumber: entry.oldLineNumber ?? entry.oldAnchorLineNumber,
+      content: entry.content,
+      tokens: buildProjectOriginalLineTokens(entry.content, pairedEntry?.content ?? null, language),
+      tone: pairedEntry ? ("modified" as const) : ("deleted" as const),
+    };
+  });
+  const patchEntries = projectPatchEntriesForRange(entries, range);
+  const oldStart = patchStartLine(patchEntries, "oldLineNumber", range, entries, "old");
+  const newStart = patchStartLine(patchEntries, "newLineNumber", range, entries, "new");
+  const oldLines = patchEntries.filter((entry) => entry.prefix !== "+").length;
+  const newLines = patchEntries.filter((entry) => entry.prefix !== "-").length;
+
   return {
-    originalLines,
-    addedLines,
-    deletedLines,
+    blockIndex,
+    startEntryIndex: range.startEntryIndex,
+    endEntryIndex: range.endEntryIndex,
+    entries: changeEntries,
+    patch: buildProjectHunkPatch(fileHeader, oldStart, oldLines, newStart, newLines, patchEntries),
     changedOldStart,
     changedOldEnd,
     changedNewStart,
     changedNewEnd,
+    oldStart,
+    oldLines,
+    newStart,
+    newLines,
+    addedLines: addedEntries.length,
+    deletedLines: deletedEntries.length,
+    originalLines,
   };
+}
+
+function projectPatchEntriesForRange(
+  entries: ProjectHunkEntry[],
+  range: { startEntryIndex: number; endEntryIndex: number },
+) {
+  let start = range.startEntryIndex;
+  let end = range.endEntryIndex;
+  let beforeContext = 0;
+  let afterContext = 0;
+
+  while (
+    start > 0 &&
+    beforeContext < PROJECT_HUNK_PATCH_CONTEXT_LINES &&
+    entries[start - 1]?.prefix === " "
+  ) {
+    start -= 1;
+    beforeContext += 1;
+  }
+
+  while (
+    end < entries.length - 1 &&
+    afterContext < PROJECT_HUNK_PATCH_CONTEXT_LINES &&
+    entries[end + 1]?.prefix === " "
+  ) {
+    end += 1;
+    afterContext += 1;
+  }
+
+  return entries.slice(start, end + 1);
+}
+
+function patchStartLine(
+  entries: ProjectHunkEntry[],
+  lineKey: "oldLineNumber" | "newLineNumber",
+  range: { startEntryIndex: number; endEntryIndex: number },
+  allEntries: ProjectHunkEntry[],
+  side: "old" | "new",
+) {
+  const directLine = minEntryLine(entries, lineKey);
+  if (directLine !== null) return directLine;
+
+  const firstChange = allEntries[range.startEntryIndex];
+  if (!firstChange) return 0;
+  if (side === "old") return Math.max(0, firstChange.oldAnchorLineNumber - 1);
+  return Math.max(0, firstChange.newAnchorLineNumber - 1);
+}
+
+function buildProjectHunkPatch(
+  fileHeader: string[],
+  oldStart: number,
+  oldLines: number,
+  newStart: number,
+  newLines: number,
+  entries: ProjectHunkEntry[],
+) {
+  const header = `@@ -${formatProjectPatchRange(oldStart, oldLines)} +${formatProjectPatchRange(newStart, newLines)} @@`;
+  const patchLines = [...fileHeader, header, ...entries.map((entry) => `${entry.prefix}${entry.content}`)];
+  return `${patchLines.join("\n")}\n`;
+}
+
+function formatProjectPatchRange(start: number, lines: number) {
+  return lines === 1 ? `${start}` : `${start},${lines}`;
+}
+
+function minEntryLine(entries: ProjectHunkEntry[], key: "oldLineNumber" | "newLineNumber") {
+  const lines = entries.map((entry) => entry[key]).filter((line): line is number => line !== null);
+  return lines.length ? Math.min(...lines) : null;
+}
+
+function maxEntryLine(entries: ProjectHunkEntry[], key: "oldLineNumber" | "newLineNumber") {
+  const lines = entries.map((entry) => entry[key]).filter((line): line is number => line !== null);
+  return lines.length ? Math.max(...lines) : null;
+}
+
+function buildProjectOriginalLineTokens(
+  original: string,
+  current: string | null,
+  language: string,
+): ProjectOriginalLineToken[] {
+  const tokens = tokenizeProjectLine(original || " ", language);
+  const range = projectInlineDiffRange(original, current);
+  const highlighted = splitProjectOriginalTokens(tokens, range.start, range.end);
+
+  if (range.insertAt !== null) {
+    const insertAt = Math.min(range.insertAt, original.length);
+    const result: ProjectOriginalLineToken[] = [];
+    let offset = 0;
+    let inserted = false;
+
+    for (const token of highlighted) {
+      const tokenEnd = offset + token.text.length;
+      if (!inserted && insertAt <= tokenEnd) {
+        const splitAt = Math.max(0, insertAt - offset);
+        if (splitAt > 0) {
+          result.push({ ...token, text: token.text.slice(0, splitAt) });
+        }
+        result.push({ text: " ", diff: true, insertMarker: true });
+        if (splitAt < token.text.length) {
+          result.push({ ...token, text: token.text.slice(splitAt) });
+        }
+        inserted = true;
+      } else {
+        result.push(token);
+      }
+      offset = tokenEnd;
+    }
+
+    if (!inserted) {
+      result.push({ text: " ", diff: true, insertMarker: true });
+    }
+    return result;
+  }
+
+  return highlighted;
+}
+
+function projectInlineDiffRange(original: string, current: string | null) {
+  if (current === null) {
+    return { start: 0, end: Math.max(1, original.length), insertAt: null as number | null };
+  }
+  if (original === current) {
+    return { start: 0, end: 0, insertAt: null as number | null };
+  }
+
+  let prefixLength = 0;
+  const maxPrefixLength = Math.min(original.length, current.length);
+  while (prefixLength < maxPrefixLength && original[prefixLength] === current[prefixLength]) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+  const maxSuffixLength = Math.min(original.length - prefixLength, current.length - prefixLength);
+  while (
+    suffixLength < maxSuffixLength &&
+    original[original.length - 1 - suffixLength] === current[current.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  const start = prefixLength;
+  const end = original.length - suffixLength;
+  return end > start
+    ? { start, end, insertAt: null as number | null }
+    : { start, end, insertAt: start };
+}
+
+function splitProjectOriginalTokens(tokens: ProjectCodeToken[], start: number, end: number) {
+  if (end <= start) return tokens;
+
+  const result: ProjectOriginalLineToken[] = [];
+  let offset = 0;
+  for (const token of tokens) {
+    const tokenStart = offset;
+    const tokenEnd = offset + token.text.length;
+    const diffStart = Math.max(tokenStart, start);
+    const diffEnd = Math.min(tokenEnd, end);
+
+    if (diffStart <= tokenStart && diffEnd >= tokenEnd) {
+      result.push({ ...token, diff: true });
+    } else if (diffEnd > diffStart) {
+      if (diffStart > tokenStart) {
+        result.push({ ...token, text: token.text.slice(0, diffStart - tokenStart) });
+      }
+      result.push({
+        ...token,
+        text: token.text.slice(diffStart - tokenStart, diffEnd - tokenStart),
+        diff: true,
+      });
+      if (diffEnd < tokenEnd) {
+        result.push({ ...token, text: token.text.slice(diffEnd - tokenStart) });
+      }
+    } else {
+      result.push(token);
+    }
+
+    offset = tokenEnd;
+  }
+
+  return result.length ? result : [{ text: " ", diff: true }];
 }
 
 function projectEditorHunkMarkerStyle(hunk: ProjectEditorHunkView) {
@@ -2907,8 +3259,8 @@ function formatProjectLineRange(start: number, end: number) {
   return start === end ? `${start}` : `${start}-${end}`;
 }
 
-function toggleProjectEditorHunk(index: number) {
-  expandedProjectHunkIndex.value = expandedProjectHunkIndex.value === index ? null : index;
+function toggleProjectEditorHunk(id: string) {
+  expandedProjectHunkIndex.value = expandedProjectHunkIndex.value === id ? null : id;
 }
 
 function updateProjectEditorViewport() {
@@ -2923,11 +3275,11 @@ function syncProjectEditorScroll(event: Event) {
   projectEditorViewportHeight.value = target.clientHeight;
 }
 
-async function discardProjectEditorHunk(index: number) {
+async function discardProjectEditorHunk(hunk: ProjectEditorHunkView) {
   if (project.editorDirty && !window.confirm("当前文件有未保存编辑，撤回此块会放弃未保存内容并还原 Git 原本内容。继续？")) {
     return;
   }
-  await project.discardHunk(index);
+  await project.discardPatch(hunk.patch);
   expandedProjectHunkIndex.value = null;
 }
 
@@ -4864,6 +5216,20 @@ function oppositeMergeDisplaySide(side: MergeDisplaySide): MergeDisplaySide {
   return side === "ours" ? "theirs" : "ours";
 }
 
+function hasGitConflictMarkers(content: string) {
+  return content
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .some(
+      (line) =>
+        line.startsWith("<<<<<<< ") ||
+        line.startsWith("||||||| ") ||
+        line === "=======" ||
+        line.startsWith(">>>>>>> "),
+    );
+}
+
 function mergeConflictSideContent(conflict: ConflictDetails | null, side: MergeDisplaySide) {
   if (!conflict) return "";
   return side === "ours" ? (conflict.ours ?? "") : (conflict.theirs ?? "");
@@ -4909,6 +5275,9 @@ function mergeConflictLineClasses(line: MergeCodeLine) {
     "conflict-ours": line.conflictSide === "ours",
     "conflict-base": line.conflictSide === "base",
     "conflict-theirs": line.conflictSide === "theirs",
+    "auto-merge": line.autoMerge,
+    "auto-merge-start": line.autoMergeStart,
+    "auto-merge-end": line.autoMergeEnd,
   };
 }
 
@@ -4932,6 +5301,241 @@ function findLineRange(lines: string[], needle: string[], startAt: number) {
     if (matches) return index;
   }
   return -1;
+}
+
+function sameMergeLines(left: string[], right: string[]) {
+  return left.length === right.length && left.every((line, index) => line === right[index]);
+}
+
+function firstLinePositionAtOrAfter(positions: number[] | undefined, startAt: number) {
+  if (!positions) return null;
+  let low = 0;
+  let high = positions.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (positions[mid] < startAt) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return positions[low] ?? null;
+}
+
+function buildSequentialLineAnchors(left: string[], right: string[]) {
+  const rightPositions = new Map<string, number[]>();
+  right.forEach((line, index) => {
+    const positions = rightPositions.get(line) ?? [];
+    positions.push(index);
+    rightPositions.set(line, positions);
+  });
+
+  const anchors: [number, number][] = [];
+  let rightFrom = 0;
+  left.forEach((line, leftIndex) => {
+    const rightIndex = firstLinePositionAtOrAfter(rightPositions.get(line), rightFrom);
+    if (rightIndex === null) return;
+    anchors.push([leftIndex, rightIndex]);
+    rightFrom = rightIndex + 1;
+  });
+  return anchors;
+}
+
+function buildLineDiffRanges(left: string[], right: string[]) {
+  const ranges: MergeLineDiffRange[] = [];
+  let leftStart = 0;
+  let rightStart = 0;
+
+  for (const [leftAnchor, rightAnchor] of [
+    ...buildSequentialLineAnchors(left, right),
+    [left.length, right.length] as [number, number],
+  ]) {
+    if (leftStart < leftAnchor || rightStart < rightAnchor) {
+      const leftPart = left.slice(leftStart, leftAnchor);
+      const rightPart = right.slice(rightStart, rightAnchor);
+      if (!sameMergeLines(leftPart, rightPart)) {
+        ranges.push({
+          leftStartLine: leftStart + 1,
+          leftEndLine: leftAnchor,
+          rightStartLine: rightStart + 1,
+          rightEndLine: rightAnchor,
+        });
+      }
+    }
+
+    leftStart = leftAnchor + 1;
+    rightStart = rightAnchor + 1;
+  }
+
+  return ranges;
+}
+
+function hasMergeLineRange(range: MergeConflictLineRange) {
+  return range.startLine <= range.endLine;
+}
+
+function lineRangeIntersects(left: MergeConflictLineRange, right: MergeConflictLineRange) {
+  return left.startLine <= right.endLine && right.startLine <= left.endLine;
+}
+
+function lineRangeIntersectsAny(range: MergeConflictLineRange, exclusions: MergeConflictLineRange[]) {
+  return exclusions.some((exclusion) => hasMergeLineRange(exclusion) && lineRangeIntersects(range, exclusion));
+}
+
+function subtractMergeLineRanges(range: MergeConflictLineRange, exclusions: MergeConflictLineRange[]) {
+  if (!hasMergeLineRange(range)) return [];
+
+  let segments = [range];
+  const sortedExclusions = exclusions.filter(hasMergeLineRange).sort((left, right) => left.startLine - right.startLine);
+
+  for (const exclusion of sortedExclusions) {
+    segments = segments.flatMap((segment) => {
+      if (!lineRangeIntersects(segment, exclusion)) return [segment];
+
+      const nextSegments: MergeConflictLineRange[] = [];
+      if (segment.startLine < exclusion.startLine) {
+        nextSegments.push({
+          startLine: segment.startLine,
+          endLine: exclusion.startLine - 1,
+        });
+      }
+      if (exclusion.endLine < segment.endLine) {
+        nextSegments.push({
+          startLine: exclusion.endLine + 1,
+          endLine: segment.endLine,
+        });
+      }
+      return nextSegments;
+    });
+  }
+
+  return segments;
+}
+
+function mergeLinesInRange(lines: string[], range: MergeConflictLineRange) {
+  if (!hasMergeLineRange(range)) return [];
+  return lines.slice(range.startLine - 1, range.endLine);
+}
+
+function addMergeAutoMergeSegments(
+  targetRanges: MergeConflictLineRange[],
+  resultSnippets: MergeAutoMergeSnippet[],
+  lines: string[],
+  range: MergeConflictLineRange,
+  conflictRanges: MergeConflictLineRange[],
+) {
+  for (const segment of subtractMergeLineRanges(range, conflictRanges)) {
+    const segmentLines = mergeLinesInRange(lines, segment);
+    if (segmentLines.length === 0) continue;
+
+    targetRanges.push(segment);
+    if (segmentLines.some((line) => line.length > 0)) {
+      resultSnippets.push({ lines: segmentLines });
+    }
+  }
+}
+
+function buildMergeAutoMergeDiff(
+  currentContent: string,
+  incomingContent: string,
+  currentConflictRanges: MergeConflictLineRange[],
+  incomingConflictRanges: MergeConflictLineRange[],
+) {
+  const currentLines = splitMergeLines(currentContent);
+  const incomingLines = splitMergeLines(incomingContent);
+  const currentRanges: MergeConflictLineRange[] = [];
+  const incomingRanges: MergeConflictLineRange[] = [];
+  const resultSnippets: MergeAutoMergeSnippet[] = [];
+
+  for (const range of buildLineDiffRanges(currentLines, incomingLines)) {
+    addMergeAutoMergeSegments(
+      currentRanges,
+      resultSnippets,
+      currentLines,
+      { startLine: range.leftStartLine, endLine: range.leftEndLine },
+      currentConflictRanges,
+    );
+    addMergeAutoMergeSegments(
+      incomingRanges,
+      resultSnippets,
+      incomingLines,
+      { startLine: range.rightStartLine, endLine: range.rightEndLine },
+      incomingConflictRanges,
+    );
+  }
+
+  return { currentRanges, incomingRanges, resultSnippets };
+}
+
+function buildMergeConflictSnippetRanges(lines: string[], snippets: MergeConflictSnippet[]) {
+  const ranges: MergeConflictLineRange[] = [];
+  let searchFrom = 0;
+
+  for (const snippet of snippets) {
+    const snippetLines = splitMergeLines(snippet.content);
+    if (!snippetLines.some((line) => line.length > 0)) continue;
+
+    const foundAt = findLineRange(lines, snippetLines, searchFrom);
+    if (foundAt < 0) continue;
+
+    ranges.push({
+      startLine: foundAt + 1,
+      endLine: foundAt + snippetLines.length,
+    });
+    searchFrom = foundAt + snippetLines.length;
+  }
+
+  return ranges;
+}
+
+function findAvailableLineRange(
+  lines: string[],
+  needle: string[],
+  occupiedRanges: MergeConflictLineRange[],
+  startAt = 0,
+) {
+  if (needle.length === 0) return -1;
+
+  for (let index = startAt; index <= lines.length - needle.length; index += 1) {
+    const candidateRange = {
+      startLine: index + 1,
+      endLine: index + needle.length,
+    };
+    if (lineRangeIntersectsAny(candidateRange, occupiedRanges)) continue;
+
+    const matches = needle.every((line, offset) => lines[index + offset] === line);
+    if (matches) return index;
+  }
+
+  return -1;
+}
+
+function buildMergeResultAutoMergeRanges(
+  resultContent: string,
+  snippets: MergeAutoMergeSnippet[],
+  conflictSnippets: MergeConflictSnippet[],
+) {
+  const lines = splitMergeLines(resultContent);
+  const ranges: MergeConflictLineRange[] = [];
+  const occupiedRanges = buildMergeConflictSnippetRanges(lines, conflictSnippets);
+  let searchFrom = 0;
+
+  for (const snippet of snippets) {
+    if (!snippet.lines.some((line) => line.length > 0)) continue;
+
+    const foundAt = findAvailableLineRange(lines, snippet.lines, occupiedRanges, searchFrom);
+    if (foundAt < 0) continue;
+
+    const range = {
+      startLine: foundAt + 1,
+      endLine: foundAt + snippet.lines.length,
+    };
+    ranges.push(range);
+    occupiedRanges.push(range);
+    searchFrom = foundAt + snippet.lines.length;
+  }
+
+  return ranges;
 }
 
 function mergeConflictBlockContent(block: ConflictBlock, side: MergeConflictSide) {
@@ -5179,6 +5783,7 @@ function mergeConnectionRadius(height: number) {
 function buildMergeCodeLines(
   content: string,
   conflictSnippets: MergeConflictSnippet[],
+  autoMergeRanges: MergeConflictLineRange[],
   language: string,
 ): MergeCodeLine[] {
   const lines = splitMergeLines(content);
@@ -5186,6 +5791,7 @@ function buildMergeCodeLines(
     number,
     { index: number; side: MergeConflictSide; start: boolean; end: boolean }
   >();
+  const autoMergeLines = new Map<number, { start: boolean; end: boolean }>();
   let searchFrom = 0;
 
   conflictSnippets
@@ -5209,6 +5815,19 @@ function buildMergeCodeLines(
       searchFrom = foundAt + snippet.lines.length;
     });
 
+  autoMergeRanges.filter(hasMergeLineRange).forEach((range) => {
+    const startLine = Math.max(1, range.startLine);
+    const endLine = Math.min(lines.length, range.endLine);
+    for (let lineNumber = startLine; lineNumber <= endLine; lineNumber += 1) {
+      const index = lineNumber - 1;
+      if (conflictLines.has(index)) continue;
+      autoMergeLines.set(index, {
+        start: lineNumber === startLine,
+        end: lineNumber === endLine,
+      });
+    }
+  });
+
   return lines.map((line, index) => ({
     id: `${index}-${line}`,
     number: index + 1,
@@ -5219,6 +5838,9 @@ function buildMergeCodeLines(
     conflictSide: conflictLines.get(index)?.side ?? null,
     conflictStart: conflictLines.get(index)?.start ?? false,
     conflictEnd: conflictLines.get(index)?.end ?? false,
+    autoMerge: autoMergeLines.has(index),
+    autoMergeStart: autoMergeLines.get(index)?.start ?? false,
+    autoMergeEnd: autoMergeLines.get(index)?.end ?? false,
   }));
 }
 
@@ -6145,7 +6767,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
             type="button"
             title="刷新变更"
             :disabled="workspaceRefreshBusy"
-            :aria-busy="isUiActionPending('workspace.refresh')"
+            :aria-busy="isUiActionActive('workspace.refresh')"
             @click="refreshAll"
           >
             <component
@@ -6434,7 +7056,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
             type="button"
             title="刷新引用和日志"
             :disabled="history.loading || branches.loading"
-            :aria-busy="isUiActionPending('workspace.refresh')"
+            :aria-busy="isUiActionActive('workspace.refresh')"
             @click="refreshAll"
           >
             <component
@@ -7142,21 +7764,22 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <div v-if="projectEditorHunks.length" class="project-editor-change-layer">
               <button
                 v-for="hunk in projectEditorHunks"
-                :key="hunk.index"
+                :key="hunk.id"
                 class="project-change-marker"
-                :class="[hunk.tone, { expanded: expandedProjectHunk?.index === hunk.index }]"
+                :class="[hunk.tone, { expanded: expandedProjectHunk?.id === hunk.id }]"
                 :style="projectEditorHunkMarkerStyle(hunk)"
                 type="button"
                 :title="projectEditorHunkTitle(hunk)"
-                @click="toggleProjectEditorHunk(hunk.index)"
+                @click="toggleProjectEditorHunk(hunk.id)"
               >
-                <ChevronDown v-if="expandedProjectHunk?.index === hunk.index" :size="12" />
+                <ChevronDown v-if="expandedProjectHunk?.id === hunk.id" :size="12" />
                 <ChevronRight v-else :size="12" />
               </button>
 
               <div
                 v-if="expandedProjectHunk"
                 class="project-original-panel project-original-popover"
+                :class="expandedProjectHunk.tone"
                 :style="projectEditorOriginalPanelStyle(expandedProjectHunk)"
                 @mousedown.stop
               >
@@ -7171,7 +7794,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
                         class="icon-button danger"
                         type="button"
                         :disabled="project.contentLoading || project.contentSaving"
-                        @click="discardProjectEditorHunk(expandedProjectHunk.index)"
+                        @click="discardProjectEditorHunk(expandedProjectHunk)"
                       >
                         <RotateCcw :size="14" />
                         <span>撤回此块</span>
@@ -7186,15 +7809,23 @@ async function jumpMergeConflict(direction: -1 | 1) {
                       v-for="line in expandedProjectHunk.originalLines"
                       :key="line.index"
                       class="project-original-line"
+                      :class="line.tone"
                     >
                       <span class="line-number">{{ line.lineNumber }}</span>
                       <span class="line-content"><template
                         v-for="(token, tokenIndex) in line.tokens"
                         :key="tokenIndex"
-                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+                      ><span
+                        v-if="token.kind || token.diff"
+                        :class="[
+                          token.kind ? `syntax-${token.kind}` : '',
+                          token.diff ? 'project-original-diff-fragment' : '',
+                          token.insertMarker ? 'insert-marker' : '',
+                        ]"
+                      >{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
                     </div>
                   </div>
-                  <div v-else class="project-original-empty">原本没有内容，这一块是新增行</div>
+                  <div v-else class="project-original-empty" :class="expandedProjectHunk.tone">原本没有内容，这一块是新增行</div>
                 </div>
               </div>
             </div>
@@ -9162,6 +9793,21 @@ button[aria-busy="true"]:disabled {
   opacity: 0.86;
 }
 
+.icon-only-button.loading,
+.icon-only-button[aria-busy="true"] {
+  border-color: #7ea8dc;
+  color: #245b9f;
+  background: #f3f8ff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    0 0 0 2px rgba(91, 143, 215, 0.14);
+}
+
+.icon-only-button.loading:disabled,
+.icon-only-button[aria-busy="true"]:disabled {
+  opacity: 1;
+}
+
 .button-spinner {
   flex: 0 0 auto;
   animation: button-spin 0.8s linear infinite;
@@ -10714,6 +11360,33 @@ button[aria-busy="true"]:disabled {
   box-shadow: inset 0 -1px var(--merge-conflict-edge);
 }
 
+.merge-code-line.auto-merge:not(.conflict),
+.merge-result-render-line.auto-merge:not(.conflict),
+.merge-result-gutter-line.auto-merge:not(.conflict),
+.merge-source-gutter-line.auto-merge:not(.conflict) {
+  --merge-auto-merge-edge: rgba(65, 113, 169, 0.2);
+  background: #e9f3ff;
+}
+
+.merge-column.result .merge-result-render-line.auto-merge:not(.conflict),
+.merge-column.result .merge-result-gutter-line.auto-merge:not(.conflict) {
+  background: #edf6ff;
+}
+
+.merge-code-line.auto-merge-start:not(.conflict),
+.merge-result-render-line.auto-merge-start:not(.conflict),
+.merge-result-gutter-line.auto-merge-start:not(.conflict),
+.merge-source-gutter-line.auto-merge-start:not(.conflict) {
+  box-shadow: inset 0 1px var(--merge-auto-merge-edge);
+}
+
+.merge-code-line.auto-merge-end:not(.conflict),
+.merge-result-render-line.auto-merge-end:not(.conflict),
+.merge-result-gutter-line.auto-merge-end:not(.conflict),
+.merge-source-gutter-line.auto-merge-end:not(.conflict) {
+  box-shadow: inset 0 -1px var(--merge-auto-merge-edge);
+}
+
 .merge-result-gutter-line {
   user-select: none;
   color: #8d9991;
@@ -11071,12 +11744,19 @@ button[aria-busy="true"]:disabled {
   background: #ffffff;
 }
 
+.log-ref-tool-button .button-spinner {
+  color: #245b9f;
+}
+
 .log-ref-tool-button.loading,
-.log-ref-tool-button[aria-busy="true"] {
-  border-color: #5b8fd7;
-  color: #ffffff;
-  background: #3f6ea5;
-  box-shadow: 0 0 0 2px rgba(91, 143, 215, 0.16);
+.log-ref-tool-button[aria-busy="true"],
+.log-ref-tool-button:has(.button-spinner) {
+  border-color: #7ea8dc;
+  color: #245b9f;
+  background: #f3f8ff;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.72),
+    0 0 0 2px rgba(91, 143, 215, 0.14);
 }
 
 .log-ref-tool-button.active {
@@ -11093,8 +11773,9 @@ button[aria-busy="true"]:disabled {
 }
 
 .log-ref-tool-button.loading:disabled,
-.log-ref-tool-button[aria-busy="true"]:disabled {
-  opacity: 0.86;
+.log-ref-tool-button[aria-busy="true"]:disabled,
+.log-ref-tool-button:disabled:has(.button-spinner) {
+  opacity: 1;
   cursor: progress;
 }
 
@@ -13836,6 +14517,16 @@ button[aria-busy="true"]:disabled {
   pointer-events: auto;
 }
 
+.project-original-panel.modified {
+  border-color: #b8ccef;
+  background: #f7fbff;
+}
+
+.project-original-panel.added {
+  border-color: #b8ddc1;
+  background: #fbfffc;
+}
+
 .project-original-gutter {
   padding: 7px 12px 0 0;
   border-left: 2px solid #df3f36;
@@ -13845,10 +14536,30 @@ button[aria-busy="true"]:disabled {
   background: #fff0ee;
 }
 
+.project-original-panel.modified .project-original-gutter {
+  border-left-color: #4c82d9;
+  color: #7d91b0;
+  background: #eaf2ff;
+}
+
+.project-original-panel.added .project-original-gutter {
+  border-left-color: #3d8f55;
+  color: #779f82;
+  background: #eff8f1;
+}
+
 .project-original-card {
   max-width: 980px;
   border-right: 1px solid #f0c7c1;
   background: #ffffff;
+}
+
+.project-original-panel.modified .project-original-card {
+  border-right-color: #d4e0f5;
+}
+
+.project-original-panel.added .project-original-card {
+  border-right-color: #cce8d1;
 }
 
 .project-original-toolbar {
@@ -13861,6 +14572,18 @@ button[aria-busy="true"]:disabled {
   border-bottom: 1px solid #eadbd6;
   color: #7a4a43;
   background: #fff5f2;
+}
+
+.project-original-panel.modified .project-original-toolbar {
+  border-bottom-color: #d4e0f5;
+  color: #2f5f9f;
+  background: #f2f7ff;
+}
+
+.project-original-panel.added .project-original-toolbar {
+  border-bottom-color: #cce8d1;
+  color: #2f7b43;
+  background: #f2fbf4;
 }
 
 .project-original-toolbar span {
@@ -13880,9 +14603,59 @@ button[aria-busy="true"]:disabled {
   padding: 6px 0;
 }
 
+.project-original-line.modified {
+  background: #eef5ff;
+}
+
+.project-original-line.deleted {
+  background: #fff3f0;
+}
+
+.project-original-line.modified .line-number {
+  border-left: 2px solid #4c82d9;
+  color: #2f5f9f;
+  background: #eaf2ff;
+}
+
+.project-original-line.deleted .line-number {
+  border-left: 2px solid #df3f36;
+  color: #b13029;
+  background: #fff0ee;
+}
+
+.project-original-diff-fragment {
+  display: inline;
+  border-radius: 3px;
+  padding: 0 1px;
+  background: rgba(223, 63, 54, 0.18);
+  box-shadow: inset 0 -1px 0 rgba(223, 63, 54, 0.24);
+}
+
+.project-original-line.modified .project-original-diff-fragment {
+  background: rgba(76, 130, 217, 0.2);
+  box-shadow: inset 0 -1px 0 rgba(76, 130, 217, 0.28);
+}
+
+.project-original-diff-fragment.insert-marker {
+  display: inline-block;
+  width: 8px;
+  height: 14px;
+  margin: 0 1px;
+  padding: 0;
+  color: transparent;
+  vertical-align: -2px;
+}
+
 .project-original-empty {
   padding: 10px 12px;
+  border-left: 2px solid transparent;
   color: #8a7973;
+}
+
+.project-original-empty.added {
+  border-left-color: #3d8f55;
+  color: #2f7b43;
+  background: #eff8f1;
 }
 
 .diff-line.add {
@@ -13974,18 +14747,6 @@ html[data-theme="dark"] .topbar {
   border-bottom-color: #3c3f41;
   background: #2b2d30;
   box-shadow: inset 0 -1px 0 rgba(0, 0, 0, 0.32);
-}
-
-html[data-theme="dark"] .brand-mark {
-  border: 1px solid #56595f;
-  color: #ffffff;
-  background:
-    linear-gradient(135deg, #21d789 0 25%, transparent 25%),
-    linear-gradient(225deg, #00cfff 0 28%, transparent 28%),
-    linear-gradient(45deg, #7b61ff 0 30%, transparent 30%),
-    #111318;
-  box-shadow: inset 0 0 0 4px #111318;
-  letter-spacing: 0;
 }
 
 html[data-theme="dark"] .brand-copy strong,
@@ -14663,6 +15424,19 @@ html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.conflict-
   background: #243f36;
 }
 
+html[data-theme="dark"] .merge-code-line.auto-merge:not(.conflict),
+html[data-theme="dark"] .merge-source-gutter-line.auto-merge:not(.conflict),
+html[data-theme="dark"] .merge-result-render-line.auto-merge:not(.conflict),
+html[data-theme="dark"] .merge-result-gutter-line.auto-merge:not(.conflict) {
+  --merge-auto-merge-edge: rgba(93, 142, 199, 0.32);
+  background: #243247;
+}
+
+html[data-theme="dark"] .merge-column.result .merge-result-render-line.auto-merge:not(.conflict),
+html[data-theme="dark"] .merge-column.result .merge-result-gutter-line.auto-merge:not(.conflict) {
+  background: #233348;
+}
+
 html[data-theme="dark"] .merge-source-gutter,
 html[data-theme="dark"] .merge-result-gutter-line {
   color: #737980;
@@ -15021,11 +15795,16 @@ html[data-theme="dark"] .log-ref-tool-button.active {
 }
 
 html[data-theme="dark"] .log-ref-tool-button.loading,
-html[data-theme="dark"] .log-ref-tool-button[aria-busy="true"] {
+html[data-theme="dark"] .log-ref-tool-button[aria-busy="true"],
+html[data-theme="dark"] .log-ref-tool-button:has(.button-spinner) {
   border-color: #7aa2f7;
   color: #ffffff;
   background: #345e9d;
   box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.18);
+}
+
+html[data-theme="dark"] .log-ref-tool-button .button-spinner {
+  color: #ffffff;
 }
 
 html[data-theme="dark"] .log-ref-tool-button.active {
@@ -15603,15 +16382,45 @@ html[data-theme="dark"] .project-original-popover {
   grid-template-columns: 66px minmax(0, 1fr);
 }
 
+html[data-theme="dark"] .project-original-panel.modified {
+  border-color: #334761;
+  background: #1f2937;
+}
+
+html[data-theme="dark"] .project-original-panel.added {
+  border-color: #34472f;
+  background: #202b22;
+}
+
 html[data-theme="dark"] .project-original-gutter {
   border-left-color: #e05b55;
   color: #696d75;
   background: #332525;
 }
 
+html[data-theme="dark"] .project-original-panel.modified .project-original-gutter {
+  border-left-color: #6ea2f2;
+  color: #8eaad0;
+  background: #263247;
+}
+
+html[data-theme="dark"] .project-original-panel.added .project-original-gutter {
+  border-left-color: #6a8759;
+  color: #8aa276;
+  background: #243729;
+}
+
 html[data-theme="dark"] .project-original-card {
   border-right-color: #3c3030;
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-original-panel.modified .project-original-card {
+  border-right-color: #334761;
+}
+
+html[data-theme="dark"] .project-original-panel.added .project-original-card {
+  border-right-color: #34472f;
 }
 
 html[data-theme="dark"] .project-original-toolbar {
@@ -15620,8 +16429,56 @@ html[data-theme="dark"] .project-original-toolbar {
   background: #2b2424;
 }
 
+html[data-theme="dark"] .project-original-panel.modified .project-original-toolbar {
+  border-bottom-color: #334761;
+  color: #b8cfff;
+  background: #202d40;
+}
+
+html[data-theme="dark"] .project-original-panel.added .project-original-toolbar {
+  border-bottom-color: #34472f;
+  color: #9bc27c;
+  background: #243024;
+}
+
+html[data-theme="dark"] .project-original-line.modified {
+  background: #203047;
+}
+
+html[data-theme="dark"] .project-original-line.deleted {
+  background: #332525;
+}
+
+html[data-theme="dark"] .project-original-line.modified .line-number {
+  border-left-color: #6ea2f2;
+  color: #a9c7ff;
+  background: #263247;
+}
+
+html[data-theme="dark"] .project-original-line.deleted .line-number {
+  border-left-color: #e05b55;
+  color: #ee8a84;
+  background: #3f2a2a;
+}
+
+html[data-theme="dark"] .project-original-diff-fragment {
+  background: rgba(224, 91, 85, 0.3);
+  box-shadow: inset 0 -1px 0 rgba(224, 91, 85, 0.42);
+}
+
+html[data-theme="dark"] .project-original-line.modified .project-original-diff-fragment {
+  background: rgba(110, 162, 242, 0.28);
+  box-shadow: inset 0 -1px 0 rgba(110, 162, 242, 0.42);
+}
+
 html[data-theme="dark"] .project-original-empty {
   color: #8d9299;
+}
+
+html[data-theme="dark"] .project-original-empty.added {
+  border-left-color: #6a8759;
+  color: #9bc27c;
+  background: #243729;
 }
 
 html[data-theme="dark"] .diff-line.add {

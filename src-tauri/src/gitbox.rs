@@ -1298,8 +1298,11 @@ pub fn commit_with_full_options_and_selection_core(
     }
 
     if include_worktree {
+        ensure_unresolved_worktree_conflicts_have_no_markers(&repo, "提交")?;
         stage_worktree_changes_for_commit(&repo)?;
     }
+
+    ensure_index_ready_for_commit(&repo, None, "提交")?;
 
     let staged_diff = get_diff_core(path, None, true)?;
     if !amend && staged_diff.text.trim().is_empty() {
@@ -1388,6 +1391,202 @@ fn stage_worktree_changes_for_commit(repo: &Repository) -> Result<(), GitboxErro
     Ok(())
 }
 
+fn ensure_index_ready_for_commit(
+    repo: &Repository,
+    marker_paths: Option<&[String]>,
+    action: &str,
+) -> Result<(), GitboxError> {
+    ensure_no_unresolved_index_conflicts(repo, action)?;
+    ensure_staged_diff_has_no_conflict_markers(repo, marker_paths, action)?;
+    Ok(())
+}
+
+fn unresolved_conflict_paths(repo: &Repository) -> Result<Vec<String>, GitboxError> {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let mut paths = Vec::new();
+
+    for entry in statuses.iter() {
+        if !entry.status().contains(Status::CONFLICTED) {
+            continue;
+        }
+        let path = entry.path().unwrap_or("<unknown>").to_string();
+        if !paths.iter().any(|item| item == &path) {
+            paths.push(path);
+        }
+    }
+
+    paths.sort();
+    Ok(paths)
+}
+
+fn ensure_no_unresolved_index_conflicts(
+    repo: &Repository,
+    action: &str,
+) -> Result<(), GitboxError> {
+    let paths = unresolved_conflict_paths(repo)?;
+
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut message =
+        format!("仍有未解决的冲突文件，不能{action}。请先在合并工具中处理冲突并标记为已解决。");
+    append_limited_entries(&mut message, "受影响文件", &paths);
+    Err(GitboxError::Message(message))
+}
+
+fn ensure_unresolved_worktree_conflicts_have_no_markers(
+    repo: &Repository,
+    action: &str,
+) -> Result<(), GitboxError> {
+    let paths = unresolved_conflict_paths(repo)?;
+    ensure_worktree_paths_have_no_conflict_markers(repo, &paths, action)
+}
+
+fn ensure_staged_diff_has_no_conflict_markers(
+    repo: &Repository,
+    paths: Option<&[String]>,
+    action: &str,
+) -> Result<(), GitboxError> {
+    let workdir = repo_workdir(repo)?;
+    let mut args = vec![
+        "diff".to_string(),
+        "--check".to_string(),
+        "--cached".to_string(),
+    ];
+    if let Some(paths) = paths.filter(|paths| !paths.is_empty()) {
+        args.push("--".to_string());
+        args.extend(paths.iter().cloned());
+    }
+
+    let output = run_git_raw(&workdir, args, None)?;
+    let marker_lines = conflict_marker_lines_from_diff_check(&output.combined_output());
+    if marker_lines.is_empty() {
+        return Ok(());
+    }
+
+    Err(conflict_marker_error(action, &marker_lines))
+}
+
+fn ensure_worktree_paths_have_no_conflict_markers(
+    repo: &Repository,
+    paths: &[String],
+    action: &str,
+) -> Result<(), GitboxError> {
+    let mut marker_lines = Vec::new();
+    for path in paths {
+        let Some(content) = read_workdir_file_text(repo, path)? else {
+            continue;
+        };
+        marker_lines.extend(conflict_marker_lines_from_content(path, &content));
+    }
+
+    if marker_lines.is_empty() {
+        return Ok(());
+    }
+
+    Err(conflict_marker_error(action, &marker_lines))
+}
+
+fn conflict_marker_lines_from_content(path: &str, content: &str) -> Vec<String> {
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let has_marker = line.starts_with("<<<<<<< ")
+                || line.starts_with("||||||| ")
+                || line == "======="
+                || line.starts_with(">>>>>>> ");
+            has_marker.then(|| format!("{path}:{}: leftover conflict marker", index + 1))
+        })
+        .collect()
+}
+
+fn conflict_marker_lines_from_diff_check(output: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.contains("leftover conflict marker") {
+            continue;
+        }
+        if !lines.iter().any(|item| item == line) {
+            lines.push(line.to_string());
+        }
+    }
+    lines
+}
+
+fn conflict_marker_error(action: &str, entries: &[String]) -> GitboxError {
+    let mut message = format!(
+        "仍有文件包含冲突标记，不能{action}。请先删除 <<<<<<<、=======、>>>>>>> 标记并重新暂存。"
+    );
+    append_limited_entries(&mut message, "受影响位置", entries);
+    GitboxError::Message(message)
+}
+
+fn append_limited_entries(message: &mut String, title: &str, entries: &[String]) {
+    if entries.is_empty() {
+        return;
+    }
+
+    message.push_str("\n\n");
+    message.push_str(title);
+    message.push('：');
+    for entry in entries.iter().take(12) {
+        message.push_str("\n- ");
+        message.push_str(entry);
+    }
+    if entries.len() > 12 {
+        message.push_str(&format!("\n- 另有 {} 项", entries.len() - 12));
+    }
+}
+
+const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+fn ensure_no_pending_operation_for_action(path: &str, action: &str) -> Result<(), GitboxError> {
+    let state = operation_state_core(path)?;
+    if state.operation.is_none() && state.conflicted_paths.is_empty() {
+        return Ok(());
+    }
+
+    let operation = state
+        .operation
+        .as_deref()
+        .map(operation_label)
+        .unwrap_or("Git 操作");
+    let mut message =
+        format!("当前{operation}尚未完成，不能{action}。请先解决冲突并完成或终止该操作。");
+    append_limited_entries(&mut message, "受影响文件", &state.conflicted_paths);
+    Err(GitboxError::Message(message))
+}
+
+fn ensure_outgoing_diff_has_no_conflict_markers(
+    repo: &Repository,
+    workdir: &Path,
+    remote_name: &str,
+    target_branch: &str,
+) -> Result<(), GitboxError> {
+    let remote_ref = format!("refs/remotes/{remote_name}/{target_branch}");
+    let range = if repo.find_reference(&remote_ref).is_ok() {
+        format!("{remote_ref}..HEAD")
+    } else {
+        format!("{EMPTY_TREE_OID}..HEAD")
+    };
+    let output = run_git_raw(
+        workdir,
+        vec!["diff".to_string(), "--check".to_string(), range],
+        None,
+    )?;
+    let marker_lines = conflict_marker_lines_from_diff_check(&output.combined_output());
+    if marker_lines.is_empty() {
+        return Ok(());
+    }
+
+    Err(conflict_marker_error("推送", &marker_lines))
+}
+
 fn commit_merge_with_git(
     path: &str,
     repo: &Repository,
@@ -1409,6 +1608,7 @@ fn commit_merge_with_git(
     if let Some(selected_paths) = selected_paths {
         let selected_paths = clean_selected_paths(repo, selected_paths)?;
         if !selected_paths.is_empty() {
+            ensure_worktree_paths_have_no_conflict_markers(repo, &selected_paths, "提交")?;
             run_git(
                 &workdir,
                 git_args_with_paths(&["add", "-A"], &selected_paths),
@@ -1416,8 +1616,11 @@ fn commit_merge_with_git(
             )?;
         }
     } else if include_worktree {
+        ensure_unresolved_worktree_conflicts_have_no_markers(repo, "提交")?;
         stage_worktree_changes_for_commit(repo)?;
     }
+
+    ensure_index_ready_for_commit(repo, None, "提交")?;
 
     let mut args = vec!["commit".to_string()];
     if sign_off {
@@ -1456,11 +1659,15 @@ fn commit_selected_paths_with_git(
     }
 
     let workdir = repo_workdir(repo)?;
+    ensure_worktree_paths_have_no_conflict_markers(repo, &selected_paths, "提交")?;
     run_git(
         &workdir,
         git_args_with_paths(&["add", "-A"], &selected_paths),
         None,
     )?;
+
+    ensure_no_unresolved_index_conflicts(repo, "提交")?;
+    ensure_staged_diff_has_no_conflict_markers(repo, Some(&selected_paths), "提交")?;
 
     let mut args = vec!["commit".to_string(), "--only".to_string()];
     if amend {
@@ -1634,6 +1841,9 @@ pub fn push_with_options_core(
     let target = target_branch
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| branch.to_string());
+    ensure_no_pending_operation_for_action(path, "推送")?;
+    ensure_outgoing_diff_has_no_conflict_markers(&repo, &workdir, &name, &target)?;
+
     let mut args = vec!["push".to_string()];
     if set_upstream {
         args.push("-u".to_string());
@@ -3023,6 +3233,11 @@ pub fn operation_control_core(path: &str, action: String) -> Result<CommandResul
         .as_deref()
         .ok_or_else(|| GitboxError::Message("当前没有进行中的 Git 操作".to_string()))?;
 
+    if action == "continue" {
+        let repo = Repository::discover(path)?;
+        ensure_index_ready_for_commit(&repo, None, "继续当前操作")?;
+    }
+
     let args = match (operation, action.as_str()) {
         ("rebase", "continue") => vec!["rebase".to_string(), "--continue".to_string()],
         ("rebase", "abort") => vec!["rebase".to_string(), "--abort".to_string()],
@@ -3188,10 +3403,9 @@ pub fn mark_conflict_resolved_core(
     let rel = normalize_repo_path(&repo, &file_path)?;
     let pathspec = repo_path_string(&rel);
     let current = fs::read_to_string(workdir.join(&rel)).unwrap_or_default();
-    if current.contains("<<<<<<< ") {
-        return Err(GitboxError::Message(
-            "文件仍包含冲突标记，不能标记为已解决".to_string(),
-        ));
+    let marker_lines = conflict_marker_lines_from_content(&pathspec, &current);
+    if !marker_lines.is_empty() {
+        return Err(conflict_marker_error("标记为已解决", &marker_lines));
     }
     run_git(
         &workdir,
@@ -3217,13 +3431,9 @@ pub fn save_conflict_result_core(
     let pathspec = repo_path_string(&rel);
 
     if mark_resolved {
-        if content.contains("<<<<<<< ")
-            || content.contains("=======")
-            || content.contains(">>>>>>> ")
-        {
-            return Err(GitboxError::Message(
-                "结果仍包含冲突标记，不能标记为已解决".to_string(),
-            ));
+        let marker_lines = conflict_marker_lines_from_content(&pathspec, &content);
+        if !marker_lines.is_empty() {
+            return Err(conflict_marker_error("标记为已解决", &marker_lines));
         }
     }
 
@@ -5569,6 +5779,225 @@ mod tests {
     }
 
     #[test]
+    fn commit_merge_rejects_staged_conflict_markers() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        write_file(dir.path(), "conflict-demo.txt", "base\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage base");
+        commit_core(path, "base".to_string()).expect("commit base");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "-B".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main");
+        run_git(
+            dir.path(),
+            vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                "feature".to_string(),
+            ],
+            None,
+        )
+        .expect("checkout feature");
+        write_file(dir.path(), "conflict-demo.txt", "feature\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage feature");
+        commit_core(path, "feature change".to_string()).expect("commit feature");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main again");
+        write_file(dir.path(), "conflict-demo.txt", "main\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage main");
+        commit_core(path, "main change".to_string()).expect("commit main");
+        let head_before = repo_head_oid(path).expect("head before merge");
+
+        let merge = run_git_raw(
+            dir.path(),
+            vec!["merge".to_string(), "feature".to_string()],
+            None,
+        )
+        .expect("merge process");
+        assert!(!merge.success);
+
+        write_file(
+            dir.path(),
+            "conflict-demo.txt",
+            "<<<<<<< HEAD\nmain\n=======\nfeature\n>>>>>>> feature\n",
+        );
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()])
+            .expect("stage bad resolution");
+
+        let err = commit_with_full_options_and_selection_core(
+            path,
+            "merge feature".to_string(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            Some(vec!["conflict-demo.txt".to_string()]),
+        )
+        .expect_err("reject conflict markers");
+
+        let message = err.to_string();
+        assert!(message.contains("冲突标记"));
+        assert!(message.contains("conflict-demo.txt"));
+        assert_eq!(
+            repo_head_oid(path).expect("head after rejection"),
+            head_before
+        );
+        assert!(Repository::open(dir.path())
+            .unwrap()
+            .path()
+            .join("MERGE_HEAD")
+            .exists());
+    }
+
+    #[test]
+    fn commit_merge_rejection_preserves_conflict_editor_stages() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        write_file(dir.path(), "conflict-demo.txt", "base\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage base");
+        commit_core(path, "base".to_string()).expect("commit base");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "-B".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main");
+        run_git(
+            dir.path(),
+            vec![
+                "checkout".to_string(),
+                "-b".to_string(),
+                "feature".to_string(),
+            ],
+            None,
+        )
+        .expect("checkout feature");
+        write_file(dir.path(), "conflict-demo.txt", "feature\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage feature");
+        commit_core(path, "feature change".to_string()).expect("commit feature");
+
+        run_git(
+            dir.path(),
+            vec!["checkout".to_string(), "main".to_string()],
+            None,
+        )
+        .expect("checkout main again");
+        write_file(dir.path(), "conflict-demo.txt", "main\n");
+        stage_paths_core(path, vec!["conflict-demo.txt".to_string()]).expect("stage main");
+        commit_core(path, "main change".to_string()).expect("commit main");
+
+        let merge = run_git_raw(
+            dir.path(),
+            vec!["merge".to_string(), "feature".to_string()],
+            None,
+        )
+        .expect("merge process");
+        assert!(!merge.success);
+
+        let err = commit_with_full_options_and_selection_core(
+            path,
+            "merge feature".to_string(),
+            false,
+            false,
+            false,
+            None,
+            false,
+            Some(vec!["conflict-demo.txt".to_string()]),
+        )
+        .expect_err("reject conflict markers before staging");
+
+        let message = err.to_string();
+        assert!(message.contains("冲突标记"));
+        assert!(message.contains("conflict-demo.txt"));
+
+        let status = repo_status_core(path, false).expect("status");
+        assert_eq!(status.counts.conflicted, 1);
+        assert!(status
+            .files
+            .iter()
+            .any(|file| file.path == "conflict-demo.txt" && file.conflicted));
+
+        let details =
+            conflict_details_core(path, "conflict-demo.txt".to_string()).expect("details");
+        assert!(details.base.is_some());
+        assert!(details.ours.is_some());
+        assert!(details.theirs.is_some());
+        assert!(!details.blocks.is_empty());
+    }
+
+    #[test]
+    fn push_rejects_outgoing_commit_with_conflict_markers() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        initial_commit(dir.path());
+
+        let remote_dir = tempfile::tempdir().expect("remote dir");
+        Repository::init_bare(remote_dir.path()).expect("bare remote");
+        run_git(
+            dir.path(),
+            vec![
+                "remote".to_string(),
+                "add".to_string(),
+                "origin".to_string(),
+                remote_dir.path().to_string_lossy().to_string(),
+            ],
+            None,
+        )
+        .expect("add remote");
+        run_git(
+            dir.path(),
+            vec![
+                "push".to_string(),
+                "-u".to_string(),
+                "origin".to_string(),
+                "HEAD".to_string(),
+            ],
+            None,
+        )
+        .expect("push base");
+
+        write_file(
+            dir.path(),
+            "docs/remote-handoff.md",
+            "# Remote Handoff\n\n<<<<<<< HEAD\nlocal\n=======\nremote\n>>>>>>> origin/main\n",
+        );
+        run_git(
+            dir.path(),
+            vec!["add".to_string(), "docs/remote-handoff.md".to_string()],
+            None,
+        )
+        .expect("stage bad commit");
+        run_git(
+            dir.path(),
+            vec![
+                "commit".to_string(),
+                "-m".to_string(),
+                "bad conflict result".to_string(),
+            ],
+            None,
+        )
+        .expect("create bad commit outside GitBox");
+
+        let err =
+            push_with_options_core(path, Some("origin".to_string()), None, false, false, false)
+                .expect_err("reject push");
+        let message = err.to_string();
+        assert!(message.contains("冲突标记"));
+        assert!(message.contains("docs/remote-handoff.md"));
+    }
+
+    #[test]
     fn amend_commit_can_replace_head_and_add_signoff() {
         let (dir, _repo) = test_repo();
         initial_commit(dir.path());
@@ -6781,7 +7210,7 @@ mod tests {
         save_conflict_result_core(
             dir.path().to_str().unwrap(),
             "README.md".to_string(),
-            "manual result\n".to_string(),
+            "manual result\n==========\nkept separator\n".to_string(),
             true,
         )
         .expect("save result");
@@ -6792,7 +7221,7 @@ mod tests {
         assert!(!state.active);
         assert_eq!(
             fs::read_to_string(dir.path().join("README.md")).unwrap(),
-            "manual result\n"
+            "manual result\n==========\nkept separator\n"
         );
     }
 

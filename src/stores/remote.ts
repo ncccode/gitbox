@@ -13,6 +13,7 @@ import { useRepositoriesStore } from "./repositories";
 import type { CommandResult } from "../types/gitbox";
 
 type RemoteAction = "fetch" | "pull" | "push";
+type ActiveRemoteAction = RemoteAction | "fetchAll" | "save" | "delete" | null;
 
 function wildcardToRegExp(pattern: string) {
   const escaped = pattern
@@ -51,6 +52,7 @@ export const useRemoteStore = defineStore("remote", {
     remoteNameDraft: "",
     remoteUrlDraft: "",
     remotePushUrlDraft: "",
+    activeAction: null as ActiveRemoteAction,
     loading: false,
     error: "",
     notice: "",
@@ -65,6 +67,7 @@ export const useRemoteStore = defineStore("remote", {
       if (!repos.path) return;
 
       this.loading = true;
+      this.activeAction = action;
       this.error = "";
       if (action === "push") {
         this.lastPushRejected = false;
@@ -98,6 +101,9 @@ export const useRemoteStore = defineStore("remote", {
         }
         throw error;
       } finally {
+        if (this.activeAction === action) {
+          this.activeAction = null;
+        }
         this.loading = false;
       }
     },
@@ -106,6 +112,7 @@ export const useRemoteStore = defineStore("remote", {
       if (!repos.path) return;
 
       this.loading = true;
+      this.activeAction = "pull";
       this.error = "";
       try {
         return await pullPreflight(repos.path, this.selectedRemote || undefined);
@@ -113,6 +120,9 @@ export const useRemoteStore = defineStore("remote", {
         this.error = String(error);
         throw error;
       } finally {
+        if (this.activeAction === "pull") {
+          this.activeAction = null;
+        }
         this.loading = false;
       }
     },
@@ -124,6 +134,7 @@ export const useRemoteStore = defineStore("remote", {
       if (targets.length === 0) return;
 
       this.loading = true;
+      this.activeAction = "fetchAll";
       this.error = "";
       try {
         const errors: string[] = [];
@@ -149,6 +160,9 @@ export const useRemoteStore = defineStore("remote", {
           throw new Error(this.error);
         }
       } finally {
+        if (this.activeAction === "fetchAll") {
+          this.activeAction = null;
+        }
         this.loading = false;
       }
     },
@@ -191,6 +205,7 @@ export const useRemoteStore = defineStore("remote", {
       if (!repos.path || !this.remoteNameDraft.trim() || !this.remoteUrlDraft.trim()) return;
 
       this.loading = true;
+      this.activeAction = "save";
       this.error = "";
       try {
         const name = this.remoteNameDraft.trim();
@@ -221,6 +236,9 @@ export const useRemoteStore = defineStore("remote", {
         this.error = String(error);
         throw error;
       } finally {
+        if (this.activeAction === "save") {
+          this.activeAction = null;
+        }
         this.loading = false;
       }
     },
@@ -230,6 +248,7 @@ export const useRemoteStore = defineStore("remote", {
       if (!repos.path || !this.selectedRemote) return;
 
       this.loading = true;
+      this.activeAction = "delete";
       this.error = "";
       try {
         const result = await deleteRemote(repos.path, this.selectedRemote);
@@ -243,6 +262,9 @@ export const useRemoteStore = defineStore("remote", {
         this.error = String(error);
         throw error;
       } finally {
+        if (this.activeAction === "delete") {
+          this.activeAction = null;
+        }
         this.loading = false;
       }
     },

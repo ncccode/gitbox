@@ -210,15 +210,22 @@ export const useProjectStore = defineStore("project", {
     },
     async discardHunk(index: number) {
       const repos = useRepositoriesStore();
-      const changes = useChangesStore();
       const path = this.selectedPath;
       const hunk = this.diff?.hunks.find((item) => item.index === index);
       if (!repos.path || !path || !hunk) return;
 
+      await this.discardPatch(hunk.patch);
+    },
+    async discardPatch(patch: string) {
+      const repos = useRepositoriesStore();
+      const changes = useChangesStore();
+      const path = this.selectedPath;
+      if (!repos.path || !path || !patch) return;
+
       this.loadingContentPath = path;
       this.error = "";
       try {
-        await stageHunks(repos.path, [hunk.patch], "discard");
+        await stageHunks(repos.path, [patch], "discard");
         changes.notice = "已撤回选中块";
         await changes.refresh({ includeShelves: false });
         await this.reloadFileContent(path);
