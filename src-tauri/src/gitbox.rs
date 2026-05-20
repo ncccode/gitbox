@@ -1,6 +1,8 @@
 use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
 use rusqlite::{params, Connection};
 use serde::Serialize;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
@@ -10,6 +12,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitboxError {
@@ -5198,6 +5203,8 @@ fn run_git_raw(
         .args(args)
         .env("GIT_EDITOR", "true")
         .env("GIT_SEQUENCE_EDITOR", "true");
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     if input.is_some() {
         command.stdin(Stdio::piped());
     }
