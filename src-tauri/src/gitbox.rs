@@ -2034,6 +2034,7 @@ pub fn commit_details_core(path: &str, oid: String) -> Result<CommitDetails, Git
             "--root".to_string(),
             "--no-commit-id".to_string(),
             "--name-status".to_string(),
+            "-z".to_string(),
             "-r".to_string(),
             "-M".to_string(),
             oid.to_string(),
@@ -2219,6 +2220,7 @@ pub fn compare_refs_core(
         vec![
             "diff".to_string(),
             "--name-status".to_string(),
+            "-z".to_string(),
             "-M".to_string(),
             range.clone(),
         ],
@@ -3855,6 +3857,10 @@ fn commit_summary(commit: &git2::Commit<'_>, refs: Vec<String>) -> CommitSummary
 }
 
 fn parse_name_status(output: &str) -> Vec<CommitFileChange> {
+    if output.contains('\0') {
+        return parse_name_status_nul(output);
+    }
+
     output
         .lines()
         .filter_map(|line| {
@@ -3882,6 +3888,36 @@ fn parse_name_status(output: &str) -> Vec<CommitFileChange> {
             })
         })
         .collect()
+}
+
+fn parse_name_status_nul(output: &str) -> Vec<CommitFileChange> {
+    let mut files = Vec::new();
+    let mut parts = output.split('\0').filter(|part| !part.is_empty());
+
+    while let Some(status) = parts.next() {
+        let Some(first_path) = parts.next() else {
+            break;
+        };
+        let (old_path, path) = if status.starts_with('R') || status.starts_with('C') {
+            let Some(next_path) = parts.next() else {
+                break;
+            };
+            (Some(first_path.to_string()), next_path.to_string())
+        } else {
+            (None, first_path.to_string())
+        };
+
+        if path.is_empty() {
+            continue;
+        }
+        files.push(CommitFileChange {
+            path,
+            old_path,
+            status: status.to_string(),
+        });
+    }
+
+    files
 }
 
 fn parse_file_history(output: &str) -> Vec<FileHistoryEntry> {
@@ -6853,6 +6889,32 @@ mod tests {
             commit_details_core(dir.path().to_str().unwrap(), commit.oid).expect("details");
         assert!(details.diff.contains("+history"));
         assert_eq!(details.files[0].path, "README.md");
+    }
+
+    #[test]
+    fn commit_details_preserve_chinese_file_paths() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let file_path = "pages/chuan2/携程童/index.js";
+        write_file(dir.path(), file_path, "console.log('hello');\n");
+        stage_paths_core(dir.path().to_str().unwrap(), vec![file_path.to_string()]).expect("stage");
+        let commit = commit_core(dir.path().to_str().unwrap(), "add chinese path".to_string())
+            .expect("commit");
+
+        let details =
+            commit_details_core(dir.path().to_str().unwrap(), commit.oid).expect("details");
+        assert_eq!(details.files[0].path, file_path);
+        assert_eq!(details.files[0].status, "A");
+    }
+
+    #[test]
+    fn name_status_parser_handles_nul_delimited_renames() {
+        let files = parse_name_status("R100\0旧目录/旧文件.txt\0新目录/新文件.txt\0");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].status, "R100");
+        assert_eq!(files[0].old_path.as_deref(), Some("旧目录/旧文件.txt"));
+        assert_eq!(files[0].path, "新目录/新文件.txt");
     }
 
     #[test]
