@@ -7,14 +7,10 @@ import VcsIcon from "./icons/VcsIcon.vue";
 type WorkbenchMode =
   | "changes"
   | "log"
-  | "project"
-  | "branches"
-  | "operations"
-  | "advanced";
+  | "project";
 
 defineProps<{
   mode: WorkbenchMode;
-  conflictCount: number;
 }>();
 
 const emit = defineEmits<{

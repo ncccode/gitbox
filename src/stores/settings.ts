@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 import type { ChangeSide } from "../types/gitbox";
 
-export type LayoutPanelKey = "project" | "repo" | "changes";
+export type LayoutPanelKey = "project" | "changes";
 export type ThemeMode = "system" | "dark" | "light";
 export type DirectWorktreeCommitPolicy = "ask" | "always" | "never";
 
@@ -9,19 +9,16 @@ const STORAGE_KEY = "gitbox.settings";
 
 const DEFAULT_PANEL_WIDTHS: Record<LayoutPanelKey, number> = {
   project: 320,
-  repo: 380,
   changes: 390,
 };
 
 const DEFAULT_PANEL_VISIBILITY: Record<LayoutPanelKey, boolean> = {
   project: true,
-  repo: true,
   changes: true,
 };
 
 const PANEL_WIDTH_LIMITS: Record<LayoutPanelKey, { min: number; max: number }> = {
   project: { min: 260, max: 460 },
-  repo: { min: 300, max: 620 },
   changes: { min: 260, max: 680 },
 };
 
@@ -92,7 +89,6 @@ function readStoredSettings(): StoredSettings {
           : defaults.projectPaneCollapsed,
       panelWidths: {
         project: clampPanelWidth("project", parsed.panelWidths?.project ?? defaults.panelWidths.project),
-        repo: clampPanelWidth("repo", parsed.panelWidths?.repo ?? defaults.panelWidths.repo),
         changes: clampPanelWidth(
           "changes",
           parsed.panelWidths?.changes ?? defaults.panelWidths.changes,
@@ -103,10 +99,6 @@ function readStoredSettings(): StoredSettings {
           typeof parsed.panelVisibility?.project === "boolean"
             ? parsed.panelVisibility.project
             : defaults.panelVisibility.project,
-        repo:
-          typeof parsed.panelVisibility?.repo === "boolean"
-            ? parsed.panelVisibility.repo
-            : defaults.panelVisibility.repo,
         changes:
           typeof parsed.panelVisibility?.changes === "boolean"
             ? parsed.panelVisibility.changes
