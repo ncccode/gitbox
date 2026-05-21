@@ -504,6 +504,36 @@ pub fn filter_project_directories_core(paths: Vec<String>) -> Result<Vec<String>
     Ok(directories)
 }
 
+pub fn open_project_terminal_core(path: String) -> Result<CommandResult, GitboxError> {
+    let path = PathBuf::from(clean_ref_input(path, "请输入项目目录")?);
+    let path = fs::canonicalize(path)?;
+    if !fs::metadata(&path)?.is_dir() {
+        return Err(GitboxError::Message("项目路径不是文件夹".to_string()));
+    }
+
+    open_system_terminal(&path)?;
+    Ok(CommandResult {
+        ok: true,
+        message: "已在系统终端打开项目目录".to_string(),
+        output: path_string(&path),
+    })
+}
+
+pub fn open_project_directory_core(path: String) -> Result<CommandResult, GitboxError> {
+    let path = PathBuf::from(clean_ref_input(path, "请输入项目目录")?);
+    let path = fs::canonicalize(path)?;
+    if !fs::metadata(&path)?.is_dir() {
+        return Err(GitboxError::Message("项目路径不是文件夹".to_string()));
+    }
+
+    open_system_file_manager(&path)?;
+    Ok(CommandResult {
+        ok: true,
+        message: "已在系统文件管理器打开项目目录".to_string(),
+        output: path_string(&path),
+    })
+}
+
 pub fn list_project_files_core(
     path: &str,
     limit: Option<usize>,
@@ -4329,6 +4359,105 @@ fn is_skipped_project_entry(name: &str) -> bool {
 fn project_workdir_root(path: &str) -> Result<PathBuf, GitboxError> {
     let repo = Repository::discover(path)?;
     fs::canonicalize(repo_workdir(&repo)?).map_err(Into::into)
+}
+
+#[cfg(target_os = "macos")]
+fn open_system_file_manager(path: &Path) -> Result<(), GitboxError> {
+    let status = Command::new("open").arg(path).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitboxError::Message("无法打开系统文件管理器".to_string()))
+    }
+}
+
+#[cfg(windows)]
+fn open_system_file_manager(path: &Path) -> Result<(), GitboxError> {
+    let status = Command::new("explorer").arg(path).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitboxError::Message("无法打开系统文件管理器".to_string()))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_system_file_manager(path: &Path) -> Result<(), GitboxError> {
+    let openers: [&str; 3] = ["xdg-open", "gio", "kde-open"];
+    for program in openers {
+        let mut command = Command::new(program);
+        if program == "gio" {
+            command.arg("open");
+        }
+        command.arg(path);
+
+        match command.spawn() {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        }
+    }
+
+    Err(GitboxError::Message(
+        "无法找到可用的系统文件管理器".to_string(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn open_system_terminal(path: &Path) -> Result<(), GitboxError> {
+    let status = Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(path)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitboxError::Message("无法打开系统终端".to_string()))
+    }
+}
+
+#[cfg(windows)]
+fn open_system_terminal(path: &Path) -> Result<(), GitboxError> {
+    let mut command = Command::new("cmd");
+    command
+        .args(["/C", "start", "", "cmd", "/K", "cd", "/d"])
+        .arg(path);
+    let status = command.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(GitboxError::Message("无法打开系统终端".to_string()))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn open_system_terminal(path: &Path) -> Result<(), GitboxError> {
+    let terminals: [(&str, &[&str]); 8] = [
+        ("x-terminal-emulator", &[]),
+        ("gnome-terminal", &["--working-directory"]),
+        ("konsole", &["--workdir"]),
+        ("xfce4-terminal", &["--working-directory"]),
+        ("mate-terminal", &["--working-directory"]),
+        ("kitty", &["--directory"]),
+        ("alacritty", &["--working-directory"]),
+        ("xterm", &[]),
+    ];
+
+    for (program, args) in terminals {
+        let mut command = Command::new(program);
+        command.current_dir(path);
+        if !args.is_empty() {
+            command.args(args).arg(path);
+        }
+
+        match command.spawn() {
+            Ok(_) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        }
+    }
+
+    Err(GitboxError::Message("无法找到可用的系统终端".to_string()))
 }
 
 fn project_file_mutation(

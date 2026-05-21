@@ -1,5 +1,7 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted, ref } from "vue";
 import { FolderOpen, ListChecks, PanelLeftClose, PanelLeftOpen, Plus, X } from "@lucide/vue";
+import { openProjectDirectory, openProjectTerminal } from "../lib/gitboxCommands";
 import { useRepositoriesStore } from "../stores/repositories";
 
 defineProps<{
@@ -14,6 +16,13 @@ const emit = defineEmits<{
 }>();
 
 const repos = useRepositoriesStore();
+const projectContextMenu = ref<ProjectContextMenu | null>(null);
+
+type ProjectContextMenu = {
+  path: string;
+  x: number;
+  y: number;
+};
 
 const avatarPalettes = [
   { backgroundColor: "#3f6ea5", color: "#ffffff" },
@@ -42,6 +51,69 @@ function projectAvatarStyle(path: string) {
   }
   return avatarPalettes[hash % avatarPalettes.length];
 }
+
+function openProjectContextMenu(path: string, event: MouseEvent) {
+  const menuWidth = 260;
+  const menuHeight = 94;
+  projectContextMenu.value = {
+    path,
+    x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+  };
+}
+
+function closeProjectContextMenu() {
+  projectContextMenu.value = null;
+}
+
+function closeProjectContextMenuOnEscape(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    closeProjectContextMenu();
+  }
+}
+
+async function runProjectContextAction(action: (path: string) => Promise<unknown>) {
+  const menu = projectContextMenu.value;
+  if (!menu) return;
+
+  const { path } = menu;
+  closeProjectContextMenu();
+  repos.error = "";
+  try {
+    await action(path);
+  } catch (error) {
+    repos.error = String(error);
+  }
+}
+
+async function openProjectDirectoryFromContext(path: string) {
+  await runProjectContextAction(() => openProjectDirectory(path));
+}
+
+async function openProjectTerminalFromContext(path: string) {
+  await runProjectContextAction(() => openProjectTerminal(path));
+}
+
+async function copyProjectPathFromContext(path: string) {
+  closeProjectContextMenu();
+  try {
+    await navigator.clipboard.writeText(path);
+  } catch {
+    window.prompt("复制项目路径", path);
+  }
+}
+
+onMounted(() => {
+  window.addEventListener("click", closeProjectContextMenu);
+  window.addEventListener("blur", closeProjectContextMenu);
+  window.addEventListener("keydown", closeProjectContextMenuOnEscape);
+});
+
+onUnmounted(() => {
+  window.removeEventListener("click", closeProjectContextMenu);
+  window.removeEventListener("blur", closeProjectContextMenu);
+  window.removeEventListener("keydown", closeProjectContextMenuOnEscape);
+});
 </script>
 
 <template>
@@ -76,6 +148,7 @@ function projectAvatarStyle(path: string) {
           :key="project.path"
           class="project-row"
           :class="{ active: project.path === repos.selectedPath, uninitialized: !project.initialized }"
+          @contextmenu.prevent.stop="openProjectContextMenu(project.path, $event)"
         >
           <button
             class="project-switch"
@@ -108,6 +181,24 @@ function projectAvatarStyle(path: string) {
         <FolderOpen :size="16" />
         <span v-if="!collapsed">添加项目</span>
       </button>
+
+      <div
+        v-if="projectContextMenu"
+        class="context-menu project-context-menu"
+        :style="{ left: `${projectContextMenu.x}px`, top: `${projectContextMenu.y}px` }"
+        @click.stop
+        @contextmenu.prevent.stop
+      >
+        <button type="button" @click="openProjectDirectoryFromContext(projectContextMenu.path)">
+          <span>在系统文件管理器打开</span>
+        </button>
+        <button type="button" @click="openProjectTerminalFromContext(projectContextMenu.path)">
+          <span>在系统终端打开</span>
+        </button>
+        <button type="button" @click="copyProjectPathFromContext(projectContextMenu.path)">
+          <span>复制路径</span>
+        </button>
+      </div>
     </section>
   </aside>
 </template>

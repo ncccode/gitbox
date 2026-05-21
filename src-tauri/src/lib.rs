@@ -14,11 +14,12 @@ use gitbox::{
     fixup_commit_core, get_diff_core, init_repository_core, lfs_status_core, list_branches_core,
     list_commits_filtered_multi_core, list_project_files_core, list_shelves_core,
     list_stashes_core, list_submodules_core, list_worktrees_core, mark_conflict_resolved_core,
-    mark_shelf_applied, merge_branch_core, move_project_entry_core, open_repo_core,
-    operation_control_core, operation_state_core, pull_core, pull_preflight_core, push_commit_core,
-    push_tag_core, push_with_options_core, read_project_file_core, rebase_advanced_core,
-    rebase_branch_core, record_recent_repo, record_shelf, remove_worktree_core, rename_branch_core,
-    rename_project_entry_core, repo_status_core, reset_to_commit_core, resolve_conflict_block_core,
+    mark_shelf_applied, merge_branch_core, move_project_entry_core, open_project_directory_core,
+    open_project_terminal_core, open_repo_core, operation_control_core, operation_state_core,
+    pull_core, pull_preflight_core, push_commit_core, push_tag_core, push_with_options_core,
+    read_project_file_core, rebase_advanced_core, rebase_branch_core, record_recent_repo,
+    record_shelf, remove_worktree_core, rename_branch_core, rename_project_entry_core,
+    repo_status_core, reset_to_commit_core, resolve_conflict_block_core,
     resolve_conflict_file_core, revert_commit_core, revert_commit_files_core,
     save_conflict_result_core, save_project_file_core, set_branch_upstream_core,
     shelve_changes_core, stage_hunks_core, stage_paths_core, stash_action_core,
@@ -55,6 +56,16 @@ fn open_repo(app: AppHandle, path: String) -> CommandResponse<RepositoryInfo> {
 #[tauri::command]
 fn filter_project_directories(paths: Vec<String>) -> CommandResponse<Vec<String>> {
     filter_project_directories_core(paths).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn open_project_directory(path: String) -> CommandResponse<CommandResult> {
+    open_project_directory_core(path).map_err(|err| err.command())
+}
+
+#[tauri::command]
+fn open_project_terminal(path: String) -> CommandResponse<CommandResult> {
+    open_project_terminal_core(path).map_err(|err| err.command())
 }
 
 #[tauri::command]
@@ -759,6 +770,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_repo,
             filter_project_directories,
+            open_project_directory,
+            open_project_terminal,
             init_repository,
             clone_repository,
             unshallow_repository,

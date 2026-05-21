@@ -33,6 +33,14 @@ export function filterProjectDirectories(paths: string[]) {
   return invoke<string[]>("filter_project_directories", { paths });
 }
 
+export function openProjectDirectory(path: string) {
+  return invoke<CommandResult>("open_project_directory", { path });
+}
+
+export function openProjectTerminal(path: string) {
+  return invoke<CommandResult>("open_project_terminal", { path });
+}
+
 export function initRepository(
   path: string,
   options: { bare?: boolean; initialBranch?: string } = {},

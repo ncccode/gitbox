@@ -1474,6 +1474,8 @@ watch(workbenchMode, (mode) => {
 });
 
 onMounted(() => {
+  window.addEventListener("mousedown", preventRightClickTextSelection, { capture: true });
+  window.addEventListener("contextmenu", preventNativeContextMenu, { capture: true });
   setupProjectDragDrop();
 
   if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
@@ -1496,6 +1498,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener("mousedown", preventRightClickTextSelection, { capture: true });
+  window.removeEventListener("contextmenu", preventNativeContextMenu, { capture: true });
   projectDragDropDisposed = true;
   stopProjectDragDrop?.();
   stopSystemThemeWatch?.();
@@ -1503,6 +1507,20 @@ onUnmounted(() => {
   clearAutoFetchTimer();
   clearNoticeToastTimer();
 });
+
+function preventNativeContextMenu(event: MouseEvent) {
+  event.preventDefault();
+}
+
+function preventRightClickTextSelection(event: MouseEvent) {
+  if (event.button !== 2 || isEditableTarget(event.target)) return;
+  event.preventDefault();
+}
+
+function isEditableTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable], [role='textbox']"));
+}
 
 function clearNoticeToastTimer() {
   if (noticeToastTimer !== null && typeof window !== "undefined") {
