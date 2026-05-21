@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
   Archive,
   ArchiveRestore,
@@ -46,6 +47,7 @@ import {
   createProjectDirectory,
   createProjectFile,
   deleteProjectEntry,
+  filterProjectDirectories,
   moveProjectEntry,
   renameProjectEntry,
 } from "./lib/gitboxCommands";
@@ -124,6 +126,7 @@ const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
 const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
+const projectDropActive = ref(false);
 const expandedSubmitConfirmDirectories = ref<Record<string, boolean>>({});
 const mergeCurrentScroller = ref<HTMLElement | null>(null);
 const mergeCurrentGutter = ref<HTMLElement | null>(null);
@@ -377,6 +380,8 @@ let autoFetchTimer: number | null = null;
 let noticeToastTimer: number | null = null;
 let noticeToastId = 0;
 let errorDialogId = 0;
+let stopProjectDragDrop: (() => void) | null = null;
+let projectDragDropDisposed = false;
 const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 const PROJECT_EDITOR_LINE_HEIGHT = 18;
@@ -1429,6 +1434,8 @@ watch(workbenchMode, (mode) => {
 });
 
 onMounted(() => {
+  setupProjectDragDrop();
+
   if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
     const updateSystemTheme = () => {
@@ -1449,6 +1456,8 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  projectDragDropDisposed = true;
+  stopProjectDragDrop?.();
   stopSystemThemeWatch?.();
   projectEditorResizeObserver?.disconnect();
   clearAutoFetchTimer();
@@ -1646,6 +1655,15 @@ function parseHostedRemote(rawUrl: string) {
   }
 }
 
+async function addRepositoryPaths(paths: string[]) {
+  const uniquePaths = [...new Set(paths.map((path) => path.trim()).filter(Boolean))];
+  if (uniquePaths.length === 0) return [];
+
+  const opened = await repos.openMany(uniquePaths);
+  await loadSelectedProject();
+  return opened;
+}
+
 async function chooseRepository() {
   await runUiAction("repo.choose", async () => {
     const selected = await open({
@@ -1657,9 +1675,47 @@ async function chooseRepository() {
     const paths = normalizeSelectedPaths(selected);
     if (paths.length === 0) return;
 
-    await repos.openMany(paths);
-    await loadSelectedProject();
+    await addRepositoryPaths(paths);
   });
+}
+
+async function addDroppedProjectPaths(paths: string[]) {
+  await runUiAction("repo.drop", async () => {
+    const directories = await filterProjectDirectories(paths);
+    if (directories.length === 0) {
+      repos.error = "请拖入文件夹来添加项目";
+      return;
+    }
+
+    await addRepositoryPaths(directories);
+    showNoticeToast(directories.length === 1 ? "已添加拖入项目" : `已添加 ${directories.length} 个拖入项目`);
+  });
+}
+
+async function setupProjectDragDrop() {
+  try {
+    const unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        projectDropActive.value = true;
+        return;
+      }
+
+      projectDropActive.value = false;
+      if (event.payload.type !== "drop") return;
+
+      addDroppedProjectPaths(event.payload.paths).catch((error) => {
+        repos.error = String(error);
+      });
+    });
+
+    if (projectDragDropDisposed) {
+      unlisten();
+      return;
+    }
+    stopProjectDragDrop = unlisten;
+  } catch {
+    // Browser-only dev sessions do not expose Tauri drag/drop events.
+  }
 }
 
 async function initSelectedProject() {
@@ -5970,7 +6026,12 @@ async function jumpMergeConflict(direction: -1 | 1) {
 </script>
 
 <template>
-  <div class="app-shell" :data-theme="effectiveTheme" @click="closeContextMenus">
+  <div
+    class="app-shell"
+    :class="{ 'project-drop-active': projectDropActive }"
+    :data-theme="effectiveTheme"
+    @click="closeContextMenus"
+  >
     <AppTopbar
       :brand-subtitle="brandSubtitle"
       :has-repository="Boolean(repos.current)"
@@ -5979,6 +6040,16 @@ async function jumpMergeConflict(direction: -1 | 1) {
       :ahead="branch?.ahead ?? 0"
       :behind="branch?.behind ?? 0"
     />
+
+    <Transition name="project-drop-overlay">
+      <div v-if="projectDropActive" class="project-drop-overlay" aria-hidden="true">
+        <div class="project-drop-target">
+          <FolderOpen :size="22" />
+          <strong>松开以添加项目</strong>
+          <span>支持多个文件夹</span>
+        </div>
+      </div>
+    </Transition>
 
     <Transition name="notice-toast">
       <div v-if="noticeToast" class="notice-toast" role="status" aria-live="polite" @click.stop>
@@ -9544,6 +9615,61 @@ button:disabled {
   height: 100vh;
   min-width: 0;
   background: #eef1ed;
+}
+
+.project-drop-overlay {
+  position: fixed;
+  inset: 60px 12px 12px;
+  z-index: 110;
+  display: grid;
+  place-items: center;
+  border: 2px dashed #4c82d9;
+  border-radius: 8px;
+  background: rgba(232, 240, 251, 0.72);
+  pointer-events: none;
+}
+
+.project-drop-target {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(440px, calc(100vw - 48px));
+  min-height: 48px;
+  padding: 10px 14px;
+  border: 1px solid #b8cdea;
+  border-radius: 8px;
+  color: #244a7c;
+  background: #ffffff;
+  box-shadow: 0 18px 46px rgba(34, 48, 42, 0.18);
+}
+
+.project-drop-target strong,
+.project-drop-target span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-drop-target strong {
+  font-size: 15px;
+}
+
+.project-drop-target span {
+  color: #526158;
+  font-size: 12px;
+}
+
+.project-drop-overlay-enter-active,
+.project-drop-overlay-leave-active {
+  transition:
+    opacity 0.14s ease,
+    transform 0.14s ease;
+}
+
+.project-drop-overlay-enter-from,
+.project-drop-overlay-leave-to {
+  opacity: 0;
+  transform: scale(0.99);
 }
 
 .notice-toast {
@@ -14855,6 +14981,22 @@ html[data-theme="dark"] button:disabled {
 
 html[data-theme="dark"] .app-shell {
   background: #1e1f22;
+}
+
+html[data-theme="dark"] .project-drop-overlay {
+  border-color: #4c82d9;
+  background: rgba(40, 53, 75, 0.74);
+}
+
+html[data-theme="dark"] .project-drop-target {
+  border-color: #3e5f8f;
+  color: #d8e7ff;
+  background: #252629;
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.42);
+}
+
+html[data-theme="dark"] .project-drop-target span {
+  color: #a3aab4;
 }
 
 html[data-theme="dark"] .notice-toast {

@@ -474,6 +474,34 @@ pub fn open_repo_core(path: &str) -> Result<RepositoryInfo, GitboxError> {
     repository_info(&repo)
 }
 
+pub fn filter_project_directories_core(paths: Vec<String>) -> Result<Vec<String>, GitboxError> {
+    let mut directories = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw_path in paths {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(trimmed);
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let normalized = fs::canonicalize(&path).unwrap_or(path);
+        let value = path_string(&normalized);
+        if seen.insert(value.clone()) {
+            directories.push(value);
+        }
+    }
+
+    Ok(directories)
+}
+
 pub fn list_project_files_core(
     path: &str,
     limit: Option<usize>,
@@ -3764,8 +3792,10 @@ pub fn list_shelves_core(app: &AppHandle, repo_path: &str) -> Result<Vec<ShelfIn
 }
 
 fn repository_info(repo: &Repository) -> Result<RepositoryInfo, GitboxError> {
-    let workdir = repo.workdir().map(path_string);
-    let root = repo_root(repo)?;
+    let workdir = repo
+        .workdir()
+        .map(|path| path_string(&normalize_existing_path(path)));
+    let root = normalize_existing_path(&repo_root(repo)?);
     let branch = current_branch_name(repo);
     let head = repo
         .head()
@@ -3776,7 +3806,7 @@ fn repository_info(repo: &Repository) -> Result<RepositoryInfo, GitboxError> {
     Ok(RepositoryInfo {
         path: path_string(&root),
         workdir,
-        git_dir: path_string(repo.path()),
+        git_dir: path_string(&normalize_existing_path(repo.path())),
         is_bare: repo.is_bare(),
         branch,
         head,
@@ -5175,6 +5205,10 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+fn normalize_existing_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn git_args_with_paths(prefix: &[&str], paths: &[String]) -> Vec<String> {
     let mut args = prefix.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
     args.push("--".to_string());
@@ -5494,6 +5528,29 @@ mod tests {
         write_file(root, "README.md", "hello\n");
         stage_paths_core(root.to_str().unwrap(), vec!["README.md".to_string()]).expect("stage");
         commit_core(root.to_str().unwrap(), "initial".to_string()).expect("commit");
+    }
+
+    #[test]
+    fn filter_project_directories_keeps_only_existing_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project");
+        let file = dir.path().join("note.txt");
+        fs::write(&file, "not a directory").expect("write file");
+
+        let paths = filter_project_directories_core(vec![
+            file.to_string_lossy().to_string(),
+            project.to_string_lossy().to_string(),
+            format!(" {} ", project.to_string_lossy()),
+            dir.path().join("missing").to_string_lossy().to_string(),
+            String::new(),
+        ])
+        .expect("filter project directories");
+
+        assert_eq!(
+            paths,
+            vec![path_string(&fs::canonicalize(project).unwrap())]
+        );
     }
 
     #[test]
@@ -7361,6 +7418,14 @@ mod tests {
         )
         .expect("init repo");
         assert_eq!(initialized.branch.as_deref(), Some("main"));
+        assert_eq!(
+            initialized.path,
+            path_string(&fs::canonicalize(&init_path).unwrap())
+        );
+        assert_eq!(
+            initialized.workdir.as_deref(),
+            Some(initialized.path.as_str())
+        );
 
         let (source_dir, _repo) = test_repo();
         initial_commit(source_dir.path());

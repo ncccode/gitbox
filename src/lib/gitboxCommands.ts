@@ -29,6 +29,10 @@ export function openRepo(path: string) {
   return invoke<RepositoryInfo>("open_repo", { path });
 }
 
+export function filterProjectDirectories(paths: string[]) {
+  return invoke<string[]>("filter_project_directories", { paths });
+}
+
 export function initRepository(
   path: string,
   options: { bare?: boolean; initialBranch?: string } = {},
