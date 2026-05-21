@@ -1,4 +1,6 @@
-use git2::{BranchType, DiffFormat, DiffOptions, Oid, Repository, Status, StatusOptions};
+use git2::{
+    BranchType, DiffFormat, DiffOptions, ErrorCode, Oid, Repository, Status, StatusOptions,
+};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 #[cfg(windows)]
@@ -1805,7 +1807,12 @@ pub fn pull_core(
         });
     }
 
-    let merge_base = repo.merge_base(head_oid, target_oid)?;
+    let merge_base = merge_base_or_none(&repo, head_oid, target_oid)?.ok_or_else(|| {
+        GitboxError::Message(unrelated_histories_pull_message(
+            &preflight.target,
+            &preflight.remote,
+        ))
+    })?;
     let use_autostash = smart_merge && !preflight.overlapping_paths.is_empty();
     if merge_base == head_oid {
         let mut args = vec!["merge".to_string(), "--ff-only".to_string()];
@@ -2284,6 +2291,28 @@ pub fn list_branches_core(path: &str) -> Result<BranchList, GitboxError> {
 
     collect_branches(&repo, BranchType::Local, &mut branches)?;
     collect_branches(&repo, BranchType::Remote, &mut branches)?;
+    if let Some(current_name) = current.as_deref().filter(|name| *name != "HEAD") {
+        if !branches
+            .iter()
+            .any(|branch| branch.branch_type == "local" && branch.name == current_name)
+        {
+            let target = repo
+                .head()
+                .ok()
+                .and_then(|head| head.target())
+                .map(|oid| oid.to_string());
+            branches.push(BranchInfo {
+                name: current_name.to_string(),
+                full_name: format!("refs/heads/{current_name}"),
+                branch_type: "local".to_string(),
+                current: true,
+                upstream: None,
+                target,
+                ahead: 0,
+                behind: 0,
+            });
+        }
+    }
     branches.sort_by(|left, right| {
         branch_type_order(&left.branch_type)
             .cmp(&branch_type_order(&right.branch_type))
@@ -3816,6 +3845,12 @@ fn repository_info(repo: &Repository) -> Result<RepositoryInfo, GitboxError> {
 
 fn current_branch_name(repo: &Repository) -> Option<String> {
     if let Ok(head) = repo.head() {
+        if let Some(name) = head
+            .symbolic_target()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+        {
+            return Some(name.to_string());
+        }
         if let Some(name) = head.shorthand() {
             return Some(name.to_string());
         }
@@ -4529,6 +4564,24 @@ fn current_pull_remote_and_target(
     Ok(("origin".to_string(), format!("origin/{branch_name}")))
 }
 
+fn merge_base_or_none(
+    repo: &Repository,
+    left: Oid,
+    right: Oid,
+) -> Result<Option<Oid>, GitboxError> {
+    match repo.merge_base(left, right) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(error) if error.code() == ErrorCode::NotFound => Ok(None),
+        Err(error) => Err(GitboxError::Git(error)),
+    }
+}
+
+fn unrelated_histories_pull_message(target: &str, remote: &str) -> String {
+    format!(
+        "当前分支与 {target} 没有共同提交历史，无法直接拉取。请确认远程 {remote} 或上游分支是否选错；若确实要合并两个无关仓库，请在命令行使用 --allow-unrelated-histories。"
+    )
+}
+
 fn build_pull_preflight(
     repo: &Repository,
     remote: String,
@@ -4548,7 +4601,9 @@ fn build_pull_preflight(
     let merge_base = if head_oid == target_oid {
         head_oid
     } else {
-        repo.merge_base(head_oid, target_oid)?
+        merge_base_or_none(repo, head_oid, target_oid)?.ok_or_else(|| {
+            GitboxError::Message(unrelated_histories_pull_message(&target, &remote))
+        })?
     };
     let up_to_date = head_oid == target_oid;
     let fast_forward = !up_to_date && merge_base == head_oid;
@@ -6534,6 +6589,69 @@ mod tests {
     }
 
     #[test]
+    fn pull_preflight_reports_unrelated_histories_clearly() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let path = dir.path().to_str().unwrap();
+        let branch = branch_summary_core(path, false)
+            .expect("summary")
+            .current_branch
+            .expect("current branch");
+
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        let remote_repo = Repository::init(remote_dir.path()).expect("init remote repo");
+        {
+            let mut config = remote_repo.config().expect("remote config");
+            config
+                .set_str("user.name", "remote")
+                .expect("remote user name");
+            config
+                .set_str("user.email", "remote@example.test")
+                .expect("remote user email");
+        }
+        run_git(
+            remote_dir.path(),
+            vec![
+                "symbolic-ref".to_string(),
+                "HEAD".to_string(),
+                format!("refs/heads/{branch}"),
+            ],
+            None,
+        )
+        .expect("set remote head");
+        write_file(remote_dir.path(), "README.md", "remote root\n");
+        run_git(
+            remote_dir.path(),
+            vec!["add".to_string(), "README.md".to_string()],
+            None,
+        )
+        .expect("stage remote root");
+        run_git(
+            remote_dir.path(),
+            vec![
+                "commit".to_string(),
+                "-m".to_string(),
+                "remote root".to_string(),
+            ],
+            None,
+        )
+        .expect("commit remote root");
+
+        add_remote_core(
+            path,
+            "origin".to_string(),
+            remote_dir.path().to_string_lossy().to_string(),
+        )
+        .expect("add unrelated remote");
+
+        let error = pull_preflight_core(path, Some("origin".to_string()))
+            .expect_err("unrelated histories should be reported");
+        let message = error.to_string();
+        assert!(message.contains("没有共同提交历史"));
+        assert!(!message.contains("class=Merge"));
+    }
+
+    #[test]
     fn smart_pull_uses_three_way_conflict_for_dirty_overlap() {
         let (dir, _repo) = test_repo();
         initial_commit(dir.path());
@@ -7418,6 +7536,17 @@ mod tests {
         )
         .expect("init repo");
         assert_eq!(initialized.branch.as_deref(), Some("main"));
+        let initialized_branches =
+            list_branches_core(&initialized.path).expect("initialized branches");
+        let initialized_main = initialized_branches
+            .branches
+            .iter()
+            .find(|branch| branch.name == "main")
+            .expect("initialized main branch");
+        assert_eq!(initialized_branches.current.as_deref(), Some("main"));
+        assert_eq!(initialized_main.branch_type, "local");
+        assert!(initialized_main.current);
+        assert!(initialized_main.target.is_none());
         assert_eq!(
             initialized.path,
             path_string(&fs::canonicalize(&init_path).unwrap())

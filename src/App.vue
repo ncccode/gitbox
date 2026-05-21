@@ -125,6 +125,7 @@ const changeListContextMenu = ref<ChangeListContextMenu | null>(null);
 const projectFileContextMenu = ref<ProjectFileContextMenu | null>(null);
 const projectFileClipboard = ref<ProjectFileClipboard>(null);
 const projectNameDialog = ref<ProjectNameDialog | null>(null);
+const addRemoteDialog = ref<AddRemoteDialog | null>(null);
 const projectCloseDialog = ref<ProjectCloseDialog | null>(null);
 const projectDropActive = ref(false);
 const expandedSubmitConfirmDirectories = ref<Record<string, boolean>>({});
@@ -156,7 +157,7 @@ const expandedChangeFileGroups = ref<Record<string, boolean>>({
   tracked: true,
   untracked: true,
 });
-type WorkbenchMode = "changes" | "log" | "project" | "branches" | "remote" | "operations" | "advanced";
+type WorkbenchMode = "changes" | "log" | "project" | "branches" | "operations" | "advanced";
 type ChangeFileGroup = {
   key: string;
   label: string;
@@ -284,9 +285,17 @@ type ProjectFileClipboard = {
 type ProjectNameDialog = {
   title: string;
   value: string;
+  placeholder: string;
   error: string;
   validate: (value: string) => string;
   resolve: (value: string | null) => void;
+};
+type AddRemoteDialog = {
+  name: string;
+  url: string;
+  fetchAfterSave: boolean;
+  loading: boolean;
+  error: string;
 };
 type ProjectCloseDialog = {
   path: string;
@@ -382,7 +391,7 @@ let noticeToastId = 0;
 let errorDialogId = 0;
 let stopProjectDragDrop: (() => void) | null = null;
 let projectDragDropDisposed = false;
-const repositoryContextModes = new Set<WorkbenchMode>(["branches", "remote", "operations"]);
+const repositoryContextModes = new Set<WorkbenchMode>(["branches", "operations"]);
 const workbenchContextModes = new Set<WorkbenchMode>(["changes", "log", "project", "advanced"]);
 const PROJECT_EDITOR_LINE_HEIGHT = 18;
 const MIN_OPERATION_BUSY_MS = 520;
@@ -1058,6 +1067,12 @@ type LogRefContextMenu =
       branch: BranchInfo;
     }
   | {
+      kind: "remoteDirectory";
+      x: number;
+      y: number;
+      remoteName?: string;
+    }
+  | {
       kind: "tag";
       x: number;
       y: number;
@@ -1069,32 +1084,30 @@ type LogAuthorOption = {
   meta: string;
   count: number;
 };
-const hostedRemoteLinks = computed(() =>
-  (repos.current?.remotes ?? [])
-    .map((item) => {
-      const url = item.url || item.pushUrl || "";
-      const parsed = parseHostedRemote(url);
-      if (!parsed) return null;
-      return {
-        name: item.name,
-        ...parsed,
-      };
-    })
-    .filter((item): item is { name: string; provider: string; repo: string; webUrl: string; compareUrl: string } =>
-      Boolean(item),
-    ),
-);
 const logHeadLabel = computed(() => (branch.value?.detached ? "HEAD (游离)" : "HEAD (目前分支)"));
+const configuredRemoteNames = computed(() =>
+  (repos.current?.remotes ?? []).map((item) => item.name).filter(Boolean),
+);
 const logRemoteGroups = computed<LogRemoteGroup[]>(() => {
   const groups = new Map<string, BranchInfo[]>();
+  const orderedNames: string[] = [];
+  const ensureGroup = (name: string) => {
+    if (!groups.has(name)) {
+      groups.set(name, []);
+      orderedNames.push(name);
+    }
+    return groups.get(name)!;
+  };
+
   for (const item of branches.sortedRemoteBranches) {
     const parts = item.name.split("/");
     const remoteName = parts[0] || "remote";
-    const group = groups.get(remoteName) ?? [];
-    group.push(item);
-    groups.set(remoteName, group);
+    ensureGroup(remoteName).push(item);
   }
-  return [...groups.entries()].map(([name, groupBranches]) => ({ name, branches: groupBranches }));
+  for (const name of configuredRemoteNames.value) {
+    ensureGroup(name);
+  }
+  return orderedNames.map((name) => ({ name, branches: groups.get(name) ?? [] }));
 });
 const logRefSearchQuery = computed(() => logRefSearch.value.trim().toLocaleLowerCase());
 const logRefFiltering = computed(() => Boolean(logRefSearchQuery.value));
@@ -1115,6 +1128,7 @@ const visibleLogLocalBranches = computed<BranchInfo[]>(() => {
 });
 const visibleLogRemoteGroups = computed<LogRemoteGroup[]>(() => {
   const query = logRefSearchQuery.value;
+  const canShowEmptyGroups = !logFavoriteRefsOnly.value;
   const remoteGroups = logRemoteGroups.value
     .map((group) => ({
       ...group,
@@ -1122,11 +1136,11 @@ const visibleLogRemoteGroups = computed<LogRemoteGroup[]>(() => {
         ? group.branches.filter((item) => isLogBranchFavorite(item))
         : group.branches,
     }))
-    .filter((group) => group.branches.length > 0);
+    .filter((group) => group.branches.length > 0 || canShowEmptyGroups);
   if (!query) return remoteGroups;
   return remoteGroups
     .map((group) => {
-      if (logRefMatches(query, group.name, "远端", "remote")) return group;
+      if (logRefMatches(query, group.name, "远程", "remote")) return group;
       return {
         ...group,
         branches: group.branches.filter((item) =>
@@ -1134,7 +1148,33 @@ const visibleLogRemoteGroups = computed<LogRemoteGroup[]>(() => {
         ),
       };
     })
-    .filter((group) => group.branches.length > 0);
+    .filter(
+      (group) =>
+        group.branches.length > 0 ||
+        (canShowEmptyGroups &&
+          logRefMatches(
+            query,
+            group.name,
+            "远程",
+            "remote",
+            group.branches.length === 0 ? "暂无远程分支" : undefined,
+          )),
+    );
+});
+const showLogRemoteAddEntry = computed(() => {
+  const query = logRefSearchQuery.value;
+  return (
+    Boolean(repos.current) &&
+    !logFavoriteRefsOnly.value &&
+    configuredRemoteNames.value.length === 0 &&
+    branches.sortedRemoteBranches.length === 0 &&
+    logRefMatches(query, "添加远程仓库", "添加", "远程", "remote", "add")
+  );
+});
+const showLogRemoteRoot = computed(() => {
+  const query = logRefSearchQuery.value;
+  if (!repos.current || logFavoriteRefsOnly.value) return visibleLogRemoteGroups.value.length > 0;
+  return !query || visibleLogRemoteGroups.value.length > 0 || showLogRemoteAddEntry.value;
 });
 const visibleLogTags = computed<TagInfo[]>(() => {
   const query = logRefSearchQuery.value;
@@ -1168,7 +1208,7 @@ const hasVisibleLogRefs = computed(
   () =>
     showLogHeadRef.value ||
     visibleLogLocalBranches.value.length > 0 ||
-    visibleLogRemoteGroups.value.length > 0 ||
+    showLogRemoteRoot.value ||
     visibleLogTags.value.length > 0,
 );
 const logGraphRows = computed<LogGraphRow[]>(() => buildLogGraphRows(history.commits));
@@ -1630,31 +1670,6 @@ function normalizeSelectedPaths(selected: string | string[] | null) {
   return Array.isArray(selected) ? selected : [selected];
 }
 
-function parseHostedRemote(rawUrl: string) {
-  const value = rawUrl.trim().replace(/\.git$/, "");
-  if (!value) return null;
-
-  const sshLike = value.match(/^git@([^:]+):(.+)$/);
-  const normalized = sshLike ? `ssh://git@${sshLike[1]}/${sshLike[2]}` : value;
-  try {
-    const url = new URL(normalized);
-    const host = url.hostname.toLowerCase();
-    if (!["github.com", "gitlab.com", "bitbucket.org"].includes(host)) return null;
-    const repo = url.pathname.replace(/^\/+/, "").replace(/\.git$/, "");
-    const provider =
-      host === "github.com" ? "GitHub" : host === "gitlab.com" ? "GitLab" : "Bitbucket";
-    const webUrl = `https://${host}/${repo}`;
-    return {
-      provider,
-      repo,
-      webUrl,
-      compareUrl: `${webUrl}/compare`,
-    };
-  } catch {
-    return null;
-  }
-}
-
 async function addRepositoryPaths(paths: string[]) {
   const uniquePaths = [...new Set(paths.map((path) => path.trim()).filter(Boolean))];
   if (uniquePaths.length === 0) return [];
@@ -2020,12 +2035,6 @@ async function fetchAllRepositories() {
   }
 }
 
-async function fetchAllRepositoriesFromPointer(event: PointerEvent) {
-  if (event.pointerType === "mouse" && event.button !== 0) return;
-  event.preventDefault();
-  await fetchAllRepositories();
-}
-
 function cancelPullConfirmDialog() {
   if (pullConfirmDialog.value?.loading) return;
   pullConfirmDialog.value = null;
@@ -2073,33 +2082,11 @@ async function runAutoFetch() {
   }
 }
 
-async function resolveRejectedPush(strategy: "merge" | "rebase") {
-  await runUiAction(`remote.resolve.${strategy}`, async () => {
-    const target = remote.lastRejectedTarget || remote.pushTargetRef();
-    const remoteName = remote.selectedRemote || "origin";
-    const upstream = `${remoteName}/${target}`;
-    await remote.run("fetch");
-    if (strategy === "merge") {
-      operations.mergeTarget = upstream;
-      await operations.merge();
-    } else {
-      operations.rebaseTarget = upstream;
-      await operations.rebase();
-    }
-    await reloadAfterGitOperation();
-  });
-}
-
 async function openFirstPullConflict() {
   const firstConflict = operations.conflictedPaths[0];
   if (!firstConflict) return;
   workbenchMode.value = "changes";
   await selectConflict(firstConflict);
-}
-
-function syncRemoteDraft() {
-  remote.syncDraftFromSelected();
-  remote.syncTargetFromBranch();
 }
 
 async function saveRemoteConfig() {
@@ -2108,18 +2095,6 @@ async function saveRemoteConfig() {
     syncSelectedRemote(true);
     await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
     branches.syncUpstreamDraft();
-    syncOperationTargets();
-  });
-}
-
-async function deleteSelectedRemote() {
-  if (!remote.selectedRemote) return;
-  if (!window.confirm(`删除远程 ${remote.selectedRemote}？`)) return;
-  await runUiAction("remote.delete", async () => {
-    await remote.deleteSelectedRemote();
-    syncSelectedRemote(true);
-    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
-    branches.syncUpstreamDraft(true);
     syncOperationTargets();
   });
 }
@@ -2740,6 +2715,14 @@ function translateGitError(error: unknown) {
 
   if (lower.includes("repository not found")) {
     return "远程仓库不存在或当前账号没有访问权限。请检查远程地址和仓库权限。";
+  }
+
+  if (
+    lower.includes("no merge base found") ||
+    lower.includes("unrelated histories") ||
+    lower.includes("refusing to merge unrelated histories")
+  ) {
+    return "拉取失败：当前分支与远程目标没有共同提交历史。请确认远程或上游分支是否选错；若确实要合并两个无关仓库，请在命令行使用 --allow-unrelated-histories。";
   }
 
   if (lower.includes("could not resolve host")) {
@@ -3571,11 +3554,17 @@ function validateProjectRenameName(value: string) {
   return "";
 }
 
-function promptProjectName(title: string, defaultValue: string, validate: (value: string) => string) {
+function promptProjectName(
+  title: string,
+  defaultValue: string,
+  validate: (value: string) => string,
+  placeholder = "输入名称",
+) {
   return new Promise<string | null>((resolve) => {
     projectNameDialog.value = {
       title,
       value: defaultValue,
+      placeholder,
       error: "",
       validate,
       resolve,
@@ -4064,6 +4053,20 @@ function shortRemoteBranchName(name: string, remoteName: string) {
   return name.startsWith(`${remoteName}/`) ? name.slice(remoteName.length + 1) : name;
 }
 
+function isConfiguredRemoteName(name: string | undefined) {
+  return Boolean(name && repos.current?.remotes.some((item) => item.name === name));
+}
+
+function nextAvailableRemoteName(baseName = "origin") {
+  const base = baseName.trim() || "origin";
+  if (!isConfiguredRemoteName(base)) return base;
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base}-${index}`;
+    if (!isConfiguredRemoteName(candidate)) return candidate;
+  }
+  return base;
+}
+
 function isLogBranchFavorite(item: BranchInfo) {
   return branches.isFavorite(item.fullName) || branches.isFavorite(item.name);
 }
@@ -4153,6 +4156,15 @@ function openLogBranchContextMenu(branchItem: BranchInfo, event: MouseEvent) {
   };
 }
 
+function openLogRemoteDirectoryContextMenu(remoteName: string | undefined, event: MouseEvent) {
+  closeContextMenus();
+  logRefContextMenu.value = {
+    kind: "remoteDirectory",
+    remoteName,
+    ...contextMenuPoint(event, 270, isConfiguredRemoteName(remoteName) ? 118 : 78),
+  };
+}
+
 function openLogTagContextMenu(tag: TagInfo, event: MouseEvent) {
   closeContextMenus();
   logRefContextMenu.value = {
@@ -4199,7 +4211,17 @@ function isLogRefContextFavorite(menu: LogRefContextMenu | null) {
 }
 
 function isLogBranchContextTarget(branchItem: BranchInfo) {
-  return logRefContextMenu.value?.kind !== "tag" && logRefContextMenu.value?.branch.fullName === branchItem.fullName;
+  return (
+    (logRefContextMenu.value?.kind === "local" || logRefContextMenu.value?.kind === "remote") &&
+    logRefContextMenu.value.branch.fullName === branchItem.fullName
+  );
+}
+
+function isLogRemoteDirectoryContextTarget(remoteName?: string) {
+  return (
+    logRefContextMenu.value?.kind === "remoteDirectory" &&
+    (logRefContextMenu.value.remoteName ?? "") === (remoteName ?? "")
+  );
 }
 
 function isLogTagContextTarget(tag: TagInfo) {
@@ -4417,6 +4439,62 @@ async function copyLogRefNameFromContext(menu: LogRefContextMenu | null) {
   closeLogRefContextMenu();
 }
 
+function openAddRemoteDialog(remoteName?: string) {
+  closeLogRefContextMenu();
+  addRemoteDialog.value = {
+    name: nextAvailableRemoteName(remoteName || "origin"),
+    url: "",
+    fetchAfterSave: true,
+    loading: false,
+    error: "",
+  };
+}
+
+function cancelAddRemoteDialog() {
+  if (addRemoteDialog.value?.loading) return;
+  addRemoteDialog.value = null;
+}
+
+async function submitAddRemoteDialog() {
+  const dialog = addRemoteDialog.value;
+  if (!dialog || dialog.loading) return;
+
+  const name = dialog.name.trim();
+  const url = dialog.url.trim();
+  const validationError = validateRemoteName(name) || validateRemoteUrl(url);
+  if (validationError) {
+    dialog.error = validationError;
+    return;
+  }
+
+  dialog.loading = true;
+  dialog.error = "";
+  try {
+    remote.selectedRemote = name;
+    remote.remoteNameDraft = name;
+    remote.remoteUrlDraft = url;
+    remote.remotePushUrlDraft = "";
+    remote.syncTargetFromBranch();
+    await saveRemoteConfig();
+    const shouldFetch = dialog.fetchAfterSave;
+    addRemoteDialog.value = null;
+    if (shouldFetch) {
+      await executeRemoteAction("fetch");
+    }
+  } catch (error) {
+    if (addRemoteDialog.value === dialog) {
+      dialog.error = translateGitError(error);
+    }
+  } finally {
+    dialog.loading = false;
+  }
+}
+
+async function addRemoteFromLogRefContext(menu: LogRefContextMenu | null) {
+  if (menu?.kind !== "remoteDirectory") return;
+  openAddRemoteDialog(menu.remoteName);
+}
+
 async function pushLogTagFromContext(menu: LogRefContextMenu | null) {
   const tag = logRefContextTagItem(menu);
   if (!tag) return;
@@ -4451,6 +4529,28 @@ function validateBranchName(value: string, existingLocalName = "") {
     return "远程分支已存在";
   }
   return "";
+}
+
+function validateRemoteName(value: string) {
+  const name = value.trim();
+  if (!name) return "请输入远程名称";
+  if (
+    name.startsWith("-") ||
+    name.endsWith("/") ||
+    name.endsWith(".") ||
+    name.includes("..") ||
+    /[\/\s~^:?*\[\\\]]/.test(name)
+  ) {
+    return "远程名称包含 Git 不支持的字符";
+  }
+  if (isConfiguredRemoteName(name)) {
+    return "远程仓库已存在";
+  }
+  return "";
+}
+
+function validateRemoteUrl(value: string) {
+  return value.trim() ? "" : "请输入远程地址";
 }
 
 async function createLogBranchFromHead() {
@@ -6668,146 +6768,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </details>
         </section>
 
-        <section v-if="workbenchMode === 'remote'" class="pane-section">
-          <div class="section-title">
-            <Download :size="16" />
-            <span>远程</span>
-          </div>
-          <select v-model="remote.selectedRemote" class="remote-select" @change="syncRemoteDraft">
-            <option
-              v-for="item in repos.current?.remotes ?? []"
-              :key="item.name"
-              :value="item.name"
-            >
-              {{ item.name }}
-            </option>
-            <option v-if="!(repos.current?.remotes.length)" value="origin">origin</option>
-          </select>
-
-          <div class="remote-editor">
-            <input v-model="remote.remoteNameDraft" type="text" placeholder="远程名称，例如 origin" />
-            <input v-model="remote.remoteUrlDraft" type="text" placeholder="获取地址" />
-            <input v-model="remote.remotePushUrlDraft" type="text" placeholder="推送地址（可选）" />
-            <div class="remote-editor-actions">
-              <button
-                class="icon-button"
-                :class="actionButtonClass('remote.save')"
-                :disabled="remote.loading || !remote.remoteNameDraft.trim() || !remote.remoteUrlDraft.trim()"
-                :aria-busy="isUiActionPending('remote.save')"
-                @click="saveRemoteConfig"
-              >
-                <component
-                  :is="actionIcon('remote.save', Check)"
-                  :class="actionIconClass('remote.save')"
-                  :size="14"
-                />
-                <span>保存</span>
-              </button>
-              <button
-                class="icon-button danger"
-                :class="actionButtonClass('remote.delete')"
-                :disabled="remote.loading || !(repos.current?.remotes.length)"
-                :aria-busy="isUiActionPending('remote.delete')"
-                @click="deleteSelectedRemote"
-              >
-                <component
-                  :is="actionIcon('remote.delete', Trash2)"
-                  :class="actionIconClass('remote.delete')"
-                  :size="14"
-                />
-                <span>删除</span>
-              </button>
-            </div>
-          </div>
-
-          <div class="push-options">
-            <div class="operation-options">
-              <label title="fetch --prune"><input v-model="remote.fetchPrune" type="checkbox" /> 获取时清理失效引用</label>
-            </div>
-            <label>
-              <span>推送到分支</span>
-              <input v-model="remote.targetBranch" type="text" placeholder="目标分支" />
-            </label>
-            <div class="operation-options">
-              <label title="-u"><input v-model="remote.setUpstream" type="checkbox" /> 设置上游</label>
-              <label title="--force-with-lease"><input v-model="remote.forceWithLease" type="checkbox" /> 安全强推</label>
-              <label title="--tags"><input v-model="remote.pushTags" type="checkbox" /> 同步标签</label>
-            </div>
-            <div class="operation-options">
-              <label><input v-model="remote.protectBranches" type="checkbox" /> 启用保护分支</label>
-              <label><input v-model="remote.allowProtectedPush" type="checkbox" /> 允许保护分支推送</label>
-            </div>
-            <label>
-              <span>保护分支规则</span>
-              <input v-model="remote.protectedBranchPatterns" type="text" placeholder="main,master,production,release/*" />
-            </label>
-            <div class="operation-options">
-              <label><input v-model="remote.autoFetchEnabled" type="checkbox" /> 自动获取</label>
-              <label><input v-model="remote.autoFetchAllRepositories" type="checkbox" /> 所有仓库</label>
-            </div>
-            <label>
-              <span>自动获取间隔（分钟）</span>
-              <input v-model.number="remote.autoFetchIntervalMinutes" type="number" min="1" />
-            </label>
-          </div>
-
-          <div v-if="remote.lastPushRejected" class="push-rejected-panel">
-            <strong>推送被远程拒绝</strong>
-            <span>可以先获取远程更新，再选择合并或变基到 {{ remote.lastRejectedTarget }}</span>
-            <div class="remote-editor-actions">
-              <button
-                class="icon-button"
-                :class="actionButtonClass('remote.resolve.merge')"
-                :disabled="remote.loading || operations.loading"
-                :aria-busy="isUiActionPending('remote.resolve.merge')"
-                @click="resolveRejectedPush('merge')"
-              >
-                <component
-                  :is="actionIcon('remote.resolve.merge', VcsIcon)"
-                  :class="actionIconClass('remote.resolve.merge')"
-                  :size="14"
-                />
-                <span>获取后合并</span>
-              </button>
-              <button
-                class="icon-button"
-                :class="actionButtonClass('remote.resolve.rebase')"
-                :disabled="remote.loading || operations.loading"
-                :aria-busy="isUiActionPending('remote.resolve.rebase')"
-                @click="resolveRejectedPush('rebase')"
-              >
-                <component
-                  :is="actionIcon('remote.resolve.rebase', RotateCcw)"
-                  :class="actionIconClass('remote.resolve.rebase')"
-                  :size="14"
-                />
-                <span>获取后变基</span>
-              </button>
-            </div>
-          </div>
-
-          <div
-            v-for="item in repos.current?.remotes ?? []"
-            :key="item.name"
-            class="remote-row"
-          >
-            <strong>{{ item.name }}</strong>
-            <span>{{ item.url || "未配置地址" }}</span>
-            <span v-if="item.pushUrl">推送地址：{{ item.pushUrl }}</span>
-          </div>
-
-          <div v-if="hostedRemoteLinks.length" class="hosted-panel">
-            <div v-for="item in hostedRemoteLinks" :key="`${item.name}-${item.webUrl}`" class="hosted-row">
-              <span>
-                <strong>{{ item.provider }}</strong>
-                <small>{{ item.repo }}</small>
-              </span>
-              <a :href="item.webUrl" target="_blank" rel="noreferrer">仓库</a>
-              <a :href="item.compareUrl" target="_blank" rel="noreferrer">对比</a>
-            </div>
-          </div>
-        </section>
-
         <section v-if="workbenchMode === 'operations'" class="pane-section shelves">
           <div class="section-title">
             <ArchiveRestore :size="16" />
@@ -7405,21 +7365,28 @@ async function jumpMergeConflict(direction: -1 | 1) {
           </div>
 
           <button
-            v-if="visibleLogRemoteGroups.length"
+            v-if="showLogRemoteRoot"
             class="log-ref-toggle"
+            :class="{ 'context-target': isLogRemoteDirectoryContextTarget() }"
             type="button"
             @click="toggleLogRefGroup('remote')"
+            @contextmenu.prevent.stop="openLogRemoteDirectoryContextMenu(undefined, $event)"
           >
             <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded('remote')" :size="13" />
             <ChevronRight v-else :size="13" />
-            <span>远端</span>
+            <span>远程</span>
           </button>
-          <div v-if="visibleLogRemoteGroups.length && (logRefFiltering || isLogRefGroupExpanded('remote'))" class="log-ref-children">
+          <div
+            v-if="(visibleLogRemoteGroups.length || showLogRemoteAddEntry) && (logRefFiltering || isLogRefGroupExpanded('remote'))"
+            class="log-ref-children"
+          >
             <section v-for="group in visibleLogRemoteGroups" :key="`log-remote-${group.name}`" class="log-ref-group">
               <button
                 class="log-ref-toggle remote-root"
+                :class="{ 'context-target': isLogRemoteDirectoryContextTarget(group.name) }"
                 type="button"
                 @click="toggleLogRefGroup(logRemoteGroupKey(group.name))"
+                @contextmenu.prevent.stop="openLogRemoteDirectoryContextMenu(group.name, $event)"
               >
                 <ChevronDown v-if="logRefFiltering || isLogRefGroupExpanded(logRemoteGroupKey(group.name))" :size="13" />
                 <ChevronRight v-else :size="13" />
@@ -7430,6 +7397,18 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 v-if="logRefFiltering || isLogRefGroupExpanded(logRemoteGroupKey(group.name))"
                 class="log-ref-children remote-branch-list"
               >
+                <div
+                  v-if="group.branches.length === 0"
+                  class="log-ref-row remote empty remote-empty"
+                  :class="{ 'context-target': isLogRemoteDirectoryContextTarget(group.name) }"
+                  title="远程仓库暂无分支"
+                  @contextmenu.prevent.stop="openLogRemoteDirectoryContextMenu(group.name, $event)"
+                >
+                  <Minus :size="13" />
+                  <span>
+                    <strong>暂无远程分支</strong>
+                  </span>
+                </div>
                 <button
                   v-for="branchItem in group.branches"
                   :key="`log-remote-${branchItem.fullName}`"
@@ -7452,6 +7431,19 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 </button>
               </div>
             </section>
+            <button
+              v-if="showLogRemoteAddEntry && visibleLogRemoteGroups.length === 0"
+              class="log-ref-row remote-root-add empty remote-add"
+              title="添加远程仓库"
+              type="button"
+              @click="openAddRemoteDialog()"
+              @contextmenu.prevent.stop="openLogRemoteDirectoryContextMenu(undefined, $event)"
+            >
+              <Plus :size="13" />
+              <span>
+                <strong>添加远程仓库</strong>
+              </span>
+            </button>
           </div>
 
           <button
@@ -8976,114 +8968,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         </div>
         </template>
 
-        <template v-else-if="workbenchMode === 'remote'">
-        <div class="diff-header">
-          <div>
-            <span class="eyebrow">远程</span>
-            <h2>{{ remote.selectedRemote || "origin" }}</h2>
-          </div>
-          <div class="log-actions">
-            <button
-              class="tool-button"
-              :class="actionButtonClass(remoteActionKey('fetch'))"
-              :disabled="!repos.current || remote.loading"
-              :aria-busy="isUiActionActive(remoteActionKey('fetch'))"
-              @pointerdown="runRemoteActionFromPointer($event, 'fetch')"
-              @click="runRemoteAction('fetch')"
-            >
-              <component
-                :is="actionIcon(remoteActionKey('fetch'), Download)"
-                :class="actionIconClass(remoteActionKey('fetch'))"
-                :size="14"
-              />
-              <span>获取</span>
-            </button>
-            <button
-              class="tool-button"
-              :class="actionButtonClass('remote.fetchAll')"
-              :disabled="repos.initializedItems.length === 0 || remote.loading"
-              :aria-busy="isUiActionActive('remote.fetchAll')"
-              @pointerdown="fetchAllRepositoriesFromPointer"
-              @click="fetchAllRepositories"
-            >
-              <component
-                :is="actionIcon('remote.fetchAll', Download)"
-                :class="actionIconClass('remote.fetchAll')"
-                :size="14"
-              />
-              <span>全部获取</span>
-            </button>
-            <button
-              class="tool-button"
-              :class="actionButtonClass(remoteActionKey('pull'))"
-              :disabled="!repos.current || remote.loading"
-              :aria-busy="isUiActionActive(remoteActionKey('pull'))"
-              @pointerdown="runRemoteActionFromPointer($event, 'pull')"
-              @click="runRemoteAction('pull')"
-            >
-              <component
-                :is="actionIcon(remoteActionKey('pull'), RotateCcw)"
-                :class="actionIconClass(remoteActionKey('pull'))"
-                :size="14"
-              />
-              <span>拉取</span>
-            </button>
-            <button
-              class="tool-button primary"
-              :class="actionButtonClass(remoteActionKey('push'))"
-              :disabled="!repos.current || remote.loading"
-              :aria-busy="isUiActionActive(remoteActionKey('push'))"
-              @pointerdown="runRemoteActionFromPointer($event, 'push')"
-              @click="runRemoteAction('push')"
-            >
-              <component
-                :is="actionIcon(remoteActionKey('push'), Upload)"
-                :class="actionIconClass(remoteActionKey('push'))"
-                :size="14"
-              />
-              <span>推送</span>
-            </button>
-          </div>
-        </div>
-
-        <div class="context-dashboard">
-          <section class="dashboard-card">
-            <div class="section-title">
-              <Download :size="16" />
-              <span>同步状态</span>
-            </div>
-            <strong>{{ remote.selectedRemote || "origin" }}</strong>
-            <small>{{ remote.targetBranch || branch?.currentBranch || "HEAD" }}</small>
-            <div class="metric-row">
-              <span>领先 {{ branch?.ahead ?? 0 }}</span>
-              <span>落后 {{ branch?.behind ?? 0 }}</span>
-            </div>
-          </section>
-
-          <section class="dashboard-card">
-            <div class="section-title">
-              <RefreshCw :size="16" />
-              <span>自动获取</span>
-            </div>
-            <strong>{{ remote.autoFetchEnabled ? "已开启" : "已关闭" }}</strong>
-            <small>{{ remote.autoFetchAllRepositories ? "所有仓库" : "当前仓库" }} · {{ remote.autoFetchIntervalMinutes }} 分钟</small>
-          </section>
-
-          <section class="dashboard-card wide">
-            <div class="section-title">
-              <Upload :size="16" />
-              <span>远程地址</span>
-            </div>
-            <div class="remote-dashboard-list">
-              <div v-for="item in repos.current?.remotes ?? []" :key="`dashboard-${item.name}`">
-                <strong>{{ item.name }}</strong>
-                <span>{{ item.url || "未配置地址" }}</span>
-              </div>
-            </div>
-          </section>
-        </div>
-        </template>
-
         <template v-else>
         <div class="diff-header">
           <div>
@@ -9267,7 +9151,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
         <input
           v-model="projectNameDialog.value"
           autofocus
-          placeholder="输入名称"
+          :placeholder="projectNameDialog.placeholder"
           @input="projectNameDialog.error = ''"
           @keydown.esc.prevent="cancelProjectNameDialog"
         />
@@ -9280,6 +9164,64 @@ async function jumpMergeConflict(direction: -1 | 1) {
           <button class="icon-button primary" type="submit">
             <Check :size="14" />
             <span>确认</span>
+          </button>
+        </footer>
+      </form>
+    </div>
+
+    <div v-if="addRemoteDialog" class="modal-backdrop" @click.self="cancelAddRemoteDialog">
+      <form class="add-remote-modal" role="dialog" aria-modal="true" aria-label="定义远程" @submit.prevent="submitAddRemoteDialog">
+        <header>
+          <h2>定义远程</h2>
+          <button
+            class="icon-only-button"
+            type="button"
+            title="关闭"
+            :disabled="addRemoteDialog.loading"
+            @click="cancelAddRemoteDialog"
+          >
+            <X :size="14" />
+          </button>
+        </header>
+        <label class="add-remote-field">
+          <span>名称:</span>
+          <input
+            v-model="addRemoteDialog.name"
+            autofocus
+            type="text"
+            :disabled="addRemoteDialog.loading"
+            @input="addRemoteDialog.error = ''"
+            @keydown.esc.prevent="cancelAddRemoteDialog"
+          />
+        </label>
+        <label class="add-remote-field">
+          <span>URL:</span>
+          <input
+            v-model="addRemoteDialog.url"
+            type="text"
+            :disabled="addRemoteDialog.loading"
+            @input="addRemoteDialog.error = ''"
+            @keydown.esc.prevent="cancelAddRemoteDialog"
+          />
+        </label>
+        <label class="add-remote-check">
+          <input v-model="addRemoteDialog.fetchAfterSave" type="checkbox" :disabled="addRemoteDialog.loading" />
+          <span>抓取远程</span>
+        </label>
+        <p v-if="addRemoteDialog.error" class="project-name-error">{{ addRemoteDialog.error }}</p>
+        <footer>
+          <button class="icon-button" type="button" :disabled="addRemoteDialog.loading" @click="cancelAddRemoteDialog">
+            <X :size="14" />
+            <span>取消</span>
+          </button>
+          <button
+            class="icon-button primary"
+            type="submit"
+            :disabled="addRemoteDialog.loading || !addRemoteDialog.name.trim() || !addRemoteDialog.url.trim()"
+          >
+            <LoaderCircle v-if="addRemoteDialog.loading" class="button-spinner" :size="14" />
+            <Check v-else :size="14" />
+            <span>确定</span>
           </button>
         </footer>
       </form>
@@ -9440,6 +9382,13 @@ async function jumpMergeConflict(direction: -1 | 1) {
       :style="{ left: `${logRefContextMenu.x}px`, top: `${logRefContextMenu.y}px` }"
       @click.stop
     >
+      <template v-if="logRefContextMenu.kind === 'remoteDirectory'">
+        <button @click="addRemoteFromLogRefContext(logRefContextMenu)">
+          <span>添加远程仓库</span>
+          <small>{{ nextAvailableRemoteName(logRefContextMenu.remoteName || "origin") }}</small>
+        </button>
+      </template>
+      <template v-else>
       <button @click="showLogRefFromContext(logRefContextMenu)">
         <span>查看此引用日志</span>
       </button>
@@ -9509,6 +9458,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
       >
         <span>{{ logRefContextMenu.kind === "tag" ? "删除本地标签" : logRefContextMenu.kind === "remote" ? "删除远程分支" : "删除本地分支" }}</span>
       </button>
+      </template>
     </div>
 
     <div
@@ -10620,8 +10570,7 @@ button[aria-busy="true"]:disabled {
   font-weight: 800;
 }
 
-.repo-path,
-.remote-row span {
+.repo-path {
   margin-top: 5px;
   color: #68766f;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -10658,119 +10607,10 @@ button[aria-busy="true"]:disabled {
   background: #ffffff;
 }
 
-.remote-row {
-  display: grid;
-  gap: 2px;
-  margin-top: 12px;
-}
-
-.hosted-panel {
-  display: grid;
-  gap: 6px;
-  margin-top: 12px;
-  padding-top: 10px;
-  border-top: 1px solid #d9e0dc;
-}
-
-.hosted-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  align-items: center;
-  gap: 8px;
-  min-height: 32px;
-  padding: 5px 7px;
-  border: 1px solid #d2dad4;
-  border-radius: 7px;
-  background: #ffffff;
-}
-
-.hosted-row span {
-  display: grid;
-  min-width: 0;
-  line-height: 1.2;
-}
-
-.hosted-row small {
-  overflow: hidden;
-  color: #68766f;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.hosted-row a {
-  color: #315f96;
-  font-size: 12px;
-  text-decoration: none;
-}
-
-.remote-editor,
-.push-options {
-  display: grid;
-  gap: 7px;
-  margin-top: 12px;
-}
-
-.remote-editor input,
-.push-options input[type="text"] {
-  min-width: 0;
-  width: 100%;
-  height: 30px;
-  padding: 0 8px;
-  border: 1px solid #c5cec8;
-  border-radius: 7px;
-  color: #26312c;
-  background: #ffffff;
-  font-size: 12px;
-}
-
 .remote-editor-actions {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
-}
-
-.push-options {
-  padding-top: 10px;
-  border-top: 1px solid #d9e0dc;
-}
-
-.push-options input[type="number"] {
-  min-width: 0;
-  width: 100%;
-  height: 30px;
-  padding: 0 8px;
-  border: 1px solid #c5cec8;
-  border-radius: 7px;
-  color: #26312c;
-  background: #ffffff;
-  font-size: 12px;
-}
-
-.push-options > label {
-  display: grid;
-  gap: 5px;
-  color: #5e6b63;
-  font-size: 12px;
-}
-
-.push-rejected-panel {
-  display: grid;
-  gap: 7px;
-  margin-top: 12px;
-  padding: 9px;
-  border: 1px solid #e1c28a;
-  border-radius: 7px;
-  color: #5e4516;
-  background: #fff6df;
-}
-
-.push-rejected-panel strong {
-  font-size: 13px;
-}
-
-.push-rejected-panel span {
-  color: #6f6553;
-  font-size: 12px;
 }
 
 .branch-manager {
@@ -12112,6 +11952,10 @@ button[aria-busy="true"]:disabled {
   background: #f0f4f1;
 }
 
+.log-ref-toggle.context-target:not(:hover) {
+  background: #e8eef5;
+}
+
 .log-ref-toggle span,
 .log-ref-toggle small {
   overflow: hidden;
@@ -12150,6 +11994,22 @@ button[aria-busy="true"]:disabled {
 
 .log-ref-row.remote {
   padding-left: 50px;
+}
+
+.log-ref-row.remote-root-add {
+  padding-left: 28px;
+}
+
+.log-ref-row.empty {
+  color: #68766f;
+}
+
+.log-ref-row.remote-add > svg {
+  color: #3f6ea5;
+}
+
+.log-ref-row.remote-empty > svg {
+  color: #8a978f;
 }
 
 .log-ref-row:hover,
@@ -12254,6 +12114,7 @@ button[aria-busy="true"]:disabled {
 }
 
 .project-name-modal,
+.add-remote-modal,
 .project-unsaved-modal,
 .pull-confirm-modal,
 .submit-confirm-modal,
@@ -12274,6 +12135,8 @@ button[aria-busy="true"]:disabled {
 
 .project-name-modal header,
 .project-name-modal footer,
+.add-remote-modal header,
+.add-remote-modal footer,
 .project-unsaved-modal header,
 .project-unsaved-modal footer,
 .pull-confirm-modal header,
@@ -12289,6 +12152,7 @@ button[aria-busy="true"]:disabled {
 }
 
 .project-name-modal h2,
+.add-remote-modal h2,
 .project-unsaved-modal h2,
 .pull-confirm-modal h2,
 .submit-confirm-modal h2,
@@ -12302,6 +12166,52 @@ button[aria-busy="true"]:disabled {
   width: 100%;
 }
 
+.add-remote-modal {
+  width: min(396px, calc(100vw - 56px));
+  gap: 10px;
+}
+
+.add-remote-field {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  color: #4b574f;
+  font-size: 13px;
+}
+
+.add-remote-field input {
+  min-width: 0;
+  width: 100%;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid #bdc8c1;
+  border-radius: 5px;
+  color: #26312b;
+  background: #ffffff;
+  outline: 0;
+  font-size: 13px;
+}
+
+.add-remote-field input:focus {
+  border-color: #4c82d9;
+  box-shadow: 0 0 0 2px rgba(76, 130, 217, 0.16);
+}
+
+.add-remote-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  color: #25312b;
+  font-size: 13px;
+}
+
+.add-remote-check input {
+  width: 16px;
+  height: 16px;
+}
+
 .project-name-error {
   margin: -4px 0 0;
   color: #b64242;
@@ -12310,7 +12220,8 @@ button[aria-busy="true"]:disabled {
   word-break: break-word;
 }
 
-.project-name-modal footer {
+.project-name-modal footer,
+.add-remote-modal footer {
   justify-content: flex-end;
 }
 
@@ -13140,6 +13051,10 @@ button[aria-busy="true"]:disabled {
   text-transform: uppercase;
 }
 
+.log-table-head > span:last-child {
+  text-align: right;
+}
+
 .log-commit-list {
   flex: 1 1 auto;
   min-height: 0;
@@ -13863,8 +13778,7 @@ button[aria-busy="true"]:disabled {
 
 .metric-row span,
 .metric-grid span,
-.chip-list span,
-.remote-dashboard-list div {
+.chip-list span {
   min-height: 28px;
   padding: 5px 8px;
   border: 1px solid #d2dad4;
@@ -13887,29 +13801,6 @@ button[aria-busy="true"]:disabled {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
-}
-
-.remote-dashboard-list {
-  display: grid;
-  gap: 6px;
-}
-
-.remote-dashboard-list div {
-  display: grid;
-  gap: 2px;
-}
-
-.remote-dashboard-list strong,
-.remote-dashboard-list span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.remote-dashboard-list span {
-  color: #68766f;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .advanced-card {
@@ -15028,7 +14919,6 @@ html[data-theme="dark"] .metric-grid strong {
 html[data-theme="dark"] .brand-copy span,
 html[data-theme="dark"] .topbar-state small,
 html[data-theme="dark"] .repo-path,
-html[data-theme="dark"] .remote-row span,
 html[data-theme="dark"] .branch-line small,
 html[data-theme="dark"] .sync-line span,
 html[data-theme="dark"] .branch-copy small,
@@ -15042,7 +14932,6 @@ html[data-theme="dark"] .operation-state span,
 html[data-theme="dark"] .operation-options,
 html[data-theme="dark"] .shelf-row small,
 html[data-theme="dark"] .toggle-row,
-html[data-theme="dark"] .push-options > label,
 html[data-theme="dark"] .eyebrow,
 html[data-theme="dark"] .diff-empty {
   color: #8f949b;
@@ -15442,15 +15331,11 @@ html[data-theme="dark"] .add-project-empty {
 }
 
 html[data-theme="dark"] .branch-line,
-html[data-theme="dark"] .sync-line,
-html[data-theme="dark"] .remote-row strong {
+html[data-theme="dark"] .sync-line {
   color: #dfe1e5;
 }
 
 html[data-theme="dark"] .remote-select,
-html[data-theme="dark"] .remote-editor input,
-html[data-theme="dark"] .push-options input[type="text"],
-html[data-theme="dark"] .push-options input[type="number"],
 html[data-theme="dark"] .branch-create input,
 html[data-theme="dark"] .tag-create input,
 html[data-theme="dark"] .changelist-create input,
@@ -15479,10 +15364,6 @@ html[data-theme="dark"] .remote-select option,
 html[data-theme="dark"] .reset-select option {
   color: #dfe1e5;
   background: #2b2d30;
-}
-
-html[data-theme="dark"] .push-options {
-  border-top-color: #3c3f41;
 }
 
 html[data-theme="dark"] .tag-option,
@@ -15528,20 +15409,9 @@ html[data-theme="dark"] .operation-state {
 }
 
 html[data-theme="dark"] .operation-state strong,
-html[data-theme="dark"] .push-rejected-panel strong,
 html[data-theme="dark"] .conflict-header,
 html[data-theme="dark"] .conflict-block-title {
   color: #ffd98a;
-}
-
-html[data-theme="dark"] .push-rejected-panel {
-  border-color: #6b5930;
-  color: #ffd98a;
-  background: #332b1a;
-}
-
-html[data-theme="dark"] .push-rejected-panel span {
-  color: #c9aa6a;
 }
 
 html[data-theme="dark"] .conflict-panel {
@@ -15763,8 +15633,7 @@ html[data-theme="dark"] .message-history-row,
 html[data-theme="dark"] .advanced-output,
 html[data-theme="dark"] .metric-row span,
 html[data-theme="dark"] .metric-grid span,
-html[data-theme="dark"] .chip-list span,
-html[data-theme="dark"] .remote-dashboard-list div {
+html[data-theme="dark"] .chip-list span {
   border-color: #3c3f41;
   color: #dfe1e5;
   background: #2b2d30;
@@ -15895,6 +15764,7 @@ html[data-theme="dark"] .modal-backdrop {
 
 html[data-theme="dark"] .log-file-picker-modal,
 html[data-theme="dark"] .project-name-modal,
+html[data-theme="dark"] .add-remote-modal,
 html[data-theme="dark"] .project-unsaved-modal,
 html[data-theme="dark"] .pull-confirm-modal,
 html[data-theme="dark"] .submit-confirm-modal,
@@ -15907,6 +15777,7 @@ html[data-theme="dark"] .log-filter-popover {
 }
 
 html[data-theme="dark"] .project-name-modal h2,
+html[data-theme="dark"] .add-remote-modal h2,
 html[data-theme="dark"] .project-unsaved-modal h2,
 html[data-theme="dark"] .pull-confirm-modal h2,
 html[data-theme="dark"] .submit-confirm-modal h2,
@@ -15917,6 +15788,22 @@ html[data-theme="dark"] .submit-confirm-summary strong,
 html[data-theme="dark"] .submit-confirm-message strong,
 html[data-theme="dark"] .worktree-commit-copy strong {
   color: #dfe1e5;
+}
+
+html[data-theme="dark"] .add-remote-field,
+html[data-theme="dark"] .add-remote-check {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .add-remote-field input {
+  border-color: #55595f;
+  color: #dfe1e5;
+  background: #1f2023;
+}
+
+html[data-theme="dark"] .add-remote-field input:focus {
+  border-color: #4c82d9;
+  box-shadow: 0 0 0 2px rgba(76, 130, 217, 0.24);
 }
 
 html[data-theme="dark"] .project-unsaved-modal p,
@@ -16112,6 +15999,10 @@ html[data-theme="dark"] .log-commit-row {
 
 html[data-theme="dark"] .log-ref-toggle:hover {
   background: #313335;
+}
+
+html[data-theme="dark"] .log-ref-toggle.context-target:not(:hover) {
+  background: #343d4a;
 }
 
 html[data-theme="dark"] .log-ref-row:hover,
@@ -16358,8 +16249,6 @@ html[data-theme="dark"] .file-row.active .kind-badge {
   background: #354966;
 }
 
-html[data-theme="dark"] .remote-editor input::placeholder,
-html[data-theme="dark"] .push-options input::placeholder,
 html[data-theme="dark"] .changelist-create input::placeholder,
 html[data-theme="dark"] .log-filter-panel input::placeholder,
 html[data-theme="dark"] .advanced-form input::placeholder,
@@ -16374,7 +16263,6 @@ html[data-theme="dark"] .commit-box textarea,
 html[data-theme="dark"] .diff-lines,
 html[data-theme="dark"] .side-by-side-diff,
 html[data-theme="dark"] .repo-path,
-html[data-theme="dark"] .remote-row span,
 html[data-theme="dark"] .file-main strong,
 html[data-theme="dark"] .file-main small {
   font-family: "JetBrains Mono", "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;

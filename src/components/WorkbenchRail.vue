@@ -9,7 +9,6 @@ type WorkbenchMode =
   | "log"
   | "project"
   | "branches"
-  | "remote"
   | "operations"
   | "advanced";
 
