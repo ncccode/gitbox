@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import {
-  GitBranch,
   Monitor,
   Moon,
   Sun,
 } from "@lucide/vue";
+import VcsIcon from "./icons/VcsIcon.vue";
 import { useSettingsStore } from "../stores/settings";
 import type { ThemeMode } from "../stores/settings";
 
@@ -12,6 +12,7 @@ defineProps<{
   brandSubtitle: string;
   hasRepository: boolean;
   currentBranch: string;
+  remoteBranch?: string | null;
   ahead: number;
   behind: number;
 }>();
@@ -33,9 +34,12 @@ const themeModes: Array<{ key: ThemeMode; label: string; title: string }> = [
         <span>{{ brandSubtitle }}</span>
       </div>
       <div v-if="hasRepository" class="topbar-state">
-        <GitBranch :size="14" />
-        <span>{{ currentBranch }}</span>
-        <small>领先 {{ ahead }} / 落后 {{ behind }}</small>
+        <VcsIcon :size="14" />
+        <span class="topbar-branch-local" :title="currentBranch">{{ currentBranch }}</span>
+        <small class="topbar-branch-remote" :title="remoteBranch ? `远程 ${remoteBranch}` : '未设置远程分支'">
+          远程 {{ remoteBranch || "未设置" }}
+        </small>
+        <small class="topbar-sync-state">领先 {{ ahead }} / 落后 {{ behind }}</small>
       </div>
     </div>
 

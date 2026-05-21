@@ -21,7 +21,6 @@ import {
   FileSearch,
   Folder,
   FolderOpen,
-  GitBranch,
   GitCommitVertical,
   ListChecks,
   LoaderCircle,
@@ -134,6 +133,9 @@ const mergeIncomingScroller = ref<HTMLElement | null>(null);
 const mergeIncomingGutter = ref<HTMLElement | null>(null);
 const mergeResultScrollTop = ref(0);
 const mergeResultScrollLeft = ref(0);
+const commitMessageTextarea = ref<HTMLTextAreaElement | null>(null);
+const commitMessageHistoryIndex = ref(-1);
+const commitMessageHistoryDraft = ref("");
 const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
 const changeDiffScroller = ref<HTMLElement | null>(null);
 const logDiffScroller = ref<HTMLElement | null>(null);
@@ -537,6 +539,16 @@ const commitButtonLabel = computed(() => (pendingCommitAction.value === "commit"
 const commitPushButtonLabel = computed(() =>
   pendingCommitAction.value === "push" ? "提交并推送中" : "提交并推送",
 );
+const commitMessageHistoryItems = computed(() => {
+  const seen = new Set<string>();
+  return advanced.commitMessages
+    .map((message) => message.trim())
+    .filter((message) => {
+      if (!message || seen.has(message)) return false;
+      seen.add(message);
+      return true;
+    });
+});
 const submitConfirmTitle = computed(() => {
   const mode = submitConfirmDialog.value?.mode;
   if (mode === "commit-push") return "确认提交并推送";
@@ -1706,6 +1718,7 @@ async function loadCurrentRepository() {
 
 function clearProjectView() {
   clearLogDiffTabs();
+  resetCommitMessageHistoryCursor();
   advanced.resetForRepositorySwitch();
   branches.resetForRepositorySwitch();
   changelists.resetForRepositorySwitch();
@@ -1847,6 +1860,87 @@ async function runRemoteAction(action: "fetch" | "pull" | "push") {
       activeRemoteAction.value = null;
     }
   }
+}
+
+async function ensureCommitMessageHistory() {
+  if (commitMessageHistoryItems.value.length > 0 || advanced.loading) return;
+  await advanced.refreshCommitMessages();
+}
+
+function isCommitMessageAtFirstLine(textarea: HTMLTextAreaElement) {
+  const start = Math.min(textarea.selectionStart, textarea.selectionEnd);
+  return !commit.message.slice(0, start).includes("\n");
+}
+
+function isCommitMessageAtLastLine(textarea: HTMLTextAreaElement) {
+  const end = Math.max(textarea.selectionStart, textarea.selectionEnd);
+  return !commit.message.slice(end).includes("\n");
+}
+
+function focusCommitMessageEnd() {
+  nextTick(() => {
+    const textarea = commitMessageTextarea.value;
+    if (!textarea) return;
+    const end = commit.message.length;
+    textarea.focus();
+    textarea.setSelectionRange(end, end);
+  }).catch(() => undefined);
+}
+
+function rememberCommitMessage(message: string) {
+  const value = message.trim();
+  if (!value) return;
+  advanced.commitMessages = [
+    value,
+    ...advanced.commitMessages.filter((item) => item.trim() !== value),
+  ].slice(0, 40);
+}
+
+function resetCommitMessageHistoryCursor() {
+  commitMessageHistoryIndex.value = -1;
+  commitMessageHistoryDraft.value = "";
+}
+
+async function navigateCommitMessageHistory(event: KeyboardEvent, direction: "previous" | "next") {
+  if (event.isComposing) return;
+  const textarea = event.currentTarget instanceof HTMLTextAreaElement ? event.currentTarget : null;
+  if (!textarea) return;
+
+  const browsingHistory = commitMessageHistoryIndex.value >= 0;
+  if (direction === "next" && !browsingHistory) return;
+  const canUseHistory =
+    direction === "previous"
+      ? browsingHistory || isCommitMessageAtFirstLine(textarea)
+      : browsingHistory || isCommitMessageAtLastLine(textarea);
+  if (!canUseHistory) return;
+
+  event.preventDefault();
+  try {
+    await ensureCommitMessageHistory();
+  } catch {
+    return;
+  }
+  const messages = commitMessageHistoryItems.value;
+  if (messages.length === 0) return;
+
+  if (direction === "previous") {
+    if (commitMessageHistoryIndex.value === -1) {
+      commitMessageHistoryDraft.value = commit.message;
+      commitMessageHistoryIndex.value = 0;
+    } else {
+      commitMessageHistoryIndex.value = Math.min(commitMessageHistoryIndex.value + 1, messages.length - 1);
+    }
+    commit.message = messages[commitMessageHistoryIndex.value] ?? commit.message;
+  } else if (commitMessageHistoryIndex.value > 0) {
+    commitMessageHistoryIndex.value -= 1;
+    commit.message = messages[commitMessageHistoryIndex.value] ?? commit.message;
+  } else {
+    commitMessageHistoryIndex.value = -1;
+    commit.message = commitMessageHistoryDraft.value;
+    commitMessageHistoryDraft.value = "";
+  }
+
+  focusCommitMessageEnd();
 }
 
 async function runRemoteActionFromPointer(event: PointerEvent, action: "fetch" | "pull" | "push") {
@@ -2657,6 +2751,8 @@ async function confirmSubmitAction() {
     } else {
       pendingCommitAction.value = dialog.mode === "commit-push" ? "push" : "commit";
       await commit.commit(dialog.mode === "commit-push" ? dialog.remoteName || undefined : undefined, false, dialog.paths);
+      rememberCommitMessage(dialog.message);
+      resetCommitMessageHistoryCursor();
       await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
       syncOperationTargets();
     }
@@ -4025,11 +4121,6 @@ function logRefContextTagItem(menu: LogRefContextMenu | null) {
 function logRefContextRefName(menu: LogRefContextMenu | null) {
   const branchItem = logRefContextBranchItem(menu);
   return branchItem?.name ?? logRefContextTagItem(menu)?.name ?? "";
-}
-
-function logRefContextFullName(menu: LogRefContextMenu | null) {
-  const branchItem = logRefContextBranchItem(menu);
-  return branchItem?.fullName ?? (menu?.kind === "tag" ? `refs/tags/${menu.tag.name}` : "");
 }
 
 function logRefContextFavoriteKey(menu: LogRefContextMenu | null) {
@@ -5884,6 +5975,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
       :brand-subtitle="brandSubtitle"
       :has-repository="Boolean(repos.current)"
       :current-branch="branchNameLabel(branch?.currentBranch)"
+      :remote-branch="branch?.upstream"
       :ahead="branch?.ahead ?? 0"
       :behind="branch?.behind ?? 0"
     />
@@ -6116,7 +6208,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
       >
         <section class="pane-section">
           <div class="section-title">
-            <GitBranch :size="16" />
+            <VcsIcon :size="16" />
             <span>仓库</span>
           </div>
           <div class="repo-name">{{ repos.name }}</div>
@@ -6133,7 +6225,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
 
         <section v-if="workbenchMode === 'branches'" class="pane-section branch-manager">
           <div class="section-title">
-            <GitBranch :size="16" />
+            <VcsIcon :size="16" />
             <span>分支</span>
           </div>
           <form class="branch-create" @submit.prevent="createBranchFromHead">
@@ -6371,7 +6463,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
 
         <section v-if="workbenchMode === 'operations'" class="pane-section git-operation-panel">
           <div class="section-title">
-            <GitBranch :size="16" />
+            <VcsIcon :size="16" />
             <span>合并 / 变基</span>
           </div>
 
@@ -6443,7 +6535,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
               @click="mergeSelectedTarget"
             >
               <component
-                :is="actionIcon('operation.merge', GitBranch)"
+                :is="actionIcon('operation.merge', VcsIcon)"
                 :class="actionIconClass('operation.merge')"
                 :size="14"
               />
@@ -6600,7 +6692,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
                 @click="resolveRejectedPush('merge')"
               >
                 <component
-                  :is="actionIcon('remote.resolve.merge', GitBranch)"
+                  :is="actionIcon('remote.resolve.merge', VcsIcon)"
                   :class="actionIconClass('remote.resolve.merge')"
                   :size="14"
                 />
@@ -6773,6 +6865,22 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <component
               :is="actionIcon('workspace.refresh', RefreshCw)"
               :class="actionIconClass('workspace.refresh')"
+              :size="14"
+            />
+          </button>
+          <button
+            class="icon-only-button file-actions-pull"
+            :class="actionButtonClass(remoteActionKey('pull'))"
+            type="button"
+            title="拉取代码"
+            :disabled="remote.loading || !remote.selectedRemote"
+            :aria-busy="isUiActionActive(remoteActionKey('pull'))"
+            @pointerdown="runRemoteActionFromPointer($event, 'pull')"
+            @click="runRemoteAction('pull')"
+          >
+            <component
+              :is="actionIcon(remoteActionKey('pull'), ArrowDown)"
+              :class="actionIconClass(remoteActionKey('pull'))"
               :size="14"
             />
           </button>
@@ -6981,7 +7089,15 @@ async function jumpMergeConflict(direction: -1 | 1) {
             <GitCommitVertical :size="16" />
             <span>提交</span>
           </div>
-          <textarea v-model="commit.message" rows="5" placeholder="提交信息" />
+          <textarea
+            ref="commitMessageTextarea"
+            v-model="commit.message"
+            rows="5"
+            placeholder="提交信息"
+            @input="resetCommitMessageHistoryCursor"
+            @keydown.up="navigateCommitMessageHistory($event, 'previous')"
+            @keydown.down="navigateCommitMessageHistory($event, 'next')"
+          />
           <div class="commit-options">
             <label title="替换上一次提交">
               <input v-model="commit.amend" type="checkbox" />
@@ -7210,7 +7326,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
               @contextmenu.prevent.stop="openLogBranchContextMenu(branchItem, $event)"
             >
               <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
-              <GitBranch v-else :size="13" />
+              <VcsIcon v-else :size="13" />
               <span>
                 <strong>{{ branchItem.name }}</strong>
               </span>
@@ -7258,7 +7374,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
                   @contextmenu.prevent.stop="openLogBranchContextMenu(branchItem, $event)"
                 >
                   <Star v-if="branches.isFavorite(branchItem.fullName)" :size="13" fill="currentColor" />
-                  <GitBranch v-else :size="13" />
+                  <VcsIcon v-else :size="13" />
                   <span>
                     <strong>{{ shortRemoteBranchName(branchItem.name, group.name) }}</strong>
                   </span>
@@ -7360,7 +7476,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
       <section v-else-if="settings.panelVisibility.changes && workbenchMode === 'advanced'" class="advanced-sidebar">
         <div class="history-header">
           <div class="section-title">
-            <GitBranch :size="16" />
+            <VcsIcon :size="16" />
             <span>高级工具</span>
           </div>
           <button
@@ -8003,7 +8119,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
         <div class="advanced-workbench">
           <section class="advanced-card">
             <div class="section-title">
-              <GitBranch :size="16" />
+              <VcsIcon :size="16" />
               <span>分支增强</span>
             </div>
             <div class="advanced-form two">
@@ -8193,7 +8309,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
 
           <section class="advanced-card">
             <div class="section-title">
-              <GitBranch :size="16" />
+              <VcsIcon :size="16" />
               <span>工作树</span>
             </div>
             <div class="advanced-form">
@@ -8752,7 +8868,7 @@ async function jumpMergeConflict(direction: -1 | 1) {
         <div class="context-dashboard">
           <section class="dashboard-card">
             <div class="section-title">
-              <GitBranch :size="16" />
+              <VcsIcon :size="16" />
               <span>当前分支</span>
             </div>
             <strong>{{ branchNameLabel(branch?.currentBranch) }}</strong>
@@ -9255,15 +9371,12 @@ async function jumpMergeConflict(direction: -1 | 1) {
     >
       <button @click="showLogRefFromContext(logRefContextMenu)">
         <span>查看此引用日志</span>
-        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
       </button>
       <button :disabled="!canCheckoutLogRefContext(logRefContextMenu)" @click="checkoutLogRefFromContext(logRefContextMenu)">
         <span>{{ logRefContextMenu.kind === "tag" ? "检出标签" : logRefContextMenu.kind === "remote" ? "检出远程分支" : "切换到此分支" }}</span>
-        <small>{{ canCheckoutLogRefContext(logRefContextMenu) ? logRefContextRefName(logRefContextMenu) : "当前分支" }}</small>
       </button>
       <button @click="createBranchFromLogRefContext(logRefContextMenu)">
         <span>从此处新建分支</span>
-        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
       </button>
 
       <div class="context-menu-separator" />
@@ -9273,7 +9386,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="mergeLogRefIntoCurrent(logRefContextMenu)"
       >
         <span>合并到当前分支</span>
-        <small>{{ logRefContextMenu.kind === "local" && logRefContextMenu.branch.current ? "当前分支" : logRefContextRefName(logRefContextMenu) }}</small>
       </button>
       <button
         v-if="logRefContextMenu.kind !== 'tag'"
@@ -9281,7 +9393,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="rebaseCurrentOntoLogRef(logRefContextMenu)"
       >
         <span>变基当前分支到此处</span>
-        <small>{{ logRefContextMenu.kind === "local" && logRefContextMenu.branch.current ? "当前分支" : logRefContextRefName(logRefContextMenu) }}</small>
       </button>
       <button
         v-if="logRefContextMenu.kind === 'remote'"
@@ -9289,17 +9400,14 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="setCurrentBranchUpstreamFromContext(logRefContextMenu)"
       >
         <span>设为当前分支上游</span>
-        <small>{{ branchNameLabel(branch?.currentBranch) }}</small>
       </button>
 
       <div class="context-menu-separator" />
       <button @click="toggleLogRefFavoriteFromContext(logRefContextMenu)">
         <span>{{ isLogRefContextFavorite(logRefContextMenu) ? "取消收藏" : "收藏" }}</span>
-        <small>{{ formatRefName(logRefContextFullName(logRefContextMenu)) }}</small>
       </button>
       <button @click="copyLogRefNameFromContext(logRefContextMenu)">
         <span>复制引用名称</span>
-        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
       </button>
 
       <div class="context-menu-separator" />
@@ -9308,7 +9416,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="renameLogBranchFromContext(logRefContextMenu)"
       >
         <span>重命名分支</span>
-        <small>{{ logRefContextRefName(logRefContextMenu) }}</small>
       </button>
       <button
         v-if="logRefContextMenu.kind === 'tag'"
@@ -9316,7 +9423,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="pushLogTagFromContext(logRefContextMenu)"
       >
         <span>推送标签</span>
-        <small>{{ remote.selectedRemote || "origin" }}</small>
       </button>
       <button
         v-if="logRefContextMenu.kind === 'tag'"
@@ -9324,7 +9430,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="deleteRemoteLogTagFromContext(logRefContextMenu)"
       >
         <span>删除远程标签</span>
-        <small>{{ remote.selectedRemote || "origin" }}</small>
       </button>
       <button
         class="danger-menu-item"
@@ -9332,7 +9437,6 @@ async function jumpMergeConflict(direction: -1 | 1) {
         @click="deleteLogRefFromContext(logRefContextMenu)"
       >
         <span>{{ logRefContextMenu.kind === "tag" ? "删除本地标签" : logRefContextMenu.kind === "remote" ? "删除远程分支" : "删除本地分支" }}</span>
-        <small>{{ canDeleteLogRefContext(logRefContextMenu) ? logRefContextRefName(logRefContextMenu) : "当前分支不可删除" }}</small>
       </button>
     </div>
 
@@ -9548,13 +9652,17 @@ button:disabled {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  max-width: 250px;
+  max-width: 460px;
   padding: 4px 8px;
   border: 1px solid #d2dad4;
   border-radius: 7px;
   color: #405047;
   background: #f5f8f5;
   font-size: 12px;
+}
+
+.topbar-state svg {
+  flex: 0 0 auto;
 }
 
 .topbar-state span,
@@ -9564,8 +9672,19 @@ button:disabled {
   white-space: nowrap;
 }
 
-.topbar-state span {
+.topbar-branch-local {
+  min-width: 0;
+  max-width: 130px;
   font-weight: 700;
+}
+
+.topbar-branch-remote {
+  min-width: 0;
+  max-width: 170px;
+}
+
+.topbar-sync-state {
+  flex: 0 0 auto;
 }
 
 .topbar-state small {
@@ -9732,6 +9851,11 @@ button:disabled {
 .context-menu button small {
   color: #7a867d;
   font-size: 11px;
+}
+
+.log-ref-menu button span {
+  overflow: visible;
+  text-overflow: clip;
 }
 
 .context-menu button:hover:not(:disabled) small {
@@ -13192,14 +13316,15 @@ button[aria-busy="true"]:disabled {
 
 .file-actions {
   display: grid;
-  grid-template-columns: 32px repeat(3, minmax(0, 1fr));
+  grid-template-columns: 32px 32px repeat(3, minmax(0, 1fr));
   align-items: stretch;
   gap: 6px;
   padding: 6px 8px;
   border-bottom: 1px solid #dce2dd;
 }
 
-.file-actions-refresh {
+.file-actions-refresh,
+.file-actions-pull {
   width: 32px;
   height: 32px;
 }
