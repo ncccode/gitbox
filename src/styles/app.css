@@ -3449,12 +3449,28 @@ button[aria-busy="true"]:disabled {
   overflow: auto;
   padding: 4px 0 8px;
   background: #fbfcfa;
+  --change-file-row-height: 26px;
 }
 
 .file-list-empty {
   padding: 12px 10px;
   color: #68766f;
   font-size: 12px;
+}
+
+.change-file-virtual-spacer {
+  position: relative;
+  min-height: 100%;
+}
+
+.change-file-virtual-rows {
+  position: absolute;
+  inset: 0 0 auto;
+  display: grid;
+  align-content: start;
+  width: max-content;
+  min-width: 100%;
+  will-change: transform;
 }
 
 .change-file-group {
@@ -3468,7 +3484,9 @@ button[aria-busy="true"]:disabled {
   align-items: center;
   gap: 5px;
   width: 100%;
-  min-height: 26px;
+  min-width: 100%;
+  height: var(--change-file-row-height);
+  min-height: var(--change-file-row-height);
   padding: 0 10px 0 6px;
   border: 0;
   color: #26312c;
@@ -3492,7 +3510,9 @@ button[aria-busy="true"]:disabled {
   align-items: center;
   gap: 5px;
   width: 100%;
-  min-height: 24px;
+  min-width: 100%;
+  height: var(--change-file-row-height);
+  min-height: var(--change-file-row-height);
   padding: 0 10px 0 28px;
   border: 0;
   color: #8a2e20;
@@ -3561,7 +3581,9 @@ button[aria-busy="true"]:disabled {
 }
 
 .change-file-group-empty {
-  min-height: 24px;
+  min-width: 100%;
+  height: var(--change-file-row-height);
+  min-height: var(--change-file-row-height);
   padding: 5px 10px 5px 54px;
   color: #87928b;
   font-size: 12px;
@@ -3569,11 +3591,13 @@ button[aria-busy="true"]:disabled {
 
 .file-row {
   display: grid;
-  grid-template-columns: 18px 10px 18px minmax(0, 1fr);
+  grid-template-columns: 18px 10px 18px max-content;
   align-items: center;
   gap: 7px;
-  width: 100%;
-  min-height: 24px;
+  width: max-content;
+  min-width: 100%;
+  height: var(--change-file-row-height);
+  min-height: var(--change-file-row-height);
   padding: 0 10px 0 12px;
   border: 0;
   text-align: left;
@@ -3662,28 +3686,55 @@ button[aria-busy="true"]:disabled {
   display: flex;
   align-items: baseline;
   gap: 8px;
-  min-width: 0;
+  width: max-content;
+  min-width: max-content;
 }
 
 .file-main strong,
 .file-main small {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  min-width: max-content;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
 }
 
 .file-main strong {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
+  color: #245f9f;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 12px;
   font-weight: 700;
 }
 
 .file-main small {
-  flex: 1 1 auto;
+  flex: 0 0 auto;
   color: #738077;
   font-size: 11px;
+}
+
+.file-row.status-added .file-main strong {
+  color: #237044;
+}
+
+.file-row.status-modified .file-main strong,
+.file-row.status-typechange .file-main strong {
+  color: #8b6500;
+}
+
+.file-row.status-deleted .file-main strong {
+  color: #b7332c;
+}
+
+.file-row.status-renamed .file-main strong {
+  color: #3463a6;
+}
+
+.file-row.status-conflicted .file-main strong {
+  color: #b64200;
+}
+
+.file-row.status-ignored .file-main strong {
+  color: #8b9690;
 }
 
 .kind-badge {
@@ -5921,6 +5972,39 @@ html[data-theme="dark"] .kind-badge {
 html[data-theme="dark"] .file-row.active .kind-badge {
   color: #dce7f7;
   background: #354966;
+}
+
+html[data-theme="dark"] .file-main strong {
+  color: #9dbfff;
+}
+
+html[data-theme="dark"] .file-main small {
+  color: #8f949b;
+}
+
+html[data-theme="dark"] .file-row.status-added .file-main strong {
+  color: #6fce8b;
+}
+
+html[data-theme="dark"] .file-row.status-modified .file-main strong,
+html[data-theme="dark"] .file-row.status-typechange .file-main strong {
+  color: #e0b95f;
+}
+
+html[data-theme="dark"] .file-row.status-deleted .file-main strong {
+  color: #ff8177;
+}
+
+html[data-theme="dark"] .file-row.status-renamed .file-main strong {
+  color: #89b4ff;
+}
+
+html[data-theme="dark"] .file-row.status-conflicted .file-main strong {
+  color: #ff9a5f;
+}
+
+html[data-theme="dark"] .file-row.status-ignored .file-main strong {
+  color: #8f949b;
 }
 
 html[data-theme="dark"] .changelist-create input::placeholder,

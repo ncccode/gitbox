@@ -60,8 +60,18 @@ function normalizeProjectItem(value: unknown): ProjectItem | null {
   };
 }
 
+function stripWindowsVerbatimPrefix(path: string) {
+  if (path.startsWith("\\\\?\\UNC\\")) {
+    return `\\\\${path.slice("\\\\?\\UNC\\".length)}`;
+  }
+  if (path.startsWith("\\\\?\\")) {
+    return path.slice("\\\\?\\".length);
+  }
+  return path;
+}
+
 function normalizeProjectPath(path: string) {
-  const trimmed = path.trim();
+  const trimmed = stripWindowsVerbatimPrefix(path.trim());
   if (!trimmed) return "";
   if (trimmed === "/" || /^[A-Za-z]:[\\/]?$/.test(trimmed)) return trimmed;
   return trimmed.replace(/[\\/]+$/, "");

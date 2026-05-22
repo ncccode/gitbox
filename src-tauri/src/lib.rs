@@ -34,6 +34,16 @@ use tauri::AppHandle;
 
 type CommandResponse<T> = Result<T, String>;
 
+async fn run_blocking<T, F>(task: F) -> CommandResponse<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> CommandResponse<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 fn merge_optional_filters(primary: Option<String>, extra: Option<Vec<String>>) -> Vec<String> {
     let mut values = Vec::new();
     for value in primary.into_iter().chain(extra.unwrap_or_default()) {
@@ -47,15 +57,18 @@ fn merge_optional_filters(primary: Option<String>, extra: Option<Vec<String>>) -
 }
 
 #[tauri::command]
-fn open_repo(app: AppHandle, path: String) -> CommandResponse<RepositoryInfo> {
-    let info = open_repo_core(&path).map_err(|err| err.command())?;
-    record_recent_repo(&app, &info).map_err(|err| err.command())?;
-    Ok(info)
+async fn open_repo(app: AppHandle, path: String) -> CommandResponse<RepositoryInfo> {
+    run_blocking(move || {
+        let info = open_repo_core(&path).map_err(|err| err.command())?;
+        record_recent_repo(&app, &info).map_err(|err| err.command())?;
+        Ok(info)
+    })
+    .await
 }
 
 #[tauri::command]
-fn filter_project_directories(paths: Vec<String>) -> CommandResponse<Vec<String>> {
-    filter_project_directories_core(paths).map_err(|err| err.command())
+async fn filter_project_directories(paths: Vec<String>) -> CommandResponse<Vec<String>> {
+    run_blocking(move || filter_project_directories_core(paths).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
@@ -102,21 +115,24 @@ fn unshallow_repository(
 }
 
 #[tauri::command]
-fn repo_status(path: String, include_ignored: Option<bool>) -> CommandResponse<RepoStatus> {
-    repo_status_core(&path, include_ignored.unwrap_or(false)).map_err(|err| err.command())
+async fn repo_status(path: String, include_ignored: Option<bool>) -> CommandResponse<RepoStatus> {
+    run_blocking(move || {
+        repo_status_core(&path, include_ignored.unwrap_or(false)).map_err(|err| err.command())
+    })
+    .await
 }
 
 #[tauri::command]
-fn branch_summary(path: String) -> CommandResponse<BranchSummary> {
-    branch_summary_core(&path, false).map_err(|err| err.command())
+async fn branch_summary(path: String) -> CommandResponse<BranchSummary> {
+    run_blocking(move || branch_summary_core(&path, false).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
-fn list_project_files(
+async fn list_project_files(
     path: String,
     limit: Option<usize>,
 ) -> CommandResponse<Vec<ProjectFileEntry>> {
-    list_project_files_core(&path, limit).map_err(|err| err.command())
+    run_blocking(move || list_project_files_core(&path, limit).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
@@ -184,12 +200,15 @@ fn move_project_entry(
 }
 
 #[tauri::command]
-fn get_diff(
+async fn get_diff(
     path: String,
     file_path: Option<String>,
     staged: Option<bool>,
 ) -> CommandResponse<DiffResponse> {
-    get_diff_core(&path, file_path, staged.unwrap_or(false)).map_err(|err| err.command())
+    run_blocking(move || {
+        get_diff_core(&path, file_path, staged.unwrap_or(false)).map_err(|err| err.command())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -242,8 +261,8 @@ fn delete_shelf(
 }
 
 #[tauri::command]
-fn list_shelves(app: AppHandle, path: String) -> CommandResponse<Vec<ShelfInfo>> {
-    list_shelves_core(&app, &path).map_err(|err| err.command())
+async fn list_shelves(app: AppHandle, path: String) -> CommandResponse<Vec<ShelfInfo>> {
+    run_blocking(move || list_shelves_core(&app, &path).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
@@ -334,7 +353,7 @@ fn delete_remote(path: String, name: String) -> CommandResponse<CommandResult> {
 }
 
 #[tauri::command]
-fn list_commits(
+async fn list_commits(
     path: String,
     limit: Option<usize>,
     branch: Option<String>,
@@ -344,30 +363,36 @@ fn list_commits(
     path_filter: Option<String>,
     path_filters: Option<Vec<String>>,
 ) -> CommandResponse<Vec<CommitSummary>> {
-    list_commits_filtered_multi_core(
-        &path,
-        limit,
-        branch,
-        query,
-        merge_optional_filters(author, authors),
-        merge_optional_filters(path_filter, path_filters),
-    )
-    .map_err(|err| err.command())
+    run_blocking(move || {
+        list_commits_filtered_multi_core(
+            &path,
+            limit,
+            branch,
+            query,
+            merge_optional_filters(author, authors),
+            merge_optional_filters(path_filter, path_filters),
+        )
+        .map_err(|err| err.command())
+    })
+    .await
 }
 
 #[tauri::command]
-fn commit_details(path: String, oid: String) -> CommandResponse<CommitDetails> {
-    commit_details_core(&path, oid).map_err(|err| err.command())
+async fn commit_details(path: String, oid: String) -> CommandResponse<CommitDetails> {
+    run_blocking(move || commit_details_core(&path, oid).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
-fn commit_file_diff(
+async fn commit_file_diff(
     path: String,
     oid: String,
     file_path: String,
     mode: Option<String>,
 ) -> CommandResponse<DiffResponse> {
-    commit_file_diff_core(&path, oid, file_path, mode).map_err(|err| err.command())
+    run_blocking(move || {
+        commit_file_diff_core(&path, oid, file_path, mode).map_err(|err| err.command())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -390,8 +415,8 @@ fn compare_refs(path: String, left: String, right: String) -> CommandResponse<Re
 }
 
 #[tauri::command]
-fn list_branches(path: String) -> CommandResponse<BranchList> {
-    list_branches_core(&path).map_err(|err| err.command())
+async fn list_branches(path: String) -> CommandResponse<BranchList> {
+    run_blocking(move || list_branches_core(&path).map_err(|err| err.command())).await
 }
 
 #[tauri::command]
@@ -713,8 +738,8 @@ fn commit_message_history(path: String, limit: Option<usize>) -> CommandResponse
 }
 
 #[tauri::command]
-fn operation_state(path: String) -> CommandResponse<GitOperationState> {
-    operation_state_core(&path).map_err(|err| err.command())
+async fn operation_state(path: String) -> CommandResponse<GitOperationState> {
+    run_blocking(move || operation_state_core(&path).map_err(|err| err.command())).await
 }
 
 #[tauri::command]

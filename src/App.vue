@@ -77,6 +77,7 @@ const {
   mergeIncomingGutter,
   commitMessageTextarea,
   projectEditorTextarea,
+  changeFileListScroller,
   changeDiffScroller,
   logDiffScroller,
   activeChangeDiffHunkIndex,
@@ -92,6 +93,9 @@ const {
   submitConfirmDialog,
   activeResizePanel,
   changeFileGroups,
+  visibleChangeFileRows,
+  changeFileVirtualSpacerStyle,
+  visibleChangeFileListStyle,
   counts,
   branch,
   brandSubtitle,
@@ -194,6 +198,7 @@ const {
   switchRepository,
   removeRepository,
   refreshAll,
+  refreshChangesOnly,
   runRemoteAction,
   resetCommitMessageHistoryCursor,
   navigateCommitMessageHistory,
@@ -277,9 +282,9 @@ const {
   projectTabClass,
   branchNameLabel,
   formatStatusKind,
+  syncChangeFileListViewport,
   isChangeFileGroupExpanded,
   changeConflictGroupKey,
-  changeFileGroupFiles,
   changeFileGroupCount,
   toggleChangeFileGroup,
   isChangeFileGroupSelected,
@@ -700,7 +705,7 @@ const {
             title="刷新变更"
             :disabled="workspaceRefreshBusy"
             :aria-busy="isUiActionActive('workspace.refresh')"
-            @click="refreshAll"
+            @click="refreshChangesOnly"
           >
             <component
               :is="actionIcon('workspace.refresh', RefreshCw)"
@@ -779,130 +784,102 @@ const {
           </label>
         </div>
 
-        <div class="file-list source-control-tree" @contextmenu.prevent="openChangeListContextMenu(null, $event)">
+        <div
+          ref="changeFileListScroller"
+          class="file-list source-control-tree"
+          @scroll="syncChangeFileListViewport"
+          @contextmenu.prevent="openChangeListContextMenu(null, $event)"
+        >
           <div v-if="changeFileGroups.length === 0" class="file-list-empty">没有文件变更</div>
-          <template v-else>
-            <section
-              v-for="group in changeFileGroups"
-              :key="group.key"
-              class="change-file-group"
-              @contextmenu.prevent.stop="openChangeListContextMenu(group.changelistId, $event)"
-            >
-              <div
-                class="change-file-group-header"
-                @contextmenu.prevent.stop="openChangeListContextMenu(group.changelistId, $event)"
-              >
-                <button class="change-group-toggle" type="button" @click="toggleChangeFileGroup(group.key)">
-                  <ChevronDown v-if="isChangeFileGroupExpanded(group.key)" :size="14" />
-                  <ChevronRight v-else :size="14" />
-                </button>
-                <input
-                  class="change-group-checkbox"
-                  type="checkbox"
-                  :checked="isChangeFileGroupSelected(changeFileGroupFiles(group))"
-                  :disabled="changeFileGroupCount(group) === 0"
-                  :indeterminate.prop="isChangeFileGroupPartiallySelected(changeFileGroupFiles(group))"
-                  @change="toggleChangeFileGroupSelection(changeFileGroupFiles(group))"
-                />
-                <button class="change-group-title" type="button" @click="toggleChangeFileGroup(group.key)">
-                  <span>{{ group.label }}</span>
-                  <small>{{ changeFileGroupCount(group) }} 个文件</small>
-                </button>
-              </div>
-              <div v-if="isChangeFileGroupExpanded(group.key)" class="change-file-group-list">
-                <div v-if="changeFileGroupCount(group) === 0" class="change-file-group-empty">没有文件</div>
-                <div v-if="group.conflictFiles.length" class="change-conflict-tree">
-                  <div class="change-conflict-header">
-                    <button
-                      class="change-group-toggle"
-                      type="button"
-                      @click="toggleChangeFileGroup(changeConflictGroupKey(group))"
-                    >
-                      <ChevronDown v-if="isChangeFileGroupExpanded(changeConflictGroupKey(group))" :size="14" />
-                      <ChevronRight v-else :size="14" />
-                    </button>
-                    <input
-                      class="change-group-checkbox"
-                      type="checkbox"
-                      :checked="isChangeFileGroupSelected(group.conflictFiles)"
-                      :indeterminate.prop="isChangeFileGroupPartiallySelected(group.conflictFiles)"
-                      @change="toggleChangeFileGroupSelection(group.conflictFiles)"
-                    />
-                    <button
-                      class="change-group-title conflict"
-                      type="button"
-                      @click="toggleChangeFileGroup(changeConflictGroupKey(group))"
-                    >
-                      <span>合并冲突</span>
-                    </button>
-                  </div>
-                  <div
-                    v-if="isChangeFileGroupExpanded(changeConflictGroupKey(group))"
-                    class="change-conflict-file-list"
-                  >
-                    <button
-                      v-for="file in group.conflictFiles"
-                      :key="`${group.side}-conflict-${file.path}`"
-                      class="file-row conflict-file-row"
-                      :class="{
-                        active: changes.selectedFile === file.path,
-                        selected: changes.selectedPaths.includes(file.path),
-                        [`status-${file.kind.split('|')[0]}`]: true,
-                      }"
-                      :title="`${file.path} · ${formatStatusKind(file.kind)}`"
-                      @click="selectConflict(file.path)"
-                      @contextmenu.prevent.stop="openChangeFileContextMenu(file, group.side, $event)"
-                    >
-                      <input
-                        type="checkbox"
-                        :checked="changes.selectedPaths.includes(file.path)"
-                        @click.stop
-                        @change="changes.togglePath(file.path)"
-                      />
-                      <span class="status-dot" :class="file.kind.split('|')[0]" />
-                      <span class="change-file-icon" :class="changeFileIconClass(file.path)">
-                        <span v-if="fileTypeLabel(file.path)">{{ fileTypeLabel(file.path) }}</span>
-                        <FileIcon v-else :size="13" />
-                      </span>
-                      <span class="file-main">
-                        <strong>{{ fileBaseName(file.path) }}</strong>
-                        <small>{{ fileContextPath(file.path) }}</small>
-                      </span>
-                    </button>
-                  </div>
+          <div v-else class="change-file-virtual-spacer" :style="changeFileVirtualSpacerStyle">
+            <div class="change-file-virtual-rows" :style="visibleChangeFileListStyle">
+              <template v-for="row in visibleChangeFileRows" :key="row.key">
+                <div
+                  v-if="row.kind === 'group'"
+                  class="change-file-group-header"
+                  @contextmenu.prevent.stop="openChangeListContextMenu(row.group.changelistId, $event)"
+                >
+                  <button class="change-group-toggle" type="button" @click="toggleChangeFileGroup(row.group.key)">
+                    <ChevronDown v-if="isChangeFileGroupExpanded(row.group.key)" :size="14" />
+                    <ChevronRight v-else :size="14" />
+                  </button>
+                  <input
+                    class="change-group-checkbox"
+                    type="checkbox"
+                    :checked="isChangeFileGroupSelected(row.group)"
+                    :disabled="changeFileGroupCount(row.group) === 0"
+                    :indeterminate.prop="isChangeFileGroupPartiallySelected(row.group)"
+                    @change="toggleChangeFileGroupSelection(row.group)"
+                  />
+                  <button class="change-group-title" type="button" @click="toggleChangeFileGroup(row.group.key)">
+                    <span>{{ row.group.label }}</span>
+                    <small>{{ changeFileGroupCount(row.group) }} 个文件</small>
+                  </button>
                 </div>
+
+                <div v-else-if="row.kind === 'empty'" class="change-file-group-empty">没有文件</div>
+
+                <div
+                  v-else-if="row.kind === 'conflict-group'"
+                  class="change-conflict-header"
+                  @contextmenu.prevent.stop="openChangeListContextMenu(row.group.changelistId, $event)"
+                >
+                  <button
+                    class="change-group-toggle"
+                    type="button"
+                    @click="toggleChangeFileGroup(changeConflictGroupKey(row.group))"
+                  >
+                    <ChevronDown v-if="isChangeFileGroupExpanded(changeConflictGroupKey(row.group))" :size="14" />
+                    <ChevronRight v-else :size="14" />
+                  </button>
+                  <input
+                    class="change-group-checkbox"
+                    type="checkbox"
+                    :checked="isChangeFileGroupSelected(row.group.conflictFiles)"
+                    :indeterminate.prop="isChangeFileGroupPartiallySelected(row.group.conflictFiles)"
+                    @change="toggleChangeFileGroupSelection(row.group.conflictFiles)"
+                  />
+                  <button
+                    class="change-group-title conflict"
+                    type="button"
+                    @click="toggleChangeFileGroup(changeConflictGroupKey(row.group))"
+                  >
+                    <span>合并冲突</span>
+                  </button>
+                </div>
+
                 <button
-                  v-for="file in group.files"
-                  :key="`${group.side}-${file.path}`"
+                  v-else-if="row.kind === 'file'"
                   class="file-row"
                   :class="{
-                    active: changes.selectedFile === file.path,
-                    selected: changes.selectedPaths.includes(file.path),
-                    [`status-${file.kind.split('|')[0]}`]: true,
+                    'conflict-file-row': row.conflict,
+                    active: changes.selectedFile === row.file.path,
+                    selected: changes.selectedPaths.includes(row.file.path),
+                    [`status-${row.file.kind.split('|')[0]}`]: true,
                   }"
-                  :title="`${file.path} · ${formatStatusKind(file.kind)}`"
-                  @click="selectFile(file, group.side)"
-                  @contextmenu.prevent.stop="openChangeFileContextMenu(file, group.side, $event)"
+                  :title="`${row.file.path} · ${formatStatusKind(row.file.kind)}`"
+                  @click="row.conflict ? selectConflict(row.file.path) : selectFile(row.file, row.group.side)"
+                  @contextmenu.prevent.stop="openChangeFileContextMenu(row.file, row.group.side, $event)"
                 >
                   <input
                     type="checkbox"
-                    :checked="changes.selectedPaths.includes(file.path)"
+                    :checked="changes.selectedPaths.includes(row.file.path)"
                     @click.stop
-                    @change="changes.togglePath(file.path)"
+                    @change="changes.togglePath(row.file.path)"
                   />
-                  <span class="status-dot" :class="file.kind.split('|')[0]" />
-                  <span class="change-file-icon" :class="changeFileIconClass(file.path)">
-                    <span v-if="fileTypeLabel(file.path)">{{ fileTypeLabel(file.path) }}</span>
+                  <span class="status-dot" :class="row.file.kind.split('|')[0]" />
+                  <span class="change-file-icon" :class="changeFileIconClass(row.file.path)">
+                    <span v-if="fileTypeLabel(row.file.path)">{{ fileTypeLabel(row.file.path) }}</span>
                     <FileIcon v-else :size="13" />
                   </span>
                   <span class="file-main">
-                    <strong>{{ fileBaseName(file.path) }}</strong>
-                    <small>{{ fileContextPath(file.path) }}</small>
+                    <strong>{{ fileBaseName(row.file.path) }}</strong>
+                    <small>{{ fileContextPath(row.file.path) }}</small>
                   </span>
                 </button>
-              </div>
-            </section>
-          </template>
+              </template>
+            </div>
+          </div>
         </div>
 
         <div class="shelve-box">

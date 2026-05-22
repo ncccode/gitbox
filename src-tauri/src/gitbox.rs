@@ -847,70 +847,26 @@ pub fn unshallow_repository_core(
 
 pub fn repo_status_core(path: &str, include_ignored: bool) -> Result<RepoStatus, GitboxError> {
     let repo = Repository::discover(path)?;
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .renames_head_to_index(true)
-        .renames_index_to_workdir(true)
-        .include_ignored(include_ignored);
-
-    let statuses = repo.statuses(Some(&mut opts))?;
-    let mut files = Vec::new();
-    let mut counts = StatusCounts::default();
-
-    for entry in statuses.iter() {
-        let status = entry.status();
-        let staged = has_index_change(status);
-        let unstaged = has_worktree_change(status);
-        let untracked = status.contains(Status::WT_NEW);
-        let ignored = status.contains(Status::IGNORED);
-        let conflicted = status.contains(Status::CONFLICTED);
-
-        if staged {
-            counts.staged += 1;
-        }
-        if unstaged {
-            counts.unstaged += 1;
-        }
-        if untracked {
-            counts.untracked += 1;
-        }
-        if ignored {
-            counts.ignored += 1;
-        }
-        if conflicted {
-            counts.conflicted += 1;
-        }
-
-        let path = entry
-            .path()
-            .map(ToOwned::to_owned)
-            .or_else(|| entry.index_to_workdir().and_then(delta_new_path))
-            .or_else(|| entry.head_to_index().and_then(delta_new_path))
-            .unwrap_or_else(|| "<unknown>".to_string());
-
-        let old_path = entry
-            .head_to_index()
-            .and_then(delta_old_path)
-            .or_else(|| entry.index_to_workdir().and_then(delta_old_path))
-            .filter(|old| old != &path);
-
-        files.push(ChangedFile {
-            path,
-            old_path,
-            kind: status_kind(status),
-            staged,
-            unstaged,
-            untracked,
-            ignored,
-            conflicted,
-        });
+    let workdir = repo_workdir(&repo)?;
+    let mut args = vec![
+        "status".to_string(),
+        "--porcelain=v1".to_string(),
+        "-z".to_string(),
+        "--untracked-files=all".to_string(),
+        "--no-renames".to_string(),
+    ];
+    if include_ignored {
+        args.push("--ignored".to_string());
     }
 
+    let output = run_git(&workdir, args, None)?;
+    let (mut files, counts) = parse_porcelain_status(&output);
+
     files.sort_by(|left, right| left.path.cmp(&right.path));
+    let clean = files.is_empty();
     Ok(RepoStatus {
         repo: repository_info(&repo)?,
-        branch: branch_summary_core(path, include_ignored)?,
+        branch: branch_summary_for_repo(&repo, include_ignored, Some(clean))?,
         files,
         counts,
     })
@@ -921,8 +877,16 @@ pub fn branch_summary_core(
     include_ignored: bool,
 ) -> Result<BranchSummary, GitboxError> {
     let repo = Repository::discover(path)?;
+    branch_summary_for_repo(&repo, include_ignored, None)
+}
+
+fn branch_summary_for_repo(
+    repo: &Repository,
+    include_ignored: bool,
+    clean_override: Option<bool>,
+) -> Result<BranchSummary, GitboxError> {
     let head = repo.head().ok();
-    let current_branch = current_branch_name(&repo);
+    let current_branch = current_branch_name(repo);
     let head_oid = head
         .as_ref()
         .and_then(|head| head.target())
@@ -956,7 +920,10 @@ pub fn branch_summary_core(
         ahead,
         behind,
         detached,
-        clean: repo_is_clean(&repo, include_ignored)?,
+        clean: match clean_override {
+            Some(clean) => clean,
+            None => repo_is_clean(repo, include_ignored)?,
+        },
         remotes: remote_infos(&repo)?,
     })
 }
@@ -968,9 +935,7 @@ pub fn get_diff_core(
 ) -> Result<DiffResponse, GitboxError> {
     let repo = Repository::discover(path)?;
     let mut opts = DiffOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_typechange(true);
+    opts.include_untracked(true).include_typechange(true);
 
     let normalized_path = match file_path {
         Some(path) if !path.trim().is_empty() => {
@@ -1468,7 +1433,6 @@ fn ensure_index_ready_for_commit(
 
 fn unresolved_conflict_paths(repo: &Repository) -> Result<Vec<String>, GitboxError> {
     let mut opts = StatusOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut paths = Vec::new();
 
@@ -3300,7 +3264,6 @@ pub fn operation_state_core(path: &str) -> Result<GitOperationState, GitboxError
         };
 
     let mut opts = StatusOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
     let mut conflicted_paths = Vec::new();
     for entry in repo.statuses(Some(&mut opts))?.iter() {
         if !entry.status().contains(Status::CONFLICTED) {
@@ -4015,6 +3978,120 @@ fn parse_name_status_nul(output: &str) -> Vec<CommitFileChange> {
     files
 }
 
+fn parse_porcelain_status(output: &str) -> (Vec<ChangedFile>, StatusCounts) {
+    let mut files = Vec::new();
+    let mut counts = StatusCounts::default();
+    let mut entries = output.split('\0').filter(|part| !part.is_empty());
+
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
+            continue;
+        }
+
+        let bytes = entry.as_bytes();
+        let index = bytes[0] as char;
+        let worktree = bytes[1] as char;
+        let path = entry[3..].to_string();
+        if path.is_empty() {
+            continue;
+        }
+
+        let old_path = if matches!(index, 'R' | 'C') || matches!(worktree, 'R' | 'C') {
+            entries
+                .next()
+                .filter(|old| !old.is_empty() && *old != path)
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
+        let conflicted = porcelain_status_conflicted(index, worktree);
+        let untracked = index == '?' && worktree == '?';
+        let ignored = index == '!' && worktree == '!';
+        let staged = !conflicted && porcelain_index_changed(index);
+        let unstaged = untracked || (!conflicted && porcelain_worktree_changed(worktree));
+
+        if staged {
+            counts.staged += 1;
+        }
+        if unstaged {
+            counts.unstaged += 1;
+        }
+        if untracked {
+            counts.untracked += 1;
+        }
+        if ignored {
+            counts.ignored += 1;
+        }
+        if conflicted {
+            counts.conflicted += 1;
+        }
+
+        files.push(ChangedFile {
+            path,
+            old_path,
+            kind: porcelain_status_kind(index, worktree, conflicted, untracked, ignored),
+            staged,
+            unstaged,
+            untracked,
+            ignored,
+            conflicted,
+        });
+    }
+
+    (files, counts)
+}
+
+fn porcelain_status_conflicted(index: char, worktree: char) -> bool {
+    matches!(
+        (index, worktree),
+        ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A') | ('U', 'U')
+    )
+}
+
+fn porcelain_index_changed(status: char) -> bool {
+    matches!(status, 'A' | 'M' | 'D' | 'R' | 'C' | 'T')
+}
+
+fn porcelain_worktree_changed(status: char) -> bool {
+    matches!(status, 'M' | 'D' | 'R' | 'C' | 'T')
+}
+
+fn porcelain_status_kind(
+    index: char,
+    worktree: char,
+    conflicted: bool,
+    untracked: bool,
+    ignored: bool,
+) -> String {
+    if conflicted {
+        return "conflicted".to_string();
+    }
+
+    let mut parts = Vec::new();
+    if untracked || matches!(index, 'A' | 'C') || matches!(worktree, 'A' | 'C') {
+        parts.push("added");
+    }
+    if matches!(index, 'M') || matches!(worktree, 'M') {
+        parts.push("modified");
+    }
+    if matches!(index, 'D') || matches!(worktree, 'D') {
+        parts.push("deleted");
+    }
+    if matches!(index, 'R') || matches!(worktree, 'R') {
+        parts.push("renamed");
+    }
+    if matches!(index, 'T') || matches!(worktree, 'T') {
+        parts.push("typechange");
+    }
+    if ignored {
+        parts.push("ignored");
+    }
+    if parts.is_empty() {
+        parts.push("unknown");
+    }
+    parts.join("|")
+}
+
 fn parse_file_history(output: &str) -> Vec<FileHistoryEntry> {
     output
         .lines()
@@ -4373,12 +4450,12 @@ fn open_system_file_manager(path: &Path) -> Result<(), GitboxError> {
 
 #[cfg(windows)]
 fn open_system_file_manager(path: &Path) -> Result<(), GitboxError> {
-    let status = Command::new("explorer").arg(path).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(GitboxError::Message("无法打开系统文件管理器".to_string()))
-    }
+    let mut command = Command::new("explorer");
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .arg(path_string(path));
+    command.spawn()?;
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -4420,14 +4497,11 @@ fn open_system_terminal(path: &Path) -> Result<(), GitboxError> {
 fn open_system_terminal(path: &Path) -> Result<(), GitboxError> {
     let mut command = Command::new("cmd");
     command
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["/C", "start", "", "cmd", "/K", "cd", "/d"])
-        .arg(path);
-    let status = command.status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(GitboxError::Message("无法打开系统终端".to_string()))
-    }
+        .arg(path_string(path));
+    command.spawn()?;
+    Ok(())
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -5264,7 +5338,6 @@ fn parse_conflict_blocks(lines: &[String]) -> Vec<ParsedConflictBlock> {
 fn repo_is_clean(repo: &Repository, include_ignored: bool) -> Result<bool, GitboxError> {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
         .renames_head_to_index(true)
         .renames_index_to_workdir(true)
         .include_ignored(include_ignored);
@@ -5304,53 +5377,6 @@ fn has_index_change(status: Status) -> bool {
     )
 }
 
-fn has_worktree_change(status: Status) -> bool {
-    status.intersects(
-        Status::WT_NEW
-            | Status::WT_MODIFIED
-            | Status::WT_DELETED
-            | Status::WT_RENAMED
-            | Status::WT_TYPECHANGE,
-    )
-}
-
-fn status_kind(status: Status) -> String {
-    let mut parts = Vec::new();
-    if status.contains(Status::INDEX_NEW) || status.contains(Status::WT_NEW) {
-        parts.push("added");
-    }
-    if status.contains(Status::INDEX_MODIFIED) || status.contains(Status::WT_MODIFIED) {
-        parts.push("modified");
-    }
-    if status.contains(Status::INDEX_DELETED) || status.contains(Status::WT_DELETED) {
-        parts.push("deleted");
-    }
-    if status.contains(Status::INDEX_RENAMED) || status.contains(Status::WT_RENAMED) {
-        parts.push("renamed");
-    }
-    if status.contains(Status::INDEX_TYPECHANGE) || status.contains(Status::WT_TYPECHANGE) {
-        parts.push("typechange");
-    }
-    if status.contains(Status::CONFLICTED) {
-        parts.push("conflicted");
-    }
-    if status.contains(Status::IGNORED) {
-        parts.push("ignored");
-    }
-    if parts.is_empty() {
-        parts.push("unknown");
-    }
-    parts.join("|")
-}
-
-fn delta_new_path(delta: git2::DiffDelta<'_>) -> Option<String> {
-    delta.new_file().path().map(path_string)
-}
-
-fn delta_old_path(delta: git2::DiffDelta<'_>) -> Option<String> {
-    delta.old_file().path().map(path_string)
-}
-
 fn normalize_repo_path(repo: &Repository, input: &str) -> Result<PathBuf, GitboxError> {
     let path = PathBuf::from(input);
     if path.is_absolute() {
@@ -5386,7 +5412,26 @@ fn repo_path_string(path: &Path) -> String {
 }
 
 fn path_string(path: &Path) -> String {
-    path.to_string_lossy().to_string()
+    let value = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        strip_windows_verbatim_prefix(&value)
+    }
+    #[cfg(not(windows))]
+    {
+        value
+    }
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_verbatim_prefix(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix("\\\\?\\UNC\\") {
+        return format!("\\\\{rest}");
+    }
+    if let Some(rest) = value.strip_prefix("\\\\?\\") {
+        return rest.to_string();
+    }
+    value.to_string()
 }
 
 fn normalize_existing_path(path: &Path) -> PathBuf {
@@ -5715,6 +5760,22 @@ mod tests {
     }
 
     #[test]
+    fn path_string_hides_windows_verbatim_prefixes() {
+        assert_eq!(
+            strip_windows_verbatim_prefix("\\\\?\\D:\\project\\repo"),
+            "D:\\project\\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("\\\\?\\UNC\\server\\share\\repo"),
+            "\\\\server\\share\\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("D:\\project\\repo"),
+            "D:\\project\\repo"
+        );
+    }
+
+    #[test]
     fn filter_project_directories_keeps_only_existing_directories() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = dir.path().join("project");
@@ -5880,6 +5941,25 @@ mod tests {
                 .branch
                 .clean
         );
+    }
+
+    #[test]
+    fn repo_status_expands_untracked_directory_files() {
+        let (dir, _repo) = test_repo();
+        write_file(dir.path(), "vendor/autoload.php", "<?php\n");
+        write_file(dir.path(), "vendor/composer/ClassLoader.php", "<?php\n");
+
+        let status = repo_status_core(dir.path().to_str().unwrap(), false).expect("status");
+        assert_eq!(status.counts.untracked, 2);
+        assert_eq!(
+            status
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vendor/autoload.php", "vendor/composer/ClassLoader.php"]
+        );
+        assert!(status.files.iter().all(|file| file.untracked));
     }
 
     #[test]
@@ -7219,6 +7299,29 @@ mod tests {
         assert_eq!(files[0].status, "R100");
         assert_eq!(files[0].old_path.as_deref(), Some("旧目录/旧文件.txt"));
         assert_eq!(files[0].path, "新目录/新文件.txt");
+    }
+
+    #[test]
+    fn porcelain_status_parser_handles_common_states() {
+        let (files, counts) = parse_porcelain_status(
+            " M src/main.rs\0A  staged.txt\0?? vendor/autoload.php\0!! cache/tmp.txt\0UU conflict.txt\0R  new.txt\0old.txt\0",
+        );
+
+        assert_eq!(files.len(), 6);
+        assert_eq!(counts.staged, 2);
+        assert_eq!(counts.unstaged, 2);
+        assert_eq!(counts.untracked, 1);
+        assert_eq!(counts.ignored, 1);
+        assert_eq!(counts.conflicted, 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[0].kind, "modified");
+        assert!(files[0].unstaged);
+        assert_eq!(files[2].path, "vendor/autoload.php");
+        assert!(files[2].untracked);
+        assert_eq!(files[4].kind, "conflicted");
+        assert_eq!(files[5].path, "new.txt");
+        assert_eq!(files[5].old_path.as_deref(), Some("old.txt"));
+        assert_eq!(files[5].kind, "renamed");
     }
 
     #[test]

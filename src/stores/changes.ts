@@ -59,7 +59,7 @@ export const useChangesStore = defineStore("changes", {
         repos.setCurrent(this.status.repo);
         const changedPaths = new Set(this.status.files.map((file) => file.path));
         this.selectedPaths = this.selectedPaths.filter((path) => changedPaths.has(path));
-        if (this.selectedFile && !this.status.files.some((file) => file.path === this.selectedFile)) {
+        if (this.selectedFile && !changedPaths.has(this.selectedFile)) {
           this.selectedFile = null;
           this.selectedPaths = [];
         }

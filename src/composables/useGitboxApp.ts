@@ -103,11 +103,14 @@ export function useGitboxApp() {
   const commitMessageHistoryIndex = ref(-1);
   const commitMessageHistoryDraft = ref("");
   const projectEditorTextarea = ref<HTMLTextAreaElement | null>(null);
+  const changeFileListScroller = ref<HTMLElement | null>(null);
   const changeDiffScroller = ref<HTMLElement | null>(null);
   const logDiffScroller = ref<HTMLElement | null>(null);
   const activeChangeDiffHunkIndex = ref<number | null>(null);
   const activeLogDiffHunkIndex = ref(0);
   const activeMergeConflictOrdinal = ref(0);
+  const changeFileListScrollTop = ref(0);
+  const changeFileListViewportHeight = ref(720);
   const syncingSideBySideScroll = new WeakSet<HTMLElement>();
   const syncingMergeEditorScroll = new WeakSet<HTMLElement>();
   const projectEditorScrollTop = ref(0);
@@ -128,6 +131,30 @@ export function useGitboxApp() {
     conflictFiles: ChangedFile[];
     changelistId?: string;
   };
+  type ChangeFileCollection = ChangeFileGroup | ChangedFile[];
+  type VirtualChangeFileRow =
+    | {
+        kind: "group";
+        key: string;
+        group: ChangeFileGroup;
+      }
+    | {
+        kind: "conflict-group";
+        key: string;
+        group: ChangeFileGroup;
+      }
+    | {
+        kind: "empty";
+        key: string;
+        group: ChangeFileGroup;
+      }
+    | {
+        kind: "file";
+        key: string;
+        group: ChangeFileGroup;
+        file: ChangedFile;
+        conflict: boolean;
+      };
   type ProjectCodeToken = {
     text: string;
     kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
@@ -347,6 +374,7 @@ export function useGitboxApp() {
   );
   let stopSystemThemeWatch: (() => void) | null = null;
   let projectEditorResizeObserver: ResizeObserver | null = null;
+  let changeFileListResizeObserver: ResizeObserver | null = null;
   let autoFetchTimer: number | null = null;
   let noticeToastTimer: number | null = null;
   let noticeToastId = 0;
@@ -360,15 +388,21 @@ export function useGitboxApp() {
   const PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT = 720;
   const PROJECT_HUNK_PATCH_CONTEXT_LINES = 3;
   const PROJECT_TOKEN_CACHE_LIMIT = 6000;
+  const AUTO_LOAD_CHANGE_DIFF_LIMIT = 2000;
+  const CHANGE_FILE_ROW_HEIGHT = 26;
+  const CHANGE_FILE_OVERSCAN_ROWS = 18;
+  const CHANGE_FILE_DEFAULT_VIEWPORT_HEIGHT = 720;
   const MERGE_EDITOR_LINE_HEIGHT = 18;
   const MERGE_EDITOR_PADDING_TOP = 12;
   const MERGE_CONNECTION_WIDTH = 46;
   const projectKeywordCache = new Map<string, Set<string>>();
   const projectLineTokenCache = new Map<string, ProjectCodeToken[]>();
+  let skipNextChangeDiffLoad = false;
 
   const activeFiles = computed(() => {
     return filesForChangeSide(settings.selectedSide);
   });
+  const selectedChangePathSet = computed(() => new Set(changes.selectedPaths));
   const changeFileGroups = computed<ChangeFileGroup[]>(() => {
     if (settings.selectedSide === "staged") {
       const stagedGroups: ChangeFileGroup[] = [
@@ -439,6 +473,79 @@ export function useGitboxApp() {
       (group) => group.key !== "untracked" || group.files.length + group.conflictFiles.length > 0,
     );
   });
+  const flatChangeFileRows = computed<VirtualChangeFileRow[]>(() => {
+    const rows: VirtualChangeFileRow[] = [];
+
+    for (const group of changeFileGroups.value) {
+      rows.push({
+        kind: "group",
+        key: `group:${group.key}`,
+        group,
+      });
+
+      if (!isChangeFileGroupExpanded(group.key)) continue;
+
+      if (changeFileGroupCount(group) === 0) {
+        rows.push({
+          kind: "empty",
+          key: `empty:${group.key}`,
+          group,
+        });
+      }
+
+      if (group.conflictFiles.length > 0) {
+        const conflictKey = changeConflictGroupKey(group);
+        rows.push({
+          kind: "conflict-group",
+          key: `conflict-group:${conflictKey}`,
+          group,
+        });
+
+        if (isChangeFileGroupExpanded(conflictKey)) {
+          for (const file of group.conflictFiles) {
+            rows.push({
+              kind: "file",
+              key: `${group.side}:conflict:${file.path}`,
+              group,
+              file,
+              conflict: true,
+            });
+          }
+        }
+      }
+
+      for (const file of group.files) {
+        rows.push({
+          kind: "file",
+          key: `${group.side}:file:${file.path}`,
+          group,
+          file,
+          conflict: false,
+        });
+      }
+    }
+
+    return rows;
+  });
+  const firstVisibleChangeFileRowIndex = computed(() => {
+    const viewportHeight = changeFileListViewportHeight.value || CHANGE_FILE_DEFAULT_VIEWPORT_HEIGHT;
+    const visibleCount = Math.ceil(viewportHeight / CHANGE_FILE_ROW_HEIGHT) + CHANGE_FILE_OVERSCAN_ROWS * 2;
+    const maxStart = Math.max(0, flatChangeFileRows.value.length - visibleCount);
+    const requestedStart = Math.floor(changeFileListScrollTop.value / CHANGE_FILE_ROW_HEIGHT) - CHANGE_FILE_OVERSCAN_ROWS;
+    return Math.min(Math.max(0, requestedStart), maxStart);
+  });
+  const visibleChangeFileRows = computed(() => {
+    const viewportHeight = changeFileListViewportHeight.value || CHANGE_FILE_DEFAULT_VIEWPORT_HEIGHT;
+    const visibleCount = Math.ceil(viewportHeight / CHANGE_FILE_ROW_HEIGHT) + CHANGE_FILE_OVERSCAN_ROWS * 2;
+    const start = firstVisibleChangeFileRowIndex.value;
+    return flatChangeFileRows.value.slice(start, start + visibleCount);
+  });
+  const changeFileVirtualSpacerStyle = computed(() => ({
+    height: `${flatChangeFileRows.value.length * CHANGE_FILE_ROW_HEIGHT}px`,
+  }));
+  const visibleChangeFileListStyle = computed(() => ({
+    transform: `translateY(${firstVisibleChangeFileRowIndex.value * CHANGE_FILE_ROW_HEIGHT}px)`,
+  }));
   const counts = computed(() => changes.status?.counts);
   const branch = computed(() => changes.branch);
   const brandSubtitle = computed(() =>
@@ -1278,6 +1385,10 @@ export function useGitboxApp() {
   watch(
     () => [changes.selectedFile, changes.selectedSide],
     () => {
+      if (skipNextChangeDiffLoad) {
+        skipNextChangeDiffLoad = false;
+        return;
+      }
       diff.loadSelected().catch(() => undefined);
     },
   );
@@ -1336,6 +1447,38 @@ export function useGitboxApp() {
         projectEditorResizeObserver = new ResizeObserver(updateProjectEditorViewport);
         projectEditorResizeObserver.observe(textarea);
       }
+    },
+    { flush: "post" },
+  );
+
+  watch(
+    changeFileListScroller,
+    (scroller) => {
+      changeFileListResizeObserver?.disconnect();
+      changeFileListResizeObserver = null;
+
+      if (!scroller) return;
+      updateChangeFileListViewport();
+      if (typeof ResizeObserver !== "undefined") {
+        changeFileListResizeObserver = new ResizeObserver(updateChangeFileListViewport);
+        changeFileListResizeObserver.observe(scroller);
+      }
+    },
+    { flush: "post" },
+  );
+
+  watch(
+    () => flatChangeFileRows.value.length,
+    () => {
+      nextTick(() => {
+        const scroller = changeFileListScroller.value;
+        if (!scroller) return;
+        const maxScrollTop = Math.max(0, flatChangeFileRows.value.length * CHANGE_FILE_ROW_HEIGHT - scroller.clientHeight);
+        if (scroller.scrollTop > maxScrollTop) {
+          scroller.scrollTop = maxScrollTop;
+        }
+        updateChangeFileListViewport();
+      }).catch(() => undefined);
     },
     { flush: "post" },
   );
@@ -1422,6 +1565,9 @@ export function useGitboxApp() {
     if (mode === "project") {
       project.refresh().catch(() => undefined);
     }
+    if (mode === "log" && repos.current && history.commits.length === 0 && !history.loading) {
+      history.refresh().catch(() => undefined);
+    }
   });
 
   onMounted(() => {
@@ -1455,6 +1601,7 @@ export function useGitboxApp() {
     stopProjectDragDrop?.();
     stopSystemThemeWatch?.();
     projectEditorResizeObserver?.disconnect();
+    changeFileListResizeObserver?.disconnect();
     clearAutoFetchTimer();
     clearNoticeToastTimer();
   });
@@ -1746,11 +1893,10 @@ export function useGitboxApp() {
     syncSelectedRemote(true);
     await changes.refresh();
     changelists.pruneMissingPaths(changes.files.map((file) => file.path));
-    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    await refreshRepositoryMetadata();
     syncOperationTargets();
     syncSelectedRemote(true);
-    pickFirstAvailable(settings.selectedSide);
-    await diff.loadSelected();
+    await pickAutomaticChangeFile(settings.selectedSide);
     if (workbenchMode.value === "project") {
       await project.refresh();
     }
@@ -1810,18 +1956,85 @@ export function useGitboxApp() {
     }
   }
 
+  function automaticChangeCandidateCount(side: ChangeSide) {
+    const preferred = filesForChangeSide(side);
+    if (preferred.length > 0) return preferred.length;
+    const fallbackSide: ChangeSide = side === "staged" ? "unstaged" : "staged";
+    return filesForChangeSide(fallbackSide).length;
+  }
+
+  function hasSelectedChangeFile() {
+    if (!changes.selectedFile) return false;
+    return filesForChangeSide(changes.selectedSide).some((file) => file.path === changes.selectedFile);
+  }
+
+  function clearAutomaticChangeSelection() {
+    clearMergeConflictView();
+    changes.selectedFile = null;
+    changes.selectedPaths = [];
+    diff.current = null;
+  }
+
+  function prepareAutomaticChangeSelection() {
+    const previousSelection = `${changes.selectedSide}:${changes.selectedFile ?? ""}`;
+    skipNextChangeDiffLoad = true;
+
+    return () => {
+      const nextSelection = `${changes.selectedSide}:${changes.selectedFile ?? ""}`;
+      if (nextSelection === previousSelection) {
+        skipNextChangeDiffLoad = false;
+      }
+      return true;
+    };
+  }
+
+  async function pickAutomaticChangeFile(side: ChangeSide) {
+    if (hasSelectedChangeFile()) {
+      await diff.loadSelected();
+      return;
+    }
+
+    if (automaticChangeCandidateCount(side) > AUTO_LOAD_CHANGE_DIFF_LIMIT) {
+      clearAutomaticChangeSelection();
+      return;
+    }
+
+    const shouldLoadDiff = prepareAutomaticChangeSelection();
+    pickFirstAvailable(side);
+    if (shouldLoadDiff()) {
+      await diff.loadSelected();
+    }
+  }
+
+  async function refreshRepositoryMetadata(includeHistory = workbenchMode.value === "log") {
+    const tasks: Promise<unknown>[] = [branches.refresh(), operations.refresh()];
+    if (includeHistory) {
+      tasks.push(history.refresh());
+    }
+    await Promise.all(tasks);
+  }
+
   async function refreshAll() {
     await runUiAction("workspace.refresh", async () => {
       await changes.refresh();
       changelists.pruneMissingPaths(changes.files.map((file) => file.path));
-      await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+      await refreshRepositoryMetadata();
       branches.syncUpstreamDraft();
       syncOperationTargets();
       syncSelectedRemote();
-      pickFirstAvailable(settings.selectedSide);
-      await diff.loadSelected();
+      await pickAutomaticChangeFile(settings.selectedSide);
       if (workbenchMode.value === "project") {
         await project.refresh();
+      }
+    });
+  }
+
+  async function refreshChangesOnly() {
+    await runUiAction("workspace.refresh", async () => {
+      await changes.refresh({ includeShelves: false });
+      changelists.pruneMissingPaths(changes.files.map((file) => file.path));
+      if (!changes.selectedFile) {
+        diff.current = null;
       }
     });
   }
@@ -1829,12 +2042,11 @@ export function useGitboxApp() {
   async function reloadAfterGitOperation() {
     await changes.refresh();
     changelists.pruneMissingPaths(changes.files.map((file) => file.path));
-    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    await refreshRepositoryMetadata();
     branches.syncUpstreamDraft();
     syncOperationTargets();
     syncSelectedRemote();
-    pickFirstAvailable(settings.selectedSide);
-    await diff.loadSelected();
+    await pickAutomaticChangeFile(settings.selectedSide);
     if (workbenchMode.value === "project") {
       await project.refresh();
     }
@@ -1853,7 +2065,7 @@ export function useGitboxApp() {
   }
 
   async function refreshAfterRemoteAction() {
-    await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+    await refreshRepositoryMetadata();
     branches.syncUpstreamDraft();
     syncOperationTargets();
     syncSelectedRemote();
@@ -2060,7 +2272,7 @@ export function useGitboxApp() {
     await runUiAction("remote.save", async () => {
       await remote.saveRemote();
       syncSelectedRemote(true);
-      await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+      await refreshRepositoryMetadata();
       branches.syncUpstreamDraft();
       syncOperationTargets();
     });
@@ -2165,12 +2377,16 @@ export function useGitboxApp() {
   function selectSide(side: ChangeSide) {
     settings.setSide(side);
     changes.selectedSide = side;
+    if (automaticChangeCandidateCount(side) > AUTO_LOAD_CHANGE_DIFF_LIMIT) {
+      clearAutomaticChangeSelection();
+      return;
+    }
     pickFirstAvailable(side);
   }
 
   function setIncludeIgnored(event: Event) {
     settings.setIncludeIgnored((event.target as HTMLInputElement).checked);
-    refreshAll().catch(() => undefined);
+    refreshChangesOnly().catch(() => undefined);
   }
 
   function nudgePanelWidth(panel: LayoutPanelKey, delta: number) {
@@ -2224,10 +2440,12 @@ export function useGitboxApp() {
     if (!file.conflicted) {
       clearMergeConflictView();
       changes.selectFile(file, side);
+      scrollChangeFilePathIntoView(file.path, side);
       return;
     }
 
     changes.selectFile(file, side);
+    scrollChangeFilePathIntoView(file.path, side);
     if (options.openConflict ?? true) {
       workbenchMode.value = "changes";
       openMergeConflictView(file.path);
@@ -2759,7 +2977,7 @@ export function useGitboxApp() {
         await commit.commit(dialog.mode === "commit-push" ? dialog.remoteName || undefined : undefined, false, dialog.paths);
         rememberCommitMessage(dialog.message);
         resetCommitMessageHistoryCursor();
-        await Promise.all([branches.refresh(), history.refresh(), operations.refresh()]);
+        await refreshRepositoryMetadata();
         syncOperationTargets();
       }
       submitConfirmDialog.value = null;
@@ -3365,6 +3583,42 @@ export function useGitboxApp() {
     expandedProjectHunkIndex.value = expandedProjectHunkIndex.value === id ? null : id;
   }
 
+  function updateChangeFileListViewport() {
+    const scroller = changeFileListScroller.value;
+    changeFileListViewportHeight.value = scroller?.clientHeight || CHANGE_FILE_DEFAULT_VIEWPORT_HEIGHT;
+    changeFileListScrollTop.value = scroller?.scrollTop ?? 0;
+  }
+
+  function syncChangeFileListViewport(event?: Event) {
+    const scroller = (event?.currentTarget as HTMLElement | null) ?? changeFileListScroller.value;
+    changeFileListViewportHeight.value = scroller?.clientHeight || CHANGE_FILE_DEFAULT_VIEWPORT_HEIGHT;
+    changeFileListScrollTop.value = scroller?.scrollTop ?? 0;
+  }
+
+  function scrollChangeFilePathIntoView(path: string, side: ChangeSide) {
+    nextTick(() => {
+      const scroller = changeFileListScroller.value;
+      if (!scroller) return;
+
+      const rowIndex = flatChangeFileRows.value.findIndex(
+        (row) => row.kind === "file" && row.group.side === side && row.file.path === path,
+      );
+      if (rowIndex < 0) return;
+
+      const rowTop = rowIndex * CHANGE_FILE_ROW_HEIGHT;
+      const rowBottom = rowTop + CHANGE_FILE_ROW_HEIGHT;
+      const viewportTop = scroller.scrollTop;
+      const viewportBottom = viewportTop + scroller.clientHeight;
+
+      if (rowTop < viewportTop) {
+        scroller.scrollTop = rowTop;
+      } else if (rowBottom > viewportBottom) {
+        scroller.scrollTop = Math.max(0, rowBottom - scroller.clientHeight);
+      }
+      updateChangeFileListViewport();
+    }).catch(() => undefined);
+  }
+
   function updateProjectEditorViewport() {
     projectEditorViewportHeight.value =
       projectEditorTextarea.value?.clientHeight ?? PROJECT_EDITOR_DEFAULT_VIEWPORT_HEIGHT;
@@ -3829,12 +4083,23 @@ export function useGitboxApp() {
     return `${group.key}:conflicts`;
   }
 
-  function changeFileGroupFiles(group: ChangeFileGroup) {
-    return [...group.files, ...group.conflictFiles];
-  }
-
   function changeFileGroupCount(group: ChangeFileGroup) {
     return group.files.length + group.conflictFiles.length;
+  }
+
+  function eachChangeFile(collection: ChangeFileCollection, callback: (file: ChangedFile) => void) {
+    if (Array.isArray(collection)) {
+      collection.forEach(callback);
+      return;
+    }
+    collection.files.forEach(callback);
+    collection.conflictFiles.forEach(callback);
+  }
+
+  function collectChangeFilePaths(collection: ChangeFileCollection) {
+    const paths: string[] = [];
+    eachChangeFile(collection, (file) => paths.push(file.path));
+    return paths;
   }
 
   function toggleChangeFileGroup(key: string) {
@@ -3844,19 +4109,33 @@ export function useGitboxApp() {
     };
   }
 
-  function isChangeFileGroupSelected(files: ChangedFile[]) {
-    return files.length > 0 && files.every((file) => changes.selectedPaths.includes(file.path));
+  function isChangeFileGroupSelected(collection: ChangeFileCollection) {
+    const selected = selectedChangePathSet.value;
+    let total = 0;
+    let selectedCount = 0;
+    eachChangeFile(collection, (file) => {
+      total += 1;
+      if (selected.has(file.path)) selectedCount += 1;
+    });
+    return total > 0 && selectedCount === total;
   }
 
-  function isChangeFileGroupPartiallySelected(files: ChangedFile[]) {
-    return files.some((file) => changes.selectedPaths.includes(file.path)) && !isChangeFileGroupSelected(files);
+  function isChangeFileGroupPartiallySelected(collection: ChangeFileCollection) {
+    const selected = selectedChangePathSet.value;
+    let total = 0;
+    let selectedCount = 0;
+    eachChangeFile(collection, (file) => {
+      total += 1;
+      if (selected.has(file.path)) selectedCount += 1;
+    });
+    return selectedCount > 0 && selectedCount < total;
   }
 
-  function toggleChangeFileGroupSelection(files: ChangedFile[]) {
-    const groupPaths = files.map((file) => file.path);
+  function toggleChangeFileGroupSelection(collection: ChangeFileCollection) {
+    const groupPaths = collectChangeFilePaths(collection);
     const groupPathSet = new Set(groupPaths);
 
-    if (isChangeFileGroupSelected(files)) {
+    if (isChangeFileGroupSelected(collection)) {
       changes.selectedPaths = changes.selectedPaths.filter((path) => !groupPathSet.has(path));
       return;
     }
@@ -5411,6 +5690,7 @@ export function useGitboxApp() {
       changes.selectedSide = "unstaged";
       settings.setSide("unstaged");
     }
+    scrollChangeFilePathIntoView(path, "unstaged");
     workbenchMode.value = "changes";
     await operations.loadConflict(path);
   }
@@ -6135,6 +6415,7 @@ export function useGitboxApp() {
     mergeIncomingGutter,
     commitMessageTextarea,
     projectEditorTextarea,
+    changeFileListScroller,
     changeDiffScroller,
     logDiffScroller,
     activeChangeDiffHunkIndex,
@@ -6150,6 +6431,9 @@ export function useGitboxApp() {
     submitConfirmDialog,
     activeResizePanel,
     changeFileGroups,
+    visibleChangeFileRows,
+    changeFileVirtualSpacerStyle,
+    visibleChangeFileListStyle,
     counts,
     branch,
     brandSubtitle,
@@ -6256,6 +6540,7 @@ export function useGitboxApp() {
     switchRepository,
     removeRepository,
     refreshAll,
+    refreshChangesOnly,
     loadAdvancedSnapshots,
     runRemoteAction,
     resetCommitMessageHistoryCursor,
@@ -6358,9 +6643,9 @@ export function useGitboxApp() {
     projectTabClass,
     branchNameLabel,
     formatStatusKind,
+    syncChangeFileListViewport,
     isChangeFileGroupExpanded,
     changeConflictGroupKey,
-    changeFileGroupFiles,
     changeFileGroupCount,
     toggleChangeFileGroup,
     isChangeFileGroupSelected,
