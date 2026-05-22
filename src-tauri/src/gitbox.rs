@@ -1871,10 +1871,14 @@ pub fn push_with_options_core(
     let head = repo.head()?;
     let branch = head
         .shorthand()
-        .ok_or_else(|| GitboxError::Message("当前 HEAD 不是本地分支，不能推送".to_string()))?;
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 不是本地分支，不能推送".to_string()))?
+        .to_string();
+    let head_oid = head
+        .target()
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 无法推送".to_string()))?;
     let target = target_branch
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| branch.to_string());
+        .unwrap_or_else(|| branch.clone());
     ensure_no_pending_operation_for_action(path, "推送")?;
     ensure_outgoing_diff_has_no_conflict_markers(&repo, &workdir, &name, &target)?;
 
@@ -1891,12 +1895,28 @@ pub fn push_with_options_core(
     args.push(name.clone());
     args.push(format!("refs/heads/{branch}:refs/heads/{target}"));
     let output = run_git(&workdir, args, None)?;
+    update_remote_tracking_ref_after_push(&repo, &name, &target, head_oid)?;
 
     Ok(CommandResult {
         ok: true,
         message: format!("已推送到 {name}/{target}"),
         output,
     })
+}
+
+fn update_remote_tracking_ref_after_push(
+    repo: &Repository,
+    remote: &str,
+    target_branch: &str,
+    oid: Oid,
+) -> Result<(), GitboxError> {
+    repo.reference(
+        &format!("refs/remotes/{remote}/{target_branch}"),
+        oid,
+        true,
+        "GitBox: update remote-tracking ref after successful push",
+    )?;
+    Ok(())
 }
 
 pub fn add_remote_core(
@@ -3006,6 +3026,10 @@ pub fn push_commit_core(
                 .and_then(|head| head.shorthand().map(ToOwned::to_owned))
         })
         .ok_or_else(|| GitboxError::Message("请输入目标分支".to_string()))?;
+    let pushed_oid = repo
+        .revparse_single(&oid)?
+        .peel_to_commit()
+        .map(|commit| commit.id())?;
     let output = run_git(
         &workdir,
         vec![
@@ -3015,6 +3039,7 @@ pub fn push_commit_core(
         ],
         None,
     )?;
+    update_remote_tracking_ref_after_push(&repo, &remote, &target, pushed_oid)?;
     Ok(CommandResult {
         ok: true,
         message: format!("已将 {} 推送到 {remote}/{target}", short_ref(&oid)),
@@ -6616,6 +6641,60 @@ mod tests {
             .find_reference(&format!("refs/heads/{branch}"))
             .is_ok());
         assert!(remote_repo.find_reference("refs/tags/v1.0").is_ok());
+    }
+
+    #[test]
+    fn push_with_options_refreshes_remote_tracking_ref() {
+        let (dir, _repo) = test_repo();
+        initial_commit(dir.path());
+        let remote_dir = tempfile::tempdir().expect("remote tempdir");
+        Repository::init_bare(remote_dir.path()).expect("init bare remote");
+        let remote_url = remote_dir.path().to_string_lossy().to_string();
+        let path = dir.path().to_str().unwrap();
+        let branch = branch_summary_core(path, false)
+            .expect("summary")
+            .current_branch
+            .expect("current branch");
+
+        add_remote_core(path, "origin".to_string(), remote_url).expect("add local remote");
+        push_with_options_core(
+            path,
+            Some("origin".to_string()),
+            Some(branch.clone()),
+            true,
+            false,
+            false,
+        )
+        .expect("push initial");
+
+        write_file(dir.path(), "unpushed.txt", "local ahead\n");
+        stage_paths_core(path, vec!["unpushed.txt".to_string()]).expect("stage");
+        commit_core(path, "local ahead".to_string()).expect("commit");
+        let before_push = branch_summary_core(path, false).expect("summary before push");
+        assert_eq!(before_push.ahead, 1);
+
+        push_with_options_core(
+            path,
+            Some("origin".to_string()),
+            Some(branch.clone()),
+            false,
+            false,
+            false,
+        )
+        .expect("push");
+
+        let after_push = branch_summary_core(path, false).expect("summary after push");
+        assert_eq!(after_push.ahead, 0);
+        assert_eq!(after_push.behind, 0);
+
+        let repo = Repository::discover(dir.path()).expect("repo");
+        let head_oid = repo.head().expect("head").target().expect("head oid");
+        let remote_oid = repo
+            .find_reference(&format!("refs/remotes/origin/{branch}"))
+            .expect("remote tracking ref")
+            .target()
+            .expect("remote tracking oid");
+        assert_eq!(remote_oid, head_oid);
     }
 
     #[test]

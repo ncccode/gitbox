@@ -116,6 +116,11 @@ const {
   commitBusy,
   commitButtonLabel,
   commitPushButtonLabel,
+  unpushedCommitCount,
+  hasUnpushedCommits,
+  unpushedCommitTargetLabel,
+  canPushCurrentBranch,
+  pushCurrentBranchButtonLabel,
   submitConfirmTitle,
   submitConfirmActionLabel,
   submitConfirmTargetLabel,
@@ -934,6 +939,32 @@ const {
             class="commit-author"
             placeholder="覆盖作者：姓名 <email@example.com>"
           />
+          <div v-if="hasUnpushedCommits" class="commit-push-banner">
+            <div class="commit-push-banner-copy">
+              <ArrowUp :size="14" />
+              <div>
+                <strong>待推送 {{ unpushedCommitCount }} 个提交</strong>
+                <small>{{ unpushedCommitTargetLabel }}</small>
+              </div>
+            </div>
+            <button
+              class="icon-button commit-push-only-button"
+              :class="actionButtonClass(remoteActionKey('push'))"
+              type="button"
+              title="推送当前分支"
+              :disabled="!canPushCurrentBranch"
+              :aria-busy="isUiActionActive(remoteActionKey('push'))"
+              @pointerdown="runRemoteActionFromPointer($event, 'push')"
+              @click="runRemoteAction('push')"
+            >
+              <component
+                :is="actionIcon(remoteActionKey('push'), ArrowUp)"
+                :class="actionIconClass(remoteActionKey('push'))"
+                :size="14"
+              />
+              <span>{{ pushCurrentBranchButtonLabel }}</span>
+            </button>
+          </div>
           <div class="commit-actions">
             <button
               class="commit-button"

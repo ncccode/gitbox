@@ -14,6 +14,10 @@ import type { CommandResult } from "../types/gitbox";
 
 type RemoteAction = "fetch" | "pull" | "push";
 type ActiveRemoteAction = RemoteAction | "fetchAll" | "save" | "delete" | null;
+type RemoteRunOptions = {
+  smartMerge?: boolean;
+  targetBranch?: string;
+};
 
 function wildcardToRegExp(pattern: string) {
   const escaped = pattern
@@ -60,7 +64,7 @@ export const useRemoteStore = defineStore("remote", {
   actions: {
     async run(
       action: RemoteAction,
-      options: { smartMerge?: boolean } = {},
+      options: RemoteRunOptions = {},
     ): Promise<CommandResult | undefined> {
       const repos = useRepositoriesStore();
       const changes = useChangesStore();
@@ -73,8 +77,9 @@ export const useRemoteStore = defineStore("remote", {
         this.lastPushRejected = false;
       }
       try {
+        const pushTargetBranch = options.targetBranch?.trim() || this.targetBranch;
         if (action === "push") {
-          this.assertPushAllowed();
+          this.assertPushAllowed(pushTargetBranch);
         }
         const remoteName = this.selectedRemote || undefined;
         const result =
@@ -83,7 +88,7 @@ export const useRemoteStore = defineStore("remote", {
             : action === "pull"
               ? await pullRemote(repos.path, remoteName, { smartMerge: options.smartMerge })
               : await pushRemote(repos.path, remoteName, {
-                  targetBranch: this.targetBranch,
+                  targetBranch: pushTargetBranch,
                   setUpstream: this.setUpstream,
                   forceWithLease: this.forceWithLease,
                   pushTags: this.pushTags,
@@ -97,7 +102,7 @@ export const useRemoteStore = defineStore("remote", {
         this.error = String(error);
         if (action === "push" && looksLikeRejectedPush(this.error)) {
           this.lastPushRejected = true;
-          this.lastRejectedTarget = this.pushTargetRef();
+          this.lastRejectedTarget = this.pushTargetRef(options.targetBranch);
         }
         throw error;
       } finally {
@@ -166,9 +171,9 @@ export const useRemoteStore = defineStore("remote", {
         this.loading = false;
       }
     },
-    pushTargetRef() {
+    pushTargetRef(targetBranch?: string) {
       const repos = useRepositoriesStore();
-      return this.targetBranch.trim() || repos.current?.branch || "";
+      return targetBranch?.trim() || this.targetBranch.trim() || repos.current?.branch || "";
     },
     protectedPatterns() {
       return this.protectedBranchPatterns
@@ -176,14 +181,14 @@ export const useRemoteStore = defineStore("remote", {
         .map((pattern) => pattern.trim())
         .filter(Boolean);
     },
-    isProtectedTarget() {
-      const target = this.pushTargetRef();
+    isProtectedTarget(targetBranch?: string) {
+      const target = this.pushTargetRef(targetBranch);
       if (!target || !this.protectBranches) return false;
       return this.protectedPatterns().some((pattern) => wildcardToRegExp(pattern).test(target));
     },
-    assertPushAllowed() {
-      if (!this.isProtectedTarget() || this.allowProtectedPush) return;
-      const target = this.pushTargetRef();
+    assertPushAllowed(targetBranch?: string) {
+      if (!this.isProtectedTarget(targetBranch) || this.allowProtectedPush) return;
+      const target = this.pushTargetRef(targetBranch);
       throw new Error(`受保护分支 ${target} 禁止直接推送，请勾选“允许保护分支推送”后再执行`);
     },
     syncDraftFromSelected() {

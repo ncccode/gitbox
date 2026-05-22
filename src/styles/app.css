@@ -3820,6 +3820,59 @@ button[aria-busy="true"]:disabled {
   font-size: 12px;
 }
 
+.commit-push-banner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #cddbe8;
+  border-radius: 7px;
+  background: #f4f9ff;
+}
+
+.commit-push-banner-copy {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.commit-push-banner-copy svg {
+  flex: 0 0 auto;
+  color: #3f6ea5;
+}
+
+.commit-push-banner-copy div {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.commit-push-banner-copy strong,
+.commit-push-banner-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commit-push-banner-copy strong {
+  color: #25312b;
+  font-size: 12px;
+}
+
+.commit-push-banner-copy small {
+  color: #65756c;
+  font-size: 11px;
+}
+
+.commit-push-only-button {
+  min-width: 70px;
+  height: 30px;
+  padding: 0 10px;
+}
+
 .commit-actions {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -4900,6 +4953,23 @@ html[data-theme="dark"] .commit-button.secondary {
   border-color: #4e6687;
   color: #c8dcff;
   background: #253246;
+}
+
+html[data-theme="dark"] .commit-push-banner {
+  border-color: #4e6687;
+  background: #202b3a;
+}
+
+html[data-theme="dark"] .commit-push-banner-copy svg {
+  color: #8cbcff;
+}
+
+html[data-theme="dark"] .commit-push-banner-copy strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .commit-push-banner-copy small {
+  color: #a9b7c6;
 }
 
 html[data-theme="dark"] .commit-button.loading:disabled {

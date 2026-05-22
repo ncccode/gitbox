@@ -15,13 +15,20 @@ export const useCommitStore = defineStore("commit", {
     lastCommit: "",
   }),
   actions: {
-    async commit(remoteName?: string, includeWorktree = false, selectedPaths: string[] = []) {
+    async commit(
+      remoteName?: string,
+      includeWorktree = false,
+      selectedPaths: string[] = [],
+      targetBranch?: string,
+    ) {
       const repos = useRepositoriesStore();
       const changes = useChangesStore();
       if (!repos.path || !this.message.trim()) return;
 
       this.loading = true;
       this.error = "";
+      let committed = false;
+      let commitNotice = "";
       try {
         const result = await commitRepo(repos.path, this.message, {
           amend: this.amend,
@@ -33,9 +40,10 @@ export const useCommitStore = defineStore("commit", {
         });
         this.lastCommit = result.oid.slice(0, 12);
         this.message = "";
-        const commitNotice = this.amend ? `已 amend ${this.lastCommit}` : `已提交 ${this.lastCommit}`;
+        committed = true;
+        commitNotice = this.amend ? `已 amend ${this.lastCommit}` : `已提交 ${this.lastCommit}`;
         if (remoteName) {
-          const pushResult = await pushRemote(repos.path, remoteName);
+          const pushResult = await pushRemote(repos.path, remoteName, { targetBranch });
           changes.notice = `${commitNotice}，${pushResult.message}`;
         } else {
           changes.notice = commitNotice;
@@ -43,6 +51,10 @@ export const useCommitStore = defineStore("commit", {
         await changes.refresh();
       } catch (error) {
         this.error = String(error);
+        if (committed) {
+          changes.notice = remoteName ? `${commitNotice}，推送未完成` : commitNotice;
+          await changes.refresh().catch(() => undefined);
+        }
         throw error;
       } finally {
         this.loading = false;

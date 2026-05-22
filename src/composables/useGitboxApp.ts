@@ -618,6 +618,29 @@ export function useGitboxApp() {
   const commitPushButtonLabel = computed(() =>
     pendingCommitAction.value === "push" ? "提交并推送中" : "提交并推送",
   );
+  const currentPushTargetBranch = computed(() => currentPushTargetBranchName());
+  const unpushedCommitCount = computed(() => branch.value?.ahead ?? 0);
+  const hasUnpushedCommits = computed(() => unpushedCommitCount.value > 0);
+  const unpushedCommitTargetLabel = computed(() => {
+    const localBranch = currentCommitBranchLabel();
+    const remoteName = remote.selectedRemote || "origin";
+    const targetBranch = currentPushTargetBranch.value;
+    return targetBranch ? `${localBranch} -> ${remoteName}/${targetBranch}` : remoteName;
+  });
+  const canPushCurrentBranch = computed(() =>
+    Boolean(
+      hasUnpushedCommits.value &&
+        repos.current &&
+        remote.selectedRemote &&
+        currentPushTargetBranch.value &&
+        !branch.value?.detached &&
+        !remote.loading &&
+        !commit.loading,
+    ),
+  );
+  const pushCurrentBranchButtonLabel = computed(() =>
+    isUiActionActive(remoteActionKey("push")) ? "推送中" : "推送",
+  );
   const commitMessageHistoryItems = computed(() => {
     const seen = new Set<string>();
     return advanced.commitMessages
@@ -2071,7 +2094,10 @@ export function useGitboxApp() {
     syncSelectedRemote();
   }
 
-  async function executeRemoteAction(action: "fetch" | "pull" | "push", options: { smartMerge?: boolean } = {}) {
+  async function executeRemoteAction(
+    action: "fetch" | "pull" | "push",
+    options: { smartMerge?: boolean; targetBranch?: string } = {},
+  ) {
     const result = await remote.run(action, options);
     await refreshAfterRemoteAction();
     if (action === "pull" && result && !result.ok) {
@@ -2831,6 +2857,16 @@ export function useGitboxApp() {
     return branch.value?.currentBranch || repos.current?.branch || "游离 HEAD";
   }
 
+  function currentPushTargetBranchName(remoteName = remote.selectedRemote || "origin") {
+    const upstream = branch.value?.upstream;
+    const prefix = `${remoteName}/`;
+    if (upstream?.startsWith(prefix)) {
+      return upstream.slice(prefix.length);
+    }
+    const currentBranch = currentCommitBranchLabel();
+    return currentBranch === "游离 HEAD" ? "" : currentBranch;
+  }
+
   function selectedCommitOptionLabels() {
     const options: string[] = [];
     if (commit.amend) options.push("修正上次提交");
@@ -2840,13 +2876,13 @@ export function useGitboxApp() {
     return options;
   }
 
-  function selectedPushOptionLabels() {
+  function selectedPushOptionLabels(targetBranch = currentPushTargetBranchName()) {
     const options: string[] = [];
     if (remote.setUpstream) options.push("设置上游");
     if (remote.forceWithLease) options.push("安全强推");
     if (remote.pushTags) options.push("同步标签");
-    if (remote.isProtectedTarget()) {
-      options.push(remote.allowProtectedPush ? "允许保护分支推送" : "保护分支检查");
+    if (remote.isProtectedTarget(targetBranch)) {
+      options.push(remote.allowProtectedPush ? "允许保护分支推送" : "确认后推送受保护分支");
     }
     return options;
   }
@@ -2940,8 +2976,10 @@ export function useGitboxApp() {
       message: commit.message.trim(),
       remoteName: pushAfter ? remote.selectedRemote : "",
       currentBranch: currentCommitBranchLabel(),
-      targetBranch: pushAfter ? currentCommitBranchLabel() : "",
-      options: selectedCommitOptionLabels(),
+      targetBranch: pushAfter ? currentPushTargetBranch.value : "",
+      options: pushAfter
+        ? [...selectedCommitOptionLabels(), ...selectedPushOptionLabels(currentPushTargetBranch.value)]
+        : selectedCommitOptionLabels(),
       loading: false,
     };
     expandedSubmitConfirmDirectories.value = {};
@@ -2955,8 +2993,8 @@ export function useGitboxApp() {
       message: "",
       remoteName: remote.selectedRemote || "origin",
       currentBranch: currentCommitBranchLabel(),
-      targetBranch: remote.pushTargetRef(),
-      options: selectedPushOptionLabels(),
+      targetBranch: currentPushTargetBranch.value,
+      options: selectedPushOptionLabels(currentPushTargetBranch.value),
       loading: false,
     };
     expandedSubmitConfirmDirectories.value = {};
@@ -2969,12 +3007,29 @@ export function useGitboxApp() {
     dialog.loading = true;
     try {
       if (dialog.mode === "push") {
-        await runUiAction(remoteActionKey("push"), async () => {
-          await executeRemoteAction("push");
-        });
+        const restoreAllowProtectedPush = remote.allowProtectedPush;
+        const allowConfirmedProtectedPush =
+          remote.isProtectedTarget(dialog.targetBranch) && !remote.allowProtectedPush;
+        if (allowConfirmedProtectedPush) {
+          remote.allowProtectedPush = true;
+        }
+        try {
+          await runUiAction(remoteActionKey("push"), async () => {
+            await executeRemoteAction("push", { targetBranch: dialog.targetBranch });
+          });
+        } finally {
+          if (allowConfirmedProtectedPush) {
+            remote.allowProtectedPush = restoreAllowProtectedPush;
+          }
+        }
       } else {
         pendingCommitAction.value = dialog.mode === "commit-push" ? "push" : "commit";
-        await commit.commit(dialog.mode === "commit-push" ? dialog.remoteName || undefined : undefined, false, dialog.paths);
+        await commit.commit(
+          dialog.mode === "commit-push" ? dialog.remoteName || undefined : undefined,
+          false,
+          dialog.paths,
+          dialog.mode === "commit-push" ? dialog.targetBranch : undefined,
+        );
         rememberCommitMessage(dialog.message);
         resetCommitMessageHistoryCursor();
         await refreshRepositoryMetadata();
@@ -6454,6 +6509,11 @@ export function useGitboxApp() {
     commitBusy,
     commitButtonLabel,
     commitPushButtonLabel,
+    unpushedCommitCount,
+    hasUnpushedCommits,
+    unpushedCommitTargetLabel,
+    canPushCurrentBranch,
+    pushCurrentBranchButtonLabel,
     submitConfirmTitle,
     submitConfirmActionLabel,
     submitConfirmTargetLabel,
