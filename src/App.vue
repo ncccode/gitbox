@@ -32,6 +32,7 @@ import {
   X,
 } from "@lucide/vue";
 import AppTopbar from "./components/AppTopbar.vue";
+import DiffViewer from "./components/DiffViewer.vue";
 import VcsIcon from "./components/icons/VcsIcon.vue";
 import ProjectPane from "./components/ProjectPane.vue";
 import WorkbenchRail from "./components/WorkbenchRail.vue";
@@ -1929,68 +1930,18 @@ const {
           <div v-if="diff.loading" class="diff-empty">加载中</div>
           <div v-else-if="!activeChangeDiffHasContent" class="diff-empty">没有差异</div>
           <div v-else-if="activeChangeSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
-          <div
+          <DiffViewer
             v-else
             v-memo="[diff.current?.text, activeChangeDiffHunkIndex, settings.selectedSide, changes.selectedFile]"
-            class="side-by-side-diff"
-          >
-            <div class="side-by-side-file-header">
-              <div class="side-by-side-title">
-                <strong>{{ changeDiffLeftLabel }}</strong>
-                <span>{{ changeDiffLeftDetail }}</span>
-              </div>
-              <div class="side-by-side-title">
-                <strong>{{ changeDiffRightLabel }}</strong>
-                <span>{{ changeDiffRightDetail }}</span>
-              </div>
-            </div>
-            <div class="side-by-side-editors">
-              <div class="side-by-side-column old" @scroll="syncSideBySideEditorScroll">
-                <div class="side-by-side-column-lines">
-                  <div
-                    v-for="row in activeChangeSideBySideDiffRows"
-                    :key="`change-old-${row.id}`"
-                    class="side-by-side-line"
-                    :class="[
-                      row.type,
-                      { active: row.hunkIndex !== null && row.hunkIndex === activeChangeDiffHunkIndex },
-                    ]"
-                    :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
-                  >
-                    <div class="diff-cell old" :class="row.old.type">
-                      <span class="line-number">{{ row.old.lineNumber ?? "" }}</span>
-                      <span class="line-content"><template
-                        v-for="(token, tokenIndex) in row.old.tokens"
-                        :key="tokenIndex"
-                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div class="side-by-side-column new" @scroll="syncSideBySideEditorScroll">
-                <div class="side-by-side-column-lines">
-                  <div
-                    v-for="row in activeChangeSideBySideDiffRows"
-                    :key="`change-new-${row.id}`"
-                    class="side-by-side-line"
-                    :class="[
-                      row.type,
-                      { active: row.hunkIndex !== null && row.hunkIndex === activeChangeDiffHunkIndex },
-                    ]"
-                    :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
-                  >
-                    <div class="diff-cell new" :class="row.new.type">
-                      <span class="line-number">{{ row.new.lineNumber ?? "" }}</span>
-                      <span class="line-content"><template
-                        v-for="(token, tokenIndex) in row.new.tokens"
-                        :key="tokenIndex"
-                      ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
+            row-key-prefix="change"
+            :rows="activeChangeSideBySideDiffRows"
+            :active-hunk-index="activeChangeDiffHunkIndex"
+            :left-label="changeDiffLeftLabel"
+            :left-detail="changeDiffLeftDetail"
+            :right-label="changeDiffRightLabel"
+            :right-detail="changeDiffRightDetail"
+            @scroll="syncSideBySideEditorScroll"
+          />
         </div>
         </template>
 
@@ -2274,62 +2225,18 @@ const {
               <div v-else-if="activeLogDiffTab?.error" class="diff-empty">{{ activeLogDiffTab?.error }}</div>
               <div v-else-if="!activeLogDiffHasContent" class="diff-empty">没有差异</div>
               <div v-else-if="activeLogSideBySideDiffRows.length === 0" class="diff-empty">无法以文本方式显示此差异</div>
-                <div
-                  v-else
-                  v-memo="[activeLogDiffTab?.id, activeLogDiffTab?.diff?.text, activeLogDiffHunkIndex]"
-                  class="side-by-side-diff"
-                >
-                <div class="side-by-side-file-header">
-                  <div class="side-by-side-title">
-                    <strong>提交</strong>
-                    <span>{{ activeLogDiffTab?.shortOid }}</span>
-                  </div>
-                  <div class="side-by-side-title">
-                    <strong>来源</strong>
-                    <span>{{ activeLogDiffTab?.subtitle }}</span>
-                  </div>
-                </div>
-                <div class="side-by-side-editors">
-                  <div class="side-by-side-column old" @scroll="syncSideBySideEditorScroll">
-                    <div class="side-by-side-column-lines">
-                      <div
-                        v-for="row in activeLogSideBySideDiffRows"
-                        :key="`old-${row.id}`"
-                        class="side-by-side-line"
-                        :class="[row.type, { active: row.hunkIndex === activeLogDiffHunkIndex }]"
-                        :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
-                      >
-                        <div class="diff-cell old" :class="row.old.type">
-                          <span class="line-number">{{ row.old.lineNumber ?? "" }}</span>
-                          <span class="line-content"><template
-                            v-for="(token, tokenIndex) in row.old.tokens"
-                            :key="tokenIndex"
-                          ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                  <div class="side-by-side-column new" @scroll="syncSideBySideEditorScroll">
-                    <div class="side-by-side-column-lines">
-                      <div
-                        v-for="row in activeLogSideBySideDiffRows"
-                        :key="`new-${row.id}`"
-                        class="side-by-side-line"
-                        :class="[row.type, { active: row.hunkIndex === activeLogDiffHunkIndex }]"
-                        :data-hunk-anchor="row.anchorHunkIndex ?? undefined"
-                      >
-                        <div class="diff-cell new" :class="row.new.type">
-                          <span class="line-number">{{ row.new.lineNumber ?? "" }}</span>
-                          <span class="line-content"><template
-                            v-for="(token, tokenIndex) in row.new.tokens"
-                            :key="tokenIndex"
-                          ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
+              <DiffViewer
+                v-else
+                v-memo="[activeLogDiffTab?.id, activeLogDiffTab?.diff?.text, activeLogDiffHunkIndex]"
+                row-key-prefix="log"
+                :rows="activeLogSideBySideDiffRows"
+                :active-hunk-index="activeLogDiffHunkIndex"
+                left-label="提交"
+                :left-detail="activeLogDiffTab?.shortOid"
+                right-label="来源"
+                :right-detail="activeLogDiffTab?.subtitle"
+                @scroll="syncSideBySideEditorScroll"
+              />
             </div>
           </section>
         </div>
@@ -2741,7 +2648,6 @@ const {
     >
       <button @click="showCommitFileDiff(logFileContextMenu.row)">
         <span>显示差异</span>
-        <small>⌘D</small>
       </button>
       <button @click="showCommitFileDiff(logFileContextMenu.row)">
         <span>在新标签页中显示差异</span>
@@ -2756,7 +2662,6 @@ const {
       <div class="context-menu-separator" />
       <button disabled>
         <span>编辑来源</span>
-        <small>⌘↓</small>
       </button>
       <button disabled>
         <span>开启储存库版本</span>
@@ -2776,13 +2681,13 @@ const {
       </button>
       <div class="context-menu-separator" />
       <button @click="createPatchFromLogFile(logFileContextMenu.row)">
-        <span>建立修补程式...</span>
+        <span>创建补丁...</span>
       </button>
       <button @click="cherryPickLogFile(logFileContextMenu.row)">
-        <span>从修订版本获取</span>
+        <span>从此修订版本获取</span>
       </button>
       <button @click="showLogFileHistory(logFileContextMenu.row)">
-        <span>截至此处的历程记录</span>
+        <span>查看截至此处的历史记录</span>
       </button>
       <button @click="showCommitFileDiff(logFileContextMenu.row)">
         <span>显示对父项的变更</span>
