@@ -361,11 +361,25 @@ export function useGitboxApp() {
     options: string[];
     loading: boolean;
   };
+  type LogViewMode = "list" | "dag";
+  type CommandPaletteItem = {
+    id: string;
+    section: string;
+    title: string;
+    subtitle: string;
+    disabled?: boolean;
+    run: () => void | Promise<void>;
+  };
 
   const workbenchMode = ref<WorkbenchMode>("changes");
+  const logViewMode = ref<LogViewMode>("list");
   const LOG_TAB_ID = "log-root";
   const activeLogTabId = ref(LOG_TAB_ID);
   const logDiffTabs = ref<LogDiffTab[]>([]);
+  const commandPaletteOpen = ref(false);
+  const commandPaletteQuery = ref("");
+  const commandPaletteSelectionIndex = ref(0);
+  const commandPaletteInput = ref<HTMLInputElement | null>(null);
   const noticeToast = ref<NoticeToast | null>(null);
   const errorDialog = ref<ErrorDialog | null>(null);
   const pullConfirmDialog = ref<PullConfirmDialog | null>(null);
@@ -578,6 +592,89 @@ export function useGitboxApp() {
       branches.notice ||
       changes.notice ||
       remote.notice,
+  );
+  const commandPaletteItems = computed<CommandPaletteItem[]>(() => {
+    const items: CommandPaletteItem[] = [];
+    for (const project of repos.quickSwitchItems) {
+      items.push({
+        id: `repo:${project.path}`,
+        section: project.pinned ? "固定仓库" : "最近仓库",
+        title: repos.projectName(project.path),
+        subtitle: project.path,
+        run: () => switchRepository(project.path),
+      });
+    }
+
+    items.push(
+      {
+        id: "action:add-project",
+        section: "操作",
+        title: "添加项目",
+        subtitle: "选择本地 Git 仓库",
+        run: chooseRepository,
+      },
+      {
+        id: "action:refresh",
+        section: "操作",
+        title: "刷新工作区",
+        subtitle: repos.current ? repos.name : "需要先打开仓库",
+        disabled: !repos.current,
+        run: refreshAll,
+      },
+      {
+        id: "mode:changes",
+        section: "视图",
+        title: "变更",
+        subtitle: "打开工作区与暂存区",
+        disabled: !repos.current,
+        run: () => {
+          workbenchMode.value = "changes";
+        },
+      },
+      {
+        id: "mode:log",
+        section: "视图",
+        title: "日志",
+        subtitle: "查看提交历史",
+        disabled: !repos.current,
+        run: () => {
+          workbenchMode.value = "log";
+        },
+      },
+      {
+        id: "mode:dag",
+        section: "视图",
+        title: "DAG 历史",
+        subtitle: "打开提交图谱视图",
+        disabled: !repos.current,
+        run: () => {
+          workbenchMode.value = "log";
+          logViewMode.value = "dag";
+        },
+      },
+      {
+        id: "mode:project",
+        section: "视图",
+        title: "项目文件",
+        subtitle: "浏览和编辑项目文件",
+        disabled: !repos.current,
+        run: () => {
+          workbenchMode.value = "project";
+        },
+      },
+    );
+    return items;
+  });
+  const visibleCommandPaletteItems = computed(() => {
+    const query = commandPaletteQuery.value.trim().toLocaleLowerCase();
+    const items = commandPaletteItems.value;
+    if (!query) return items;
+    return items.filter((item) =>
+      [item.section, item.title, item.subtitle].some((value) => value.toLocaleLowerCase().includes(query)),
+    );
+  });
+  const activeCommandPaletteItem = computed(
+    () => visibleCommandPaletteItems.value[commandPaletteSelectionIndex.value] ?? null,
   );
   const workspaceRefreshBusy = computed(
     () => changes.loading || branches.loading || history.loading || operations.loading || diff.loading,
@@ -1565,6 +1662,17 @@ export function useGitboxApp() {
     { flush: "post" },
   );
 
+  watch(
+    [commandPaletteQuery, visibleCommandPaletteItems],
+    () => {
+      commandPaletteSelectionIndex.value = Math.min(
+        Math.max(0, commandPaletteSelectionIndex.value),
+        Math.max(0, visibleCommandPaletteItems.value.length - 1),
+      );
+    },
+    { flush: "post" },
+  );
+
   watch(workbenchMode, (mode) => {
     if (mode === "project") {
       project.refresh().catch(() => undefined);
@@ -1577,6 +1685,7 @@ export function useGitboxApp() {
   onMounted(() => {
     window.addEventListener("mousedown", preventRightClickTextSelection, { capture: true });
     window.addEventListener("contextmenu", preventNativeContextMenu, { capture: true });
+    window.addEventListener("keydown", handleGlobalCommandPaletteKey);
     setupProjectDragDrop();
     if (typeof document !== "undefined") {
       autoFetchVisibilityHandler = handleAutoFetchVisibilityChange;
@@ -1605,6 +1714,7 @@ export function useGitboxApp() {
   onUnmounted(() => {
     window.removeEventListener("mousedown", preventRightClickTextSelection, { capture: true });
     window.removeEventListener("contextmenu", preventNativeContextMenu, { capture: true });
+    window.removeEventListener("keydown", handleGlobalCommandPaletteKey);
     projectDragDropDisposed = true;
     stopProjectDragDrop?.();
     stopSystemThemeWatch?.();
@@ -1624,6 +1734,41 @@ export function useGitboxApp() {
   function preventRightClickTextSelection(event: MouseEvent) {
     if (event.button !== 2 || isEditableTarget(event.target)) return;
     event.preventDefault();
+  }
+
+  function handleGlobalCommandPaletteKey(event: KeyboardEvent) {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if (event.key === "Escape" && commandPaletteOpen.value) {
+      event.preventDefault();
+      closeCommandPalette();
+    }
+  }
+
+  function openCommandPalette() {
+    commandPaletteQuery.value = "";
+    commandPaletteSelectionIndex.value = 0;
+    commandPaletteOpen.value = true;
+    nextTick(() => commandPaletteInput.value?.focus()).catch(() => undefined);
+  }
+
+  function closeCommandPalette() {
+    commandPaletteOpen.value = false;
+  }
+
+  function moveCommandPaletteSelection(direction: -1 | 1) {
+    const count = visibleCommandPaletteItems.value.length;
+    if (count === 0) return;
+    commandPaletteSelectionIndex.value = (commandPaletteSelectionIndex.value + direction + count) % count;
+  }
+
+  async function runCommandPaletteItem(item = activeCommandPaletteItem.value) {
+    if (!item || item.disabled) return;
+    closeCommandPalette();
+    await item.run();
   }
 
   function isEditableTarget(target: EventTarget | null) {
@@ -1877,6 +2022,10 @@ export function useGitboxApp() {
       await repos.select(path);
       await loadSelectedProject();
     });
+  }
+
+  function toggleRepositoryPinned(path: string) {
+    repos.togglePinned(path);
   }
 
   async function removeRepository(path: string) {
@@ -5961,9 +6110,16 @@ export function useGitboxApp() {
     activeLogDiffHunkIndex,
     expandedProjectHunkIndex,
     workbenchMode,
+    logViewMode,
     LOG_TAB_ID,
     activeLogTabId,
     logDiffTabs,
+    commandPaletteOpen,
+    commandPaletteQuery,
+    commandPaletteSelectionIndex,
+    commandPaletteInput,
+    visibleCommandPaletteItems,
+    activeCommandPaletteItem,
     noticeToast,
     errorDialog,
     pullConfirmDialog,
@@ -6087,7 +6243,12 @@ export function useGitboxApp() {
     chooseRepository,
     initSelectedProject,
     switchRepository,
+    toggleRepositoryPinned,
     removeRepository,
+    openCommandPalette,
+    closeCommandPalette,
+    moveCommandPaletteSelection,
+    runCommandPaletteItem,
     refreshAll,
     refreshChangesOnly,
     loadAdvancedSnapshots,

@@ -8,6 +8,8 @@ export interface ProjectItem {
   path: string;
   initialized: boolean;
   repository: RepositoryInfo | null;
+  pinned?: boolean;
+  lastOpenedAt?: number;
   error?: string;
 }
 
@@ -36,6 +38,7 @@ function projectFromRepository(repo: RepositoryInfo): ProjectItem {
     path: normalizedRepo.path,
     initialized: true,
     repository: normalizedRepo,
+    lastOpenedAt: Date.now(),
   };
 }
 
@@ -51,11 +54,14 @@ function normalizeProjectItem(value: unknown): ProjectItem | null {
 
   const repository = isRepositoryInfo(value.repository) ? value.repository : null;
   const error = typeof value.error === "string" ? value.error : undefined;
+  const lastOpenedAt = typeof value.lastOpenedAt === "number" ? value.lastOpenedAt : undefined;
   const normalizedRepo = repository ? normalizeRepositoryInfo(repository) : null;
   return {
     path: normalizedRepo?.path ?? path,
     initialized: Boolean(value.initialized) && Boolean(normalizedRepo),
     repository: normalizedRepo,
+    pinned: Boolean(value.pinned),
+    lastOpenedAt,
     error,
   };
 }
@@ -93,13 +99,30 @@ function normalizeRepositoryInfo(repo: RepositoryInfo): RepositoryInfo {
 }
 
 function mergeProjectItems(current: ProjectItem, incoming: ProjectItem) {
-  if (incoming.initialized) return incoming;
+  if (incoming.initialized) {
+    return {
+      ...incoming,
+      pinned: current.pinned || incoming.pinned,
+      lastOpenedAt: Math.max(current.lastOpenedAt ?? 0, incoming.lastOpenedAt ?? 0) || undefined,
+    };
+  }
   if (current.initialized) return current;
   return {
     ...current,
     ...incoming,
+    pinned: current.pinned || incoming.pinned,
+    lastOpenedAt: Math.max(current.lastOpenedAt ?? 0, incoming.lastOpenedAt ?? 0) || undefined,
     error: incoming.error ?? current.error,
   };
+}
+
+function sortQuickSwitchItems(items: ProjectItem[]) {
+  return [...items].sort((left, right) => {
+    if (Boolean(left.pinned) !== Boolean(right.pinned)) return left.pinned ? -1 : 1;
+    const recentDelta = (right.lastOpenedAt ?? 0) - (left.lastOpenedAt ?? 0);
+    if (recentDelta !== 0) return recentDelta;
+    return nameFromPath(left.path).localeCompare(nameFromPath(right.path));
+  });
 }
 
 function dedupeProjectItems(items: ProjectItem[]) {
@@ -180,6 +203,9 @@ export const useRepositoriesStore = defineStore("repositories", {
       state.items
         .map((item) => item.repository)
         .filter((repo): repo is RepositoryInfo => Boolean(repo)),
+    pinnedItems: (state) => sortQuickSwitchItems(state.items.filter((item) => item.pinned)),
+    recentItems: (state) => sortQuickSwitchItems(state.items),
+    quickSwitchItems: (state) => sortQuickSwitchItems(state.items),
     name: (state) => {
       const path = state.current?.path ?? state.activePath;
       if (!path) return "未打开仓库";
@@ -221,6 +247,7 @@ export const useRepositoriesStore = defineStore("repositories", {
               path,
               initialized: false,
               repository: null,
+              lastOpenedAt: Date.now(),
               error: String(error),
             });
             activePath = path;
@@ -253,6 +280,7 @@ export const useRepositoriesStore = defineStore("repositories", {
           path: projectPath,
           initialized: false,
           repository: null,
+          lastOpenedAt: Date.now(),
           error: String(error),
         });
         this.activePath = projectPath;
@@ -266,6 +294,7 @@ export const useRepositoriesStore = defineStore("repositories", {
       const project = findProjectItem(this.items, path);
       this.activePath = project?.path ?? normalizeProjectPath(path);
       this.current = project?.repository ?? null;
+      this.touch(this.activePath);
       this.persist();
     },
     setCurrent(repo: RepositoryInfo) {
@@ -274,6 +303,17 @@ export const useRepositoriesStore = defineStore("repositories", {
       this.activePath = project.path;
       this.upsert(project);
       this.persist();
+    },
+    togglePinned(path: string) {
+      const project = findProjectItem(this.items, path);
+      if (!project) return;
+      project.pinned = !project.pinned;
+      this.persist();
+    },
+    touch(path: string | null | undefined) {
+      const project = findProjectItem(this.items, path);
+      if (!project) return;
+      project.lastOpenedAt = Date.now();
     },
     remove(path: string) {
       const key = projectPathKey(path);

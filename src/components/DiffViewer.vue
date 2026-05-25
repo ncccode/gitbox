@@ -46,7 +46,10 @@ const emit = defineEmits<{
               <span class="line-content"><template
                 v-for="(token, tokenIndex) in row.old.tokens"
                 :key="tokenIndex"
-              ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+              ><span
+                v-if="token.kind || token.diff"
+                :class="[token.kind ? `syntax-${token.kind}` : '', token.diff ? 'word-diff-fragment' : '']"
+              >{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
             </div>
           </div>
         </div>
@@ -68,7 +71,10 @@ const emit = defineEmits<{
               <span class="line-content"><template
                 v-for="(token, tokenIndex) in row.new.tokens"
                 :key="tokenIndex"
-              ><span v-if="token.kind" :class="`syntax-${token.kind}`">{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
+              ><span
+                v-if="token.kind || token.diff"
+                :class="[token.kind ? `syntax-${token.kind}` : '', token.diff ? 'word-diff-fragment' : '']"
+              >{{ token.text }}</span><template v-else>{{ token.text }}</template></template></span>
             </div>
           </div>
         </div>

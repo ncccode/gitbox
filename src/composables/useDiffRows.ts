@@ -3,6 +3,7 @@ import type { DiffResponse } from "../types/gitbox";
 export type ProjectCodeToken = {
   text: string;
   kind?: "comment" | "string" | "keyword" | "number" | "function" | "property" | "operator";
+  diff?: boolean;
 };
 
 export type SideBySideDiffCell = {
@@ -22,6 +23,7 @@ export type SideBySideDiffRow = {
 };
 
 const PROJECT_TOKEN_CACHE_LIMIT = 6000;
+const MAX_DIFF_ROWS = 5000;
 const projectKeywordCache = new Map<string, Set<string>>();
 const projectLineTokenCache = new Map<string, ProjectCodeToken[]>();
 
@@ -45,6 +47,7 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
 
   const rows: SideBySideDiffRow[] = [];
   let rowIndex = 0;
+  let truncated = false;
   const anchoredHunks = new Set<number>();
   const hasCompleteText = hasCompleteDiffText(response);
   if (!response.text.trim() && !hasCompleteText) return [];
@@ -67,12 +70,31 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
     tokens: tokenizeProjectLine(content || " ", language),
   });
 
+  const pushTruncatedRow = () => {
+    if (truncated) return;
+    truncated = true;
+    rows.push({
+      id: `side-diff-${rowIndex}`,
+      type: "meta",
+      hunkIndex: null,
+      anchorHunkIndex: null,
+      old: emptyCell(),
+      new: diffCell(null, `差异过大，已截断前 ${MAX_DIFF_ROWS} 行显示。`, "meta"),
+    });
+    rowIndex += 1;
+  };
+
   const pushRow = (
     oldCell: SideBySideDiffCell,
     newCell: SideBySideDiffCell,
     type: SideBySideDiffRow["type"],
     hunkIndex: number | null,
   ) => {
+    if (rows.length >= MAX_DIFF_ROWS) {
+      pushTruncatedRow();
+      return;
+    }
+
     const anchorHunkIndex =
       hunkIndex !== null && type !== "context" && type !== "meta" && !anchoredHunks.has(hunkIndex)
         ? hunkIndex
@@ -100,12 +122,13 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
       const deleted = pendingDeletes[index];
       const added = pendingAdds[index];
       const rowType = deleted && added ? "modify" : deleted ? "delete" : "add";
-      pushRow(
-        deleted ? diffCell(deleted.lineNumber, deleted.content, "delete") : emptyCell(),
-        added ? diffCell(added.lineNumber, added.content, "add") : emptyCell(),
-        rowType,
-        hunkIndex,
-      );
+      const oldCell = deleted ? diffCell(deleted.lineNumber, deleted.content, "delete") : emptyCell();
+      const newCell = added ? diffCell(added.lineNumber, added.content, "add") : emptyCell();
+      if (deleted && added) {
+        applyWordDiff(oldCell, newCell, language);
+      }
+      pushRow(oldCell, newCell, rowType, hunkIndex);
+      if (truncated) break;
     }
     pendingDeletes.length = 0;
     pendingAdds.length = 0;
@@ -121,6 +144,7 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
     const flushChanges = () => pushChangeGroup(pendingDeletes, pendingAdds, hunkIndex);
 
     for (const line of patch.split("\n")) {
+      if (truncated) break;
       if (!line && !insideHunk) continue;
 
       if (line.startsWith("@@ ")) {
@@ -172,7 +196,7 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
     let newCursor = 1;
 
     const pushUnchangedGap = (oldEndExclusive: number, newEndExclusive: number) => {
-      while (oldCursor < oldEndExclusive || newCursor < newEndExclusive) {
+      while (!truncated && (oldCursor < oldEndExclusive || newCursor < newEndExclusive)) {
         if (oldCursor < oldEndExclusive && newCursor < newEndExclusive) {
           pushRow(
             diffCell(oldCursor, oldLines[oldCursor - 1] ?? "", "context"),
@@ -193,6 +217,7 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
     };
 
     for (const hunk of response.hunks) {
+      if (truncated) break;
       const oldStart = hunk.oldStart > 0 ? hunk.oldStart : oldCursor;
       const newStart = hunk.newStart > 0 ? hunk.newStart : newCursor;
       pushUnchangedGap(oldStart, newStart);
@@ -206,10 +231,125 @@ export function buildSideBySideDiffRows(response: DiffResponse | null, language:
   }
 
   for (const hunk of response.hunks) {
+    if (truncated) break;
     appendPatchHunk(hunk.patch, hunk.index, hunk.oldStart, hunk.newStart);
   }
 
   return rows;
+}
+
+function applyWordDiff(oldCell: SideBySideDiffCell, newCell: SideBySideDiffCell, language: string) {
+  const ranges = changedWordRanges(oldCell.content, newCell.content);
+  oldCell.tokens = tokenizeProjectLineWithDiff(oldCell.content || " ", language, ranges.oldRanges);
+  newCell.tokens = tokenizeProjectLineWithDiff(newCell.content || " ", language, ranges.newRanges);
+}
+
+function tokenizeProjectLineWithDiff(content: string, language: string, ranges: Array<[number, number]>) {
+  if (ranges.length === 0) return tokenizeProjectLine(content, language);
+  const tokens = tokenizeProjectLine(content, language);
+  const marked: ProjectCodeToken[] = [];
+  let cursor = 0;
+
+  for (const token of tokens) {
+    const start = cursor;
+    const end = start + token.text.length;
+    cursor = end;
+    const overlaps = ranges.filter(([rangeStart, rangeEnd]) => rangeStart < end && rangeEnd > start);
+    if (overlaps.length === 0) {
+      marked.push(token);
+      continue;
+    }
+
+    let tokenCursor = start;
+    for (const [rangeStart, rangeEnd] of overlaps) {
+      const beforeEnd = Math.max(tokenCursor, Math.min(end, rangeStart));
+      if (beforeEnd > tokenCursor) {
+        marked.push({ ...token, text: content.slice(tokenCursor, beforeEnd) });
+      }
+      const diffStart = Math.max(tokenCursor, rangeStart);
+      const diffEnd = Math.min(end, rangeEnd);
+      if (diffEnd > diffStart) {
+        marked.push({ ...token, text: content.slice(diffStart, diffEnd), diff: true });
+      }
+      tokenCursor = Math.max(tokenCursor, diffEnd);
+    }
+    if (tokenCursor < end) {
+      marked.push({ ...token, text: content.slice(tokenCursor, end) });
+    }
+  }
+
+  return marked.length ? marked : [{ text: " " }];
+}
+
+function changedWordRanges(left: string, right: string) {
+  const leftParts = splitWordsWithRanges(left);
+  const rightParts = splitWordsWithRanges(right);
+  const leftWords = leftParts.map((part) => part.text);
+  const rightWords = rightParts.map((part) => part.text);
+  const common = longestCommonSubsequence(leftWords, rightWords);
+  const leftCommon = new Set(common.map((pair) => pair[0]));
+  const rightCommon = new Set(common.map((pair) => pair[1]));
+
+  const oldRanges = leftParts
+    .filter((_part, index) => !leftCommon.has(index))
+    .map((part) => [part.start, part.end] as [number, number]);
+  const newRanges = rightParts
+    .filter((_part, index) => !rightCommon.has(index))
+    .map((part) => [part.start, part.end] as [number, number]);
+
+  return {
+    oldRanges: mergeRanges(oldRanges),
+    newRanges: mergeRanges(newRanges),
+  };
+}
+
+function splitWordsWithRanges(content: string) {
+  const parts: Array<{ text: string; start: number; end: number }> = [];
+  for (const match of content.matchAll(/\S+/g)) {
+    const text = match[0];
+    const start = match.index ?? 0;
+    parts.push({ text, start, end: start + text.length });
+  }
+  return parts.length ? parts : content ? [{ text: content, start: 0, end: content.length }] : [];
+}
+
+function longestCommonSubsequence(left: string[], right: string[]) {
+  if (left.length > 160 || right.length > 160) return [];
+  const matrix = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+  for (let i = left.length - 1; i >= 0; i -= 1) {
+    for (let j = right.length - 1; j >= 0; j -= 1) {
+      matrix[i][j] = left[i] === right[j] ? matrix[i + 1][j + 1] + 1 : Math.max(matrix[i + 1][j], matrix[i][j + 1]);
+    }
+  }
+
+  const pairs: Array<[number, number]> = [];
+  let i = 0;
+  let j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      pairs.push([i, j]);
+      i += 1;
+      j += 1;
+    } else if (matrix[i + 1][j] >= matrix[i][j + 1]) {
+      i += 1;
+    } else {
+      j += 1;
+    }
+  }
+  return pairs;
+}
+
+function mergeRanges(ranges: Array<[number, number]>) {
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of ranges) {
+    const previous = merged[merged.length - 1];
+    if (previous && start <= previous[1] + 1) {
+      previous[1] = Math.max(previous[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return merged;
 }
 
 export function hasDisplayableDiffContent(response: DiffResponse | null | undefined) {

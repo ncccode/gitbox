@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from "vue";
-import { FolderOpen, ListChecks, PanelLeftClose, PanelLeftOpen, Plus, X } from "@lucide/vue";
+import { FolderOpen, ListChecks, PanelLeftClose, PanelLeftOpen, Plus, Star, X } from "@lucide/vue";
 import { openProjectDirectory, openProjectTerminal } from "../lib/gitboxCommands";
 import { useRepositoriesStore } from "../stores/repositories";
 
@@ -12,6 +12,7 @@ const emit = defineEmits<{
   chooseRepository: [];
   removeRepository: [path: string];
   switchRepository: [path: string];
+  togglePinned: [path: string];
   toggleCollapsed: [];
 }>();
 
@@ -54,7 +55,7 @@ function projectAvatarStyle(path: string) {
 
 function openProjectContextMenu(path: string, event: MouseEvent) {
   const menuWidth = 260;
-  const menuHeight = 94;
+  const menuHeight = 128;
   projectContextMenu.value = {
     path,
     x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
@@ -144,10 +145,10 @@ onUnmounted(() => {
 
       <div v-if="repos.items.length" class="project-list">
         <div
-          v-for="project in repos.items"
+          v-for="project in repos.quickSwitchItems"
           :key="project.path"
           class="project-row"
-          :class="{ active: project.path === repos.selectedPath, uninitialized: !project.initialized }"
+          :class="{ active: project.path === repos.selectedPath, uninitialized: !project.initialized, pinned: project.pinned }"
           @contextmenu.prevent.stop="openProjectContextMenu(project.path, $event)"
         >
           <button
@@ -164,6 +165,16 @@ onUnmounted(() => {
               <strong>{{ repos.projectName(project.path) }}</strong>
               <small>{{ project.path }}</small>
             </span>
+          </button>
+          <button
+            v-if="!collapsed"
+            class="project-pin"
+            type="button"
+            :title="project.pinned ? '取消固定' : '固定项目'"
+            :aria-pressed="Boolean(project.pinned)"
+            @click="emit('togglePinned', project.path)"
+          >
+            <Star :size="13" :fill="project.pinned ? 'currentColor' : 'none'" />
           </button>
           <button
             v-if="!collapsed"
@@ -197,6 +208,9 @@ onUnmounted(() => {
         </button>
         <button type="button" @click="copyProjectPathFromContext(projectContextMenu.path)">
           <span>复制路径</span>
+        </button>
+        <button type="button" @click="emit('togglePinned', projectContextMenu.path); closeProjectContextMenu()">
+          <span>{{ repos.items.find((item) => item.path === projectContextMenu?.path)?.pinned ? "取消固定" : "固定项目" }}</span>
         </button>
       </div>
     </section>

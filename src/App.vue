@@ -70,6 +70,10 @@ const {
   addRemoteDialog,
   projectCloseDialog,
   projectDropActive,
+  commandPaletteOpen,
+  commandPaletteQuery,
+  commandPaletteSelectionIndex,
+  commandPaletteInput,
   mergeCurrentScroller,
   mergeCurrentGutter,
   mergeResultGutter,
@@ -85,9 +89,12 @@ const {
   activeLogDiffHunkIndex,
   expandedProjectHunkIndex,
   workbenchMode,
+  logViewMode,
   LOG_TAB_ID,
   activeLogTabId,
   logDiffTabs,
+  visibleCommandPaletteItems,
+  activeCommandPaletteItem,
   noticeToast,
   errorDialog,
   pullConfirmDialog,
@@ -207,7 +214,12 @@ const {
   chooseRepository,
   initSelectedProject,
   switchRepository,
+  toggleRepositoryPinned,
   removeRepository,
+  openCommandPalette,
+  closeCommandPalette,
+  moveCommandPaletteSelection,
+  runCommandPaletteItem,
   refreshAll,
   refreshChangesOnly,
   runRemoteAction,
@@ -425,6 +437,7 @@ const {
       :remote-branch="branch?.upstream"
       :ahead="branch?.ahead ?? 0"
       :behind="branch?.behind ?? 0"
+      @open-command-palette="openCommandPalette"
     />
 
     <Transition name="project-drop-overlay">
@@ -446,6 +459,39 @@ const {
         </button>
       </div>
     </Transition>
+
+    <div v-if="commandPaletteOpen" class="modal-backdrop command-palette-backdrop" @click.self="closeCommandPalette">
+      <section class="command-palette" role="dialog" aria-modal="true" aria-label="命令面板" @click.stop>
+        <label class="command-palette-search">
+          <Search :size="16" />
+          <input
+            ref="commandPaletteInput"
+            v-model="commandPaletteQuery"
+            placeholder="搜索命令或仓库"
+            @keydown.esc.prevent="closeCommandPalette"
+            @keydown.up.prevent="moveCommandPaletteSelection(-1)"
+            @keydown.down.prevent="moveCommandPaletteSelection(1)"
+            @keydown.enter.prevent="runCommandPaletteItem(activeCommandPaletteItem)"
+          />
+        </label>
+        <div class="command-palette-list">
+          <button
+            v-for="(item, index) in visibleCommandPaletteItems"
+            :key="item.id"
+            class="command-palette-item"
+            :class="{ active: index === commandPaletteSelectionIndex, disabled: item.disabled }"
+            :disabled="item.disabled"
+            @mouseenter="commandPaletteSelectionIndex = index"
+            @click="runCommandPaletteItem(item)"
+          >
+            <span>{{ item.section }}</span>
+            <strong>{{ item.title }}</strong>
+            <small>{{ item.subtitle }}</small>
+          </button>
+          <div v-if="visibleCommandPaletteItems.length === 0" class="command-palette-empty">没有匹配项</div>
+        </div>
+      </section>
+    </div>
 
     <div v-if="errorDialog" class="modal-backdrop" @click.self="dismissErrorDialog(errorDialog.id)">
       <section
@@ -698,6 +744,7 @@ const {
         @choose-repository="chooseRepository"
         @remove-repository="removeRepository"
         @switch-repository="switchRepository"
+        @toggle-pinned="toggleRepositoryPinned"
         @toggle-collapsed="settings.setProjectPaneCollapsed(!settings.projectPaneCollapsed)"
       />
 
@@ -2044,6 +2091,24 @@ const {
                   <X :size="12" />
                 </button>
               </span>
+              <div class="log-view-toggle" role="group" aria-label="历史视图">
+                <button
+                  class="icon-only-button"
+                  :class="{ active: logViewMode === 'list' }"
+                  title="列表视图"
+                  @click="logViewMode = 'list'"
+                >
+                  <ListChecks :size="14" />
+                </button>
+                <button
+                  class="icon-only-button"
+                  :class="{ active: logViewMode === 'dag' }"
+                  title="DAG 视图"
+                  @click="logViewMode = 'dag'"
+                >
+                  <GitCommitVertical :size="14" />
+                </button>
+              </div>
               <button
                 class="icon-only-button"
                 :class="actionButtonClass('history.refresh')"
@@ -2060,22 +2125,57 @@ const {
               </button>
             </div>
 
-            <div class="log-table-head">
-              <span />
-              <span>提交</span>
-              <span>作者</span>
-              <span>日期</span>
-            </div>
+            <template v-if="logViewMode === 'list'">
+              <div class="log-table-head">
+                <span />
+                <span>提交</span>
+                <span>作者</span>
+                <span>日期</span>
+              </div>
 
-            <div class="log-commit-list">
+              <div class="log-commit-list">
+                <button
+                  v-for="row in logGraphRows"
+                  :key="row.item.oid"
+                  class="log-commit-row"
+                  :class="{ active: history.selectedOid === row.item.oid }"
+                  @click="selectCommit(row.item.oid)"
+                >
+                  <span class="log-graph-cell" :class="{ merge: row.hasMerge }" :style="logGraphStyle(row)">
+                    <svg class="log-graph-svg" :viewBox="logGraphViewBox(row)" preserveAspectRatio="none" aria-hidden="true">
+                      <path
+                        v-for="path in row.paths"
+                        :key="path.key"
+                        class="log-graph-path"
+                        :d="path.d"
+                        :stroke="path.color"
+                      />
+                    </svg>
+                    <span class="log-graph-node" :style="logNodeStyle(row)" />
+                  </span>
+                  <span class="log-subject">
+                    <strong>{{ row.item.summary }}</strong>
+                    <span v-if="row.item.refs.length" class="commit-refs">
+                      <em v-for="refName in row.item.refs" :key="refName">{{ formatRefName(refName) }}</em>
+                    </span>
+                  </span>
+                  <span class="log-author">{{ row.item.authorName }}</span>
+                  <time class="log-date">{{ formatCompactCommitTime(row.item.authorTime) }}</time>
+                </button>
+                <div v-if="history.loading" class="diff-empty">加载中</div>
+                <div v-else-if="history.commits.length === 0" class="diff-empty">没有提交历史</div>
+              </div>
+            </template>
+
+            <div v-else class="log-dag-view">
               <button
                 v-for="row in logGraphRows"
-                :key="row.item.oid"
-                class="log-commit-row"
+                :key="`dag-${row.item.oid}`"
+                class="log-dag-row"
                 :class="{ active: history.selectedOid === row.item.oid }"
                 @click="selectCommit(row.item.oid)"
               >
-                <span class="log-graph-cell" :class="{ merge: row.hasMerge }" :style="logGraphStyle(row)">
+                <span class="log-graph-cell log-dag-graph" :class="{ merge: row.hasMerge }" :style="logGraphStyle(row)">
                   <svg class="log-graph-svg" :viewBox="logGraphViewBox(row)" preserveAspectRatio="none" aria-hidden="true">
                     <path
                       v-for="path in row.paths"
@@ -2087,14 +2187,19 @@ const {
                   </svg>
                   <span class="log-graph-node" :style="logNodeStyle(row)" />
                 </span>
-                <span class="log-subject">
-                  <strong>{{ row.item.summary }}</strong>
+                <span class="log-dag-card">
+                  <span class="log-dag-title">
+                    <strong>{{ row.item.summary }}</strong>
+                    <small>{{ row.item.shortOid }}</small>
+                  </span>
                   <span v-if="row.item.refs.length" class="commit-refs">
                     <em v-for="refName in row.item.refs" :key="refName">{{ formatRefName(refName) }}</em>
                   </span>
+                  <span class="log-dag-meta">
+                    {{ row.item.authorName }} · {{ formatCompactCommitTime(row.item.authorTime) }} ·
+                    {{ row.item.parents.length > 1 ? `${row.item.parents.length} 父提交` : row.item.parents.length === 1 ? "1 父提交" : "根提交" }}
+                  </span>
                 </span>
-                <span class="log-author">{{ row.item.authorName }}</span>
-                <time class="log-date">{{ formatCompactCommitTime(row.item.authorTime) }}</time>
               </button>
               <div v-if="history.loading" class="diff-empty">加载中</div>
               <div v-else-if="history.commits.length === 0" class="diff-empty">没有提交历史</div>

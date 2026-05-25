@@ -2,6 +2,7 @@
 import {
   Monitor,
   Moon,
+  Search,
   Sun,
 } from "@lucide/vue";
 import VcsIcon from "./icons/VcsIcon.vue";
@@ -15,6 +16,10 @@ defineProps<{
   remoteBranch?: string | null;
   ahead: number;
   behind: number;
+}>();
+
+const emit = defineEmits<{
+  openCommandPalette: [];
 }>();
 
 const settings = useSettingsStore();
@@ -44,6 +49,9 @@ const themeModes: Array<{ key: ThemeMode; label: string; title: string }> = [
     </div>
 
     <div class="toolbar">
+      <button class="command-open-button" type="button" title="命令面板" @click="emit('openCommandPalette')">
+        <Search :size="14" />
+      </button>
       <div class="theme-switch" role="group" aria-label="主题">
         <button
           v-for="mode in themeModes"
