@@ -1,5 +1,6 @@
 import { defineStore } from "pinia";
 import {
+  analyzeConflictFile,
   cherryPickCommit,
   cherryPickFiles,
   conflictDetails,
@@ -18,7 +19,7 @@ import {
   undoLastCommit,
 } from "../lib/gitboxCommands";
 import { useRepositoriesStore } from "./repositories";
-import type { ConflictDetails, GitOperationState } from "../types/gitbox";
+import type { ConflictAnalysis, ConflictDetails, GitOperationState, MergePreview } from "../types/gitbox";
 
 type OperationAction = "continue" | "abort" | "skip";
 type ConflictSide = "ours" | "theirs";
@@ -202,6 +203,8 @@ export const useOperationsStore = defineStore("operations", {
   state: () => ({
     state: null as GitOperationState | null,
     conflict: null as ConflictDetails | null,
+    conflictAnalysis: null as ConflictAnalysis | null,
+    mergePreview: null as MergePreview | null,
     resultDraft: "",
     resultInitialDraft: "",
     resultSavedDraft: "",
@@ -254,6 +257,7 @@ export const useOperationsStore = defineStore("operations", {
           });
         } else {
           this.conflict = null;
+          this.conflictAnalysis = null;
         }
       } catch (error) {
         this.error = String(error);
@@ -268,6 +272,7 @@ export const useOperationsStore = defineStore("operations", {
       this.error = "";
       try {
         this.conflict = await conflictDetails(repos.path, filePath);
+        this.conflictAnalysis = await analyzeConflictFile(repos.path, filePath).catch(() => null);
         const initialDraft = this.initialResultFromConflict();
         const shouldPreserveInitial =
           options.preserveInitial && this.resultInitialConflictPath === filePath;
@@ -283,9 +288,13 @@ export const useOperationsStore = defineStore("operations", {
         }
         this.resultDirty = false;
       } catch (error) {
+        this.conflictAnalysis = null;
         this.error = String(error);
         throw error;
       }
+    },
+    setMergePreview(preview: MergePreview | null) {
+      this.mergePreview = preview;
     },
     async merge() {
       const target = this.mergeTarget.trim();
@@ -517,6 +526,8 @@ export const useOperationsStore = defineStore("operations", {
     resetForRepositorySwitch() {
       this.state = null;
       this.conflict = null;
+      this.conflictAnalysis = null;
+      this.mergePreview = null;
       this.resultDraft = "";
       this.resultInitialDraft = "";
       this.resultSavedDraft = "";

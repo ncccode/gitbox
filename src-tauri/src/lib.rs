@@ -1,14 +1,14 @@
 mod gitbox;
 
 use gitbox::{
-    add_remote_core, apply_patch_core, blame_file_core, branch_summary_core, checkout_branch_core,
-    checkout_remote_branch_core, checkout_revision_core, cherry_pick_commit_core,
-    cherry_pick_files_core, cleanup_merged_branches_core, clear_stashes_core,
-    clone_repository_core, commit_details_core, commit_file_diff_core, commit_message_history_core,
-    commit_with_full_options_and_selection_core, compare_refs_core, conflict_details_core,
-    copy_project_entry_core, create_branch_core, create_patch_core, create_project_directory_core,
-    create_project_file_core, create_tag_core, create_worktree_core, delete_branch_core,
-    delete_project_entry_core, delete_remote_branch_core, delete_remote_core,
+    add_remote_core, analyze_conflict_file_core, apply_patch_core, blame_file_core,
+    branch_summary_core, checkout_branch_core, checkout_remote_branch_core, checkout_revision_core,
+    cherry_pick_commit_core, cherry_pick_files_core, cleanup_merged_branches_core,
+    clear_stashes_core, clone_repository_core, commit_details_core, commit_file_diff_core,
+    commit_message_history_core, commit_with_full_options_and_selection_core, compare_refs_core,
+    conflict_details_core, copy_project_entry_core, create_branch_core, create_patch_core,
+    create_project_directory_core, create_project_file_core, create_tag_core, create_worktree_core,
+    delete_branch_core, delete_project_entry_core, delete_remote_branch_core, delete_remote_core,
     delete_remote_tag_core, delete_shelf_core, delete_tag_core, discard_changes_core,
     drop_commit_core, fetch_core, file_history_core, filter_project_directories_core,
     fixup_commit_core, get_diff_core, init_repository_core, lfs_status_core, list_branches_core,
@@ -16,19 +16,19 @@ use gitbox::{
     list_stashes_core, list_submodules_core, list_worktrees_core, mark_conflict_resolved_core,
     mark_shelf_applied, merge_branch_core, move_project_entry_core, open_project_directory_core,
     open_project_terminal_core, open_repo_core, operation_control_core, operation_state_core,
-    pull_core, pull_preflight_core, push_commit_core, push_tag_core, push_with_options_core,
-    read_project_file_core, rebase_advanced_core, rebase_branch_core, record_recent_repo,
-    record_shelf, remove_worktree_core, rename_branch_core, rename_project_entry_core,
-    repo_status_core, reset_to_commit_core, resolve_conflict_block_core,
+    preview_merge_core, pull_core, pull_preflight_core, push_commit_core, push_tag_core,
+    push_with_options_core, read_project_file_core, rebase_advanced_core, rebase_branch_core,
+    record_recent_repo, record_shelf, remove_worktree_core, rename_branch_core,
+    rename_project_entry_core, repo_status_core, reset_to_commit_core, resolve_conflict_block_core,
     resolve_conflict_file_core, revert_commit_core, revert_commit_files_core,
     save_conflict_result_core, save_project_file_core, set_branch_upstream_core,
     shelve_changes_core, stage_hunks_core, stage_paths_core, stash_action_core,
     undo_last_commit_core, unshallow_repository_core, unshelve_core, unstage_paths_core,
     update_remote_core, update_submodules_core, BlameLine, BranchList, BranchSummary,
-    CommandResult, CommitDetails, CommitResult, CommitSummary, ConflictDetails, DiffResponse,
-    FileHistoryEntry, GitOperationState, ProjectFileContent, ProjectFileEntry, ProjectFileMutation,
-    PullPreflight, RefComparison, RepoStatus, RepositoryInfo, ShelfInfo, StashInfo, SubmoduleInfo,
-    WorktreeInfo,
+    CommandResult, CommitDetails, CommitResult, CommitSummary, ConflictAnalysis, ConflictDetails,
+    DiffResponse, FileHistoryEntry, GitOperationState, MergePreview, ProjectFileContent,
+    ProjectFileEntry, ProjectFileMutation, PullPreflight, RefComparison, RepoStatus,
+    RepositoryInfo, ShelfInfo, StashInfo, SubmoduleInfo, WorktreeInfo,
 };
 use tauri::AppHandle;
 
@@ -540,6 +540,11 @@ fn merge_branch(
 }
 
 #[tauri::command]
+fn preview_merge(path: String, target: String) -> CommandResponse<MergePreview> {
+    preview_merge_core(&path, target).map_err(|err| err.command())
+}
+
+#[tauri::command]
 fn rebase_branch(
     path: String,
     target: String,
@@ -753,6 +758,11 @@ fn conflict_details(path: String, file_path: String) -> CommandResponse<Conflict
 }
 
 #[tauri::command]
+fn analyze_conflict_file(path: String, file_path: String) -> CommandResponse<ConflictAnalysis> {
+    analyze_conflict_file_core(&path, file_path).map_err(|err| err.command())
+}
+
+#[tauri::command]
 fn resolve_conflict_file(
     path: String,
     file_path: String,
@@ -849,6 +859,7 @@ pub fn run() {
             push_tag,
             delete_remote_tag,
             merge_branch,
+            preview_merge,
             rebase_branch,
             rebase_advanced,
             cherry_pick_commit,
@@ -875,6 +886,7 @@ pub fn run() {
             operation_state,
             operation_control,
             conflict_details,
+            analyze_conflict_file,
             resolve_conflict_file,
             resolve_conflict_block,
             mark_conflict_resolved,

@@ -3,6 +3,7 @@ import type {
   BranchSummary,
   BranchList,
   CommandResult,
+  ConflictAnalysis,
   ConflictDetails,
   CommitDetails,
   CommitFileDiffMode,
@@ -12,6 +13,7 @@ import type {
   BlameLine,
   FileHistoryEntry,
   GitOperationState,
+  MergePreview,
   ProjectFileContent,
   ProjectFileEntry,
   ProjectFileMutation,
@@ -24,6 +26,31 @@ import type {
   SubmoduleInfo,
   WorktreeInfo,
 } from "../types/gitbox";
+
+const IPC_TIMEOUT = {
+  DEFAULT: 30_000,
+  NETWORK: 300_000,
+} satisfies Record<"DEFAULT" | "NETWORK", number>;
+
+function invokeWithTimeout<T>(
+  command: string,
+  args: Record<string, unknown>,
+  timeoutMs = IPC_TIMEOUT.DEFAULT,
+) {
+  const request = invoke<T>(command, args);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    request.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`IPC timeout after ${timeoutMs}ms: ${command}`)),
+        timeoutMs,
+      );
+    }),
+  ]);
+}
 
 export function openRepo(path: string) {
   return invoke<RepositoryInfo>("open_repo", { path });
@@ -53,7 +80,11 @@ export function initRepository(
 }
 
 export function cloneRepository(url: string, directory: string, shallowDepth?: number) {
-  return invoke<RepositoryInfo>("clone_repository", { url, directory, shallowDepth });
+  return invokeWithTimeout<RepositoryInfo>(
+    "clone_repository",
+    { url, directory, shallowDepth },
+    IPC_TIMEOUT.NETWORK,
+  );
 }
 
 export function unshallowRepository(path: string, remoteName?: string) {
@@ -165,11 +196,15 @@ export function commitRepo(
 }
 
 export function fetchRemote(path: string, remoteName?: string, options: { prune?: boolean } = {}) {
-  return invoke<CommandResult>("fetch", {
-    path,
-    remoteName,
-    prune: Boolean(options.prune),
-  });
+  return invokeWithTimeout<CommandResult>(
+    "fetch",
+    {
+      path,
+      remoteName,
+      prune: Boolean(options.prune),
+    },
+    IPC_TIMEOUT.NETWORK,
+  );
 }
 
 export function pullPreflight(path: string, remoteName?: string) {
@@ -177,11 +212,15 @@ export function pullPreflight(path: string, remoteName?: string) {
 }
 
 export function pullRemote(path: string, remoteName?: string, options: { smartMerge?: boolean } = {}) {
-  return invoke<CommandResult>("pull", {
-    path,
-    remoteName,
-    smartMerge: Boolean(options.smartMerge),
-  });
+  return invokeWithTimeout<CommandResult>(
+    "pull",
+    {
+      path,
+      remoteName,
+      smartMerge: Boolean(options.smartMerge),
+    },
+    IPC_TIMEOUT.NETWORK,
+  );
 }
 
 export function pushRemote(
@@ -194,14 +233,18 @@ export function pushRemote(
     pushTags?: boolean;
   } = {},
 ) {
-  return invoke<CommandResult>("push", {
-    path,
-    remoteName,
-    targetBranch: options.targetBranch,
-    setUpstream: Boolean(options.setUpstream),
-    forceWithLease: Boolean(options.forceWithLease),
-    pushTags: Boolean(options.pushTags),
-  });
+  return invokeWithTimeout<CommandResult>(
+    "push",
+    {
+      path,
+      remoteName,
+      targetBranch: options.targetBranch,
+      setUpstream: Boolean(options.setUpstream),
+      forceWithLease: Boolean(options.forceWithLease),
+      pushTags: Boolean(options.pushTags),
+    },
+    IPC_TIMEOUT.NETWORK,
+  );
 }
 
 export function addRemote(path: string, name: string, url: string) {
@@ -258,6 +301,10 @@ export function blameFile(path: string, filePath: string) {
 
 export function compareRefs(path: string, left: string, right: string) {
   return invoke<RefComparison>("compare_refs", { path, left, right });
+}
+
+export function previewMerge(path: string, target: string) {
+  return invoke<MergePreview>("preview_merge", { path, target });
 }
 
 export function listBranches(path: string) {
@@ -483,6 +530,10 @@ export function operationControl(path: string, action: "continue" | "abort" | "s
 
 export function conflictDetails(path: string, filePath: string) {
   return invoke<ConflictDetails>("conflict_details", { path, filePath });
+}
+
+export function analyzeConflictFile(path: string, filePath: string) {
+  return invoke<ConflictAnalysis>("analyze_conflict_file", { path, filePath });
 }
 
 export function resolveConflictFile(path: string, filePath: string, side: "ours" | "theirs") {

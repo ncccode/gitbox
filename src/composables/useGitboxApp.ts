@@ -10,6 +10,7 @@ import {
   deleteProjectEntry,
   filterProjectDirectories,
   moveProjectEntry,
+  previewMerge,
   renameProjectEntry,
 } from "../lib/gitboxCommands";
 import { useAdvancedStore } from "../stores/advanced";
@@ -36,6 +37,8 @@ import type {
   ConflictDetails,
   DiffHunk,
   DiffResponse,
+  MergePreview,
+  MergePreviewFile,
   ProjectFileEntry,
   PullPreflight,
   ShelfInfo,
@@ -346,6 +349,10 @@ export function useGitboxApp() {
     preview: PullPreflight;
     loading: boolean;
   };
+  type MergePreviewDialog = {
+    preview: MergePreview;
+    loading: boolean;
+  };
   type SubmitConfirmMode = "commit" | "commit-push" | "push";
   type SubmitConfirmDialog = {
     mode: SubmitConfirmMode;
@@ -365,6 +372,7 @@ export function useGitboxApp() {
   const noticeToast = ref<NoticeToast | null>(null);
   const errorDialog = ref<ErrorDialog | null>(null);
   const pullConfirmDialog = ref<PullConfirmDialog | null>(null);
+  const mergePreviewDialog = ref<MergePreviewDialog | null>(null);
   const submitConfirmDialog = ref<SubmitConfirmDialog | null>(null);
   const activeResizePanel = ref<LayoutPanelKey | null>(null);
   const systemPrefersDark = ref(
@@ -379,6 +387,7 @@ export function useGitboxApp() {
   let noticeToastTimer: number | null = null;
   let noticeToastId = 0;
   let errorDialogId = 0;
+  let autoFetchVisibilityHandler: (() => void) | null = null;
   let stopProjectDragDrop: (() => void) | null = null;
   let projectDragDropDisposed = false;
   const PROJECT_EDITOR_LINE_HEIGHT = 18;
@@ -880,6 +889,14 @@ export function useGitboxApp() {
     const changeLabel = operations.resultDirty ? "有未保存变更" : "没有变更";
     return `${changeLabel}。${mergeConflictCount.value} 个冲突。`;
   });
+  const mergeConflictAnalysisBlocks = computed(() => operations.conflictAnalysis?.blocks ?? []);
+  const mergeConflictAnalysisSummary = computed(() => {
+    const blocks = mergeConflictAnalysisBlocks.value;
+    if (blocks.length === 0) return "暂无冲突分析";
+    const safe = blocks.filter((block) => block.confidence === "certain" || block.confidence === "high").length;
+    const manual = blocks.length - safe;
+    return `${safe} 个高可信建议，${manual} 个需要人工判断`;
+  });
   const mergeConflictPositionLabel = computed(() => {
     if (mergeConflictCount.value === 0) return "0/0";
     return `${activeMergeConflictOrdinal.value + 1}/${mergeConflictCount.value}`;
@@ -900,6 +917,11 @@ export function useGitboxApp() {
     if (preview.fastForward) return "快进更新";
     if (preview.diverged) return "分叉合并";
     return preview.upToDate ? "已经最新" : "合并更新";
+  });
+  const mergePreviewFiles = computed(() => mergePreviewDialog.value?.preview.files.slice(0, 12) ?? []);
+  const mergePreviewExtraCount = computed(() => {
+    const total = mergePreviewDialog.value?.preview.files.length ?? 0;
+    return Math.max(0, total - mergePreviewFiles.value.length);
   });
   const isMergeConflictOperation = computed(() => operations.activeOperation === "merge");
   const showMergeConflictWorkbench = computed(
@@ -1597,6 +1619,10 @@ export function useGitboxApp() {
     window.addEventListener("mousedown", preventRightClickTextSelection, { capture: true });
     window.addEventListener("contextmenu", preventNativeContextMenu, { capture: true });
     setupProjectDragDrop();
+    if (typeof document !== "undefined") {
+      autoFetchVisibilityHandler = handleAutoFetchVisibilityChange;
+      document.addEventListener("visibilitychange", autoFetchVisibilityHandler);
+    }
 
     if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
       const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -1623,6 +1649,9 @@ export function useGitboxApp() {
     projectDragDropDisposed = true;
     stopProjectDragDrop?.();
     stopSystemThemeWatch?.();
+    if (typeof document !== "undefined" && autoFetchVisibilityHandler) {
+      document.removeEventListener("visibilitychange", autoFetchVisibilityHandler);
+    }
     projectEditorResizeObserver?.disconnect();
     changeFileListResizeObserver?.disconnect();
     clearAutoFetchTimer();
@@ -2245,6 +2274,29 @@ export function useGitboxApp() {
     pullConfirmDialog.value = null;
   }
 
+  function cancelMergePreviewDialog() {
+    if (mergePreviewDialog.value?.loading) return;
+    mergePreviewDialog.value = null;
+  }
+
+  async function confirmMergePreviewDialog() {
+    const dialog = mergePreviewDialog.value;
+    if (!dialog || dialog.loading) return;
+    if (!window.confirm(`将 ${dialog.preview.target} 合并到当前分支？`)) return;
+    dialog.loading = true;
+    operations.mergeTarget = dialog.preview.target;
+    try {
+      await runUiAction("operation.merge", async () => {
+        await operations.merge();
+        await reloadAfterGitOperation();
+      });
+      mergePreviewDialog.value = null;
+    } catch (error) {
+      dialog.loading = false;
+      throw error;
+    }
+  }
+
   async function confirmPullSmartMerge() {
     const dialog = pullConfirmDialog.value;
     if (!dialog || dialog.loading) return;
@@ -2271,11 +2323,26 @@ export function useGitboxApp() {
 
   function scheduleAutoFetch() {
     clearAutoFetchTimer();
-    if (!remote.autoFetchEnabled || typeof window === "undefined") return;
+    if (
+      !remote.autoFetchEnabled ||
+      typeof window === "undefined" ||
+      (typeof document !== "undefined" && document.hidden)
+    ) {
+      return;
+    }
     const interval = Math.max(1, Number(remote.autoFetchIntervalMinutes) || 5) * 60 * 1000;
     autoFetchTimer = window.setInterval(() => {
       runAutoFetch().catch(() => undefined);
     }, interval);
+  }
+
+  function handleAutoFetchVisibilityChange() {
+    if (typeof document !== "undefined" && document.hidden) {
+      clearAutoFetchTimer();
+      return;
+    }
+    scheduleAutoFetch();
+    runAutoFetch().catch(() => undefined);
   }
 
   async function runAutoFetch() {
@@ -4701,6 +4768,17 @@ export function useGitboxApp() {
     });
   }
 
+  async function previewLogRefMerge(menu: LogRefContextMenu | null) {
+    const target = logRefContextBranchItem(menu)?.name ?? "";
+    if (!target || !canMergeOrRebaseLogRefContext(menu) || !repos.path) return;
+    closeLogRefContextMenu();
+    await runUiAction("operation.previewMerge", async () => {
+      const preview = await previewMerge(repos.path, target);
+      operations.setMergePreview(preview);
+      mergePreviewDialog.value = { preview, loading: false };
+    });
+  }
+
   async function rebaseCurrentOntoLogRef(menu: LogRefContextMenu | null) {
     const target = logRefContextBranchItem(menu)?.name ?? "";
     if (!target || !canMergeOrRebaseLogRefContext(menu)) return;
@@ -5364,6 +5442,36 @@ export function useGitboxApp() {
 
   function formatOperationName(name?: string | null) {
     return name ? (operationKindLabels[name] ?? name) : "冲突";
+  }
+
+  function conflictAnalysisKindLabel(kind: string) {
+    const labels: Record<string, string> = {
+      same_change: "相同修改",
+      one_side_change: "单侧修改",
+      delete_no_change: "删除未改",
+      whitespace_only: "空白差异",
+      non_overlapping: "可合成",
+      complex: "复杂冲突",
+    };
+    return labels[kind] ?? kind;
+  }
+
+  function conflictAnalysisSideLabel(side?: string | null) {
+    if (side === "ours") return "当前";
+    if (side === "base") return "基线";
+    if (side === "theirs") return "传入";
+    return "合成结果";
+  }
+
+  function mergePreviewCategoryLabel(category: MergePreviewFile["category"]) {
+    const labels: Record<MergePreviewFile["category"], string> = {
+      clean: "可直接合并",
+      auto_resolvable: "可自动合成",
+      manual: "需人工处理",
+      add_delete: "增删冲突",
+      binary: "二进制/过大",
+    };
+    return labels[category];
   }
 
   function formatWorktreeLabel(item: { branch?: string | null; detached?: boolean }) {
@@ -6483,6 +6591,7 @@ export function useGitboxApp() {
     noticeToast,
     errorDialog,
     pullConfirmDialog,
+    mergePreviewDialog,
     submitConfirmDialog,
     activeResizePanel,
     changeFileGroups,
@@ -6541,11 +6650,15 @@ export function useGitboxApp() {
     resultHasConflictMarkers,
     mergeConflictCount,
     mergeConflictSummary,
+    mergeConflictAnalysisBlocks,
+    mergeConflictAnalysisSummary,
     mergeConflictPositionLabel,
     mergeResultStateLabel,
     pullConfirmFiles,
     pullConfirmExtraCount,
     pullConfirmModeLabel,
+    mergePreviewFiles,
+    mergePreviewExtraCount,
     isMergeConflictOperation,
     showMergeConflictWorkbench,
     mergeCurrentSide,
@@ -6608,6 +6721,8 @@ export function useGitboxApp() {
     runRemoteActionFromPointer,
     cancelPullConfirmDialog,
     confirmPullSmartMerge,
+    cancelMergePreviewDialog,
+    confirmMergePreviewDialog,
     unshallowCurrentRepository,
     renameSelectedBranch,
     cleanupMergedBranches,
@@ -6761,6 +6876,7 @@ export function useGitboxApp() {
     createBranchFromLogRefContext,
     renameLogBranchFromContext,
     deleteLogRefFromContext,
+    previewLogRefMerge,
     mergeLogRefIntoCurrent,
     rebaseCurrentOntoLogRef,
     setCurrentBranchUpstreamFromContext,
@@ -6785,6 +6901,9 @@ export function useGitboxApp() {
     formatCommitFileStatusCode,
     formatSubmitConfirmFileStatus,
     formatOperationName,
+    conflictAnalysisKindLabel,
+    conflictAnalysisSideLabel,
+    mergePreviewCategoryLabel,
     formatWorktreeLabel,
     selectCommit,
     checkoutSelectedBranch,

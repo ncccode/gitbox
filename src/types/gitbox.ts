@@ -243,6 +243,47 @@ export interface ConflictDetails {
   blocks: ConflictBlock[];
 }
 
+export interface ConflictBlockAnalysis {
+  index: number;
+  kind: string;
+  confidence: string;
+  score: number;
+  suggestedSide?: "ours" | "base" | "theirs" | null;
+  explanation: string;
+  replacement?: string | null;
+}
+
+export interface ConflictAnalysis {
+  path: string;
+  blocks: ConflictBlockAnalysis[];
+}
+
+export interface MergePreviewSummary {
+  clean: number;
+  autoResolvable: number;
+  manual: number;
+  addDelete: number;
+  binary: number;
+}
+
+export interface MergePreviewFile {
+  path: string;
+  category: "clean" | "auto_resolvable" | "manual" | "add_delete" | "binary";
+  conflictCount: number;
+  autoResolvable: boolean;
+  explanation: string;
+}
+
+export interface MergePreview {
+  target: string;
+  head?: string | null;
+  targetOid?: string | null;
+  mergeBase?: string | null;
+  clean: boolean;
+  files: MergePreviewFile[];
+  summary: MergePreviewSummary;
+}
+
 export interface ProjectFileEntry {
   path: string;
   name: string;

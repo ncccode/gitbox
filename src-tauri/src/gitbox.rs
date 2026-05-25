@@ -345,6 +345,57 @@ pub struct ConflictDetails {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ConflictBlockAnalysis {
+    pub index: usize,
+    pub kind: String,
+    pub confidence: String,
+    pub score: u8,
+    pub suggested_side: Option<String>,
+    pub explanation: String,
+    pub replacement: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictAnalysis {
+    pub path: String,
+    pub blocks: Vec<ConflictBlockAnalysis>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreviewSummary {
+    pub clean: usize,
+    pub auto_resolvable: usize,
+    pub manual: usize,
+    pub add_delete: usize,
+    pub binary: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreviewFile {
+    pub path: String,
+    pub category: String,
+    pub conflict_count: usize,
+    pub auto_resolvable: bool,
+    pub explanation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePreview {
+    pub target: String,
+    pub head: Option<String>,
+    pub target_oid: Option<String>,
+    pub merge_base: Option<String>,
+    pub clean: bool,
+    pub files: Vec<MergePreviewFile>,
+    pub summary: MergePreviewSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectFileEntry {
     pub path: String,
     pub name: String,
@@ -2773,6 +2824,145 @@ pub fn merge_branch_core(
     )
 }
 
+pub fn preview_merge_core(path: &str, target: String) -> Result<MergePreview, GitboxError> {
+    let target = clean_ref_input(target, "请选择要预览合并的分支")?;
+    let repo = Repository::discover(path)?;
+    let head_oid = repo
+        .head()?
+        .target()
+        .ok_or_else(|| GitboxError::Message("当前 HEAD 无法预览合并".to_string()))?;
+    let target_oid = repo
+        .revparse_single(&target)
+        .and_then(|object| object.peel_to_commit())
+        .map(|commit| commit.id())
+        .map_err(|_| GitboxError::Message(format!("找不到合并目标 {target}")))?;
+    let merge_base = merge_base_or_none(&repo, head_oid, target_oid)?;
+    let Some(merge_base) = merge_base else {
+        return Ok(MergePreview {
+            target,
+            head: Some(head_oid.to_string()),
+            target_oid: Some(target_oid.to_string()),
+            merge_base: None,
+            clean: false,
+            files: Vec::new(),
+            summary: MergePreviewSummary {
+                manual: 1,
+                ..MergePreviewSummary::default()
+            },
+        });
+    };
+
+    let local_paths = changed_paths_between(&repo, merge_base, head_oid)?;
+    let incoming_paths = changed_paths_between(&repo, merge_base, target_oid)?;
+    let local_set = local_paths.iter().cloned().collect::<HashSet<_>>();
+    let incoming_set = incoming_paths.iter().cloned().collect::<HashSet<_>>();
+    let mut paths = sorted_unique(local_paths.into_iter().chain(incoming_paths));
+    let base_ref = merge_base.to_string();
+    let head_ref = head_oid.to_string();
+    let target_ref = target_oid.to_string();
+    let mut files = Vec::new();
+    let mut summary = MergePreviewSummary::default();
+
+    for pathspec in paths.drain(..) {
+        let local_changed = local_set.contains(&pathspec);
+        let incoming_changed = incoming_set.contains(&pathspec);
+        if !(local_changed && incoming_changed) {
+            summary.clean += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "clean".to_string(),
+                conflict_count: 0,
+                auto_resolvable: true,
+                explanation: "只有一侧修改，Git 可直接合并。".to_string(),
+            });
+            continue;
+        }
+
+        let base_exists = treeish_file_exists(&repo, &base_ref, &pathspec)?;
+        let ours_exists = treeish_file_exists(&repo, &head_ref, &pathspec)?;
+        let theirs_exists = treeish_file_exists(&repo, &target_ref, &pathspec)?;
+        let base_text = read_treeish_file_text(&repo, &base_ref, &pathspec)?;
+        let ours_text = read_treeish_file_text(&repo, &head_ref, &pathspec)?;
+        let theirs_text = read_treeish_file_text(&repo, &target_ref, &pathspec)?;
+
+        if (base_exists && base_text.is_none())
+            || (ours_exists && ours_text.is_none())
+            || (theirs_exists && theirs_text.is_none())
+        {
+            summary.binary += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "binary".to_string(),
+                conflict_count: 0,
+                auto_resolvable: false,
+                explanation: "包含二进制或过大的文件版本，需要人工检查。".to_string(),
+            });
+            continue;
+        }
+
+        if base_exists && (ours_exists != theirs_exists) {
+            summary.add_delete += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "add_delete".to_string(),
+                conflict_count: 1,
+                auto_resolvable: false,
+                explanation: "一侧删除文件，另一侧仍在修改，需要人工选择保留或删除。".to_string(),
+            });
+            continue;
+        }
+
+        let base = base_text.unwrap_or_default();
+        let ours = ours_text.unwrap_or_default();
+        let theirs = theirs_text.unwrap_or_default();
+        if ours == theirs {
+            summary.clean += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "clean".to_string(),
+                conflict_count: 0,
+                auto_resolvable: true,
+                explanation: "两侧最终内容一致。".to_string(),
+            });
+            continue;
+        }
+
+        let merged = simulate_merge_file(&ours, &base, &theirs)?;
+        if merged.conflict_count == 0 {
+            summary.auto_resolvable += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "auto_resolvable".to_string(),
+                conflict_count: 0,
+                auto_resolvable: true,
+                explanation: "三方文本合并可生成无冲突结果。".to_string(),
+            });
+        } else {
+            summary.manual += 1;
+            files.push(MergePreviewFile {
+                path: pathspec,
+                category: "manual".to_string(),
+                conflict_count: merged.conflict_count,
+                auto_resolvable: false,
+                explanation: format!(
+                    "预计产生 {} 个文本冲突，需要进入合并编辑器。",
+                    merged.conflict_count
+                ),
+            });
+        }
+    }
+
+    Ok(MergePreview {
+        target,
+        head: Some(head_oid.to_string()),
+        target_oid: Some(target_oid.to_string()),
+        merge_base: Some(merge_base.to_string()),
+        clean: summary.manual == 0 && summary.add_delete == 0 && summary.binary == 0,
+        files,
+        summary,
+    })
+}
+
 pub fn rebase_branch_core(
     path: &str,
     target: String,
@@ -3388,6 +3578,22 @@ pub fn conflict_details_core(
         current_side: display_context.current_side.to_string(),
         incoming_side: display_context.incoming_side.to_string(),
         conflict_source: display_context.source.map(str::to_string),
+        blocks,
+    })
+}
+
+pub fn analyze_conflict_file_core(
+    path: &str,
+    file_path: String,
+) -> Result<ConflictAnalysis, GitboxError> {
+    let details = conflict_details_core(path, file_path)?;
+    let blocks = details
+        .blocks
+        .iter()
+        .map(analyze_conflict_block)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ConflictAnalysis {
+        path: details.path,
         blocks,
     })
 }
@@ -5221,6 +5427,179 @@ fn parse_conflict_blocks_for_response(content: &str) -> Vec<ConflictBlock> {
         .collect()
 }
 
+struct MergeFileSimulation {
+    content: String,
+    conflict_count: usize,
+}
+
+fn analyze_conflict_block(block: &ConflictBlock) -> Result<ConflictBlockAnalysis, GitboxError> {
+    let base = block.base.as_deref();
+    let ours = block.ours.as_str();
+    let theirs = block.theirs.as_str();
+
+    if ours == theirs {
+        return Ok(conflict_block_analysis(
+            block.index,
+            "same_change",
+            "certain",
+            100,
+            Some("ours"),
+            "两侧做出了相同修改，可以保留任意一侧。",
+            Some(ours.to_string()),
+        ));
+    }
+
+    if let Some(base) = base {
+        if ours.is_empty() && theirs == base {
+            return Ok(conflict_block_analysis(
+                block.index,
+                "delete_no_change",
+                "certain",
+                94,
+                Some("ours"),
+                "当前版本删除了该块，传入版本未改动，建议保留删除结果。",
+                Some(String::new()),
+            ));
+        }
+        if theirs.is_empty() && ours == base {
+            return Ok(conflict_block_analysis(
+                block.index,
+                "delete_no_change",
+                "certain",
+                94,
+                Some("theirs"),
+                "传入版本删除了该块，当前版本未改动，建议保留删除结果。",
+                Some(String::new()),
+            ));
+        }
+        if ours == base && theirs != base {
+            return Ok(conflict_block_analysis(
+                block.index,
+                "one_side_change",
+                "certain",
+                96,
+                Some("theirs"),
+                "只有传入版本修改了该块，建议接受传入版本。",
+                Some(theirs.to_string()),
+            ));
+        }
+        if theirs == base && ours != base {
+            return Ok(conflict_block_analysis(
+                block.index,
+                "one_side_change",
+                "certain",
+                96,
+                Some("ours"),
+                "只有当前版本修改了该块，建议保留当前版本。",
+                Some(ours.to_string()),
+            ));
+        }
+    }
+
+    if normalize_for_conflict_whitespace(ours) == normalize_for_conflict_whitespace(theirs) {
+        return Ok(conflict_block_analysis(
+            block.index,
+            "whitespace_only",
+            "high",
+            82,
+            Some("ours"),
+            "两侧仅有空白字符差异，建议保留当前版本的格式。",
+            Some(ours.to_string()),
+        ));
+    }
+
+    if let Some(base) = base {
+        let merged = simulate_merge_file(ours, base, theirs)?;
+        if merged.conflict_count == 0 {
+            return Ok(conflict_block_analysis(
+                block.index,
+                "non_overlapping",
+                "high",
+                78,
+                None,
+                "两侧修改可以通过三方文本合并合成一个无冲突结果。",
+                Some(merged.content),
+            ));
+        }
+    }
+
+    Ok(conflict_block_analysis(
+        block.index,
+        "complex",
+        "low",
+        20,
+        None,
+        "两侧修改存在重叠或缺少可靠基线，需要人工判断。",
+        None,
+    ))
+}
+
+fn conflict_block_analysis(
+    index: usize,
+    kind: &str,
+    confidence: &str,
+    score: u8,
+    suggested_side: Option<&str>,
+    explanation: &str,
+    replacement: Option<String>,
+) -> ConflictBlockAnalysis {
+    ConflictBlockAnalysis {
+        index,
+        kind: kind.to_string(),
+        confidence: confidence.to_string(),
+        score,
+        suggested_side: suggested_side.map(str::to_string),
+        explanation: explanation.to_string(),
+        replacement,
+    }
+}
+
+fn normalize_for_conflict_whitespace(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn simulate_merge_file(
+    ours: &str,
+    base: &str,
+    theirs: &str,
+) -> Result<MergeFileSimulation, GitboxError> {
+    let dir = tempfile::tempdir()?;
+    let ours_path = dir.path().join("ours");
+    let base_path = dir.path().join("base");
+    let theirs_path = dir.path().join("theirs");
+    fs::write(&ours_path, ours.as_bytes())?;
+    fs::write(&base_path, base.as_bytes())?;
+    fs::write(&theirs_path, theirs.as_bytes())?;
+    let output = run_git_raw(
+        dir.path(),
+        vec![
+            "merge-file".to_string(),
+            "-p".to_string(),
+            "--diff3".to_string(),
+            "ours".to_string(),
+            "base".to_string(),
+            "theirs".to_string(),
+        ],
+        None,
+    )?;
+    let content = if output.stdout.is_empty() && !output.success {
+        output.stderr
+    } else {
+        output.stdout
+    };
+    let conflict_count = content.matches("<<<<<<< ").count();
+    Ok(MergeFileSimulation {
+        content,
+        conflict_count,
+    })
+}
+
 fn derive_conflict_blocks_from_stages(
     base: Option<&str>,
     ours: Option<&str>,
@@ -5575,6 +5954,22 @@ fn read_treeish_file_text(
     Ok(bytes_to_preview_text(blob.content()))
 }
 
+fn treeish_file_exists(
+    repo: &Repository,
+    treeish: &str,
+    pathspec: &str,
+) -> Result<bool, GitboxError> {
+    let tree = match repo
+        .revparse_single(treeish)
+        .ok()
+        .and_then(|object| object.peel_to_tree().ok())
+    {
+        Some(tree) => tree,
+        None => return Ok(false),
+    };
+    Ok(tree.get_path(Path::new(pathspec)).is_ok())
+}
+
 fn read_index_file_text(repo: &Repository, pathspec: &str) -> Result<Option<String>, GitboxError> {
     let index = repo.index()?;
     let Some(entry) = index.get_path(Path::new(pathspec), 0) else {
@@ -5782,6 +6177,15 @@ mod tests {
         write_file(root, "README.md", "hello\n");
         stage_paths_core(root.to_str().unwrap(), vec!["README.md".to_string()]).expect("stage");
         commit_core(root.to_str().unwrap(), "initial".to_string()).expect("commit");
+    }
+
+    fn conflict_block(index: usize, base: Option<&str>, ours: &str, theirs: &str) -> ConflictBlock {
+        ConflictBlock {
+            index,
+            ours: ours.to_string(),
+            base: base.map(ToOwned::to_owned),
+            theirs: theirs.to_string(),
+        }
     }
 
     #[test]
@@ -7655,6 +8059,175 @@ mod tests {
             fs::read_to_string(dir.path().join("README.md")).unwrap(),
             "master\n"
         );
+    }
+
+    #[test]
+    fn conflict_analysis_classifies_common_block_shapes() {
+        let same =
+            analyze_conflict_block(&conflict_block(0, Some("base\n"), "changed\n", "changed\n"))
+                .expect("same change");
+        assert_eq!(same.kind, "same_change");
+        assert_eq!(same.confidence, "certain");
+        assert_eq!(same.suggested_side.as_deref(), Some("ours"));
+        assert_eq!(same.replacement.as_deref(), Some("changed\n"));
+
+        let one_side =
+            analyze_conflict_block(&conflict_block(1, Some("base\n"), "base\n", "incoming\n"))
+                .expect("one side");
+        assert_eq!(one_side.kind, "one_side_change");
+        assert_eq!(one_side.suggested_side.as_deref(), Some("theirs"));
+        assert_eq!(one_side.replacement.as_deref(), Some("incoming\n"));
+
+        let delete = analyze_conflict_block(&conflict_block(2, Some("remove\n"), "", "remove\n"))
+            .expect("delete");
+        assert_eq!(delete.kind, "delete_no_change");
+        assert_eq!(delete.suggested_side.as_deref(), Some("ours"));
+        assert_eq!(delete.replacement.as_deref(), Some(""));
+
+        let whitespace =
+            analyze_conflict_block(&conflict_block(3, None, "alpha beta\n", "alpha   beta\n"))
+                .expect("whitespace");
+        assert_eq!(whitespace.kind, "whitespace_only");
+        assert_eq!(whitespace.confidence, "high");
+
+        let non_overlapping = analyze_conflict_block(&conflict_block(
+            4,
+            Some("one\ntwo\nmiddle\nthree\n"),
+            "one\nTWO\nmiddle\nthree\n",
+            "one\ntwo\nmiddle\nTHREE\n",
+        ))
+        .expect("non-overlapping");
+        assert_eq!(non_overlapping.kind, "non_overlapping");
+        let replacement = non_overlapping.replacement.expect("replacement");
+        assert!(replacement.contains("TWO"));
+        assert!(replacement.contains("THREE"));
+
+        let complex =
+            analyze_conflict_block(&conflict_block(5, Some("base\n"), "ours\n", "theirs\n"))
+                .expect("complex");
+        assert_eq!(complex.kind, "complex");
+        assert_eq!(complex.confidence, "low");
+        assert!(complex.replacement.is_none());
+    }
+
+    #[test]
+    fn preview_merge_is_read_only_and_reports_manual_conflict() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        initial_commit(dir.path());
+
+        create_branch_core(path, "feature/preview-conflict".to_string(), true, None)
+            .expect("create feature");
+        write_file(dir.path(), "README.md", "feature\n");
+        stage_paths_core(path, vec!["README.md".to_string()]).expect("stage feature");
+        commit_core(path, "feature change".to_string()).expect("commit feature");
+
+        checkout_branch_core(path, "master".to_string()).expect("checkout master");
+        write_file(dir.path(), "README.md", "master\n");
+        stage_paths_core(path, vec!["README.md".to_string()]).expect("stage master");
+        commit_core(path, "master change".to_string()).expect("commit master");
+
+        let before = run_git(
+            dir.path(),
+            vec!["status".to_string(), "--porcelain".to_string()],
+            None,
+        )
+        .expect("status before");
+        let preview = preview_merge_core(path, "feature/preview-conflict".to_string())
+            .expect("preview merge");
+        let after = run_git(
+            dir.path(),
+            vec!["status".to_string(), "--porcelain".to_string()],
+            None,
+        )
+        .expect("status after");
+
+        assert_eq!(before, after);
+        assert!(!preview.clean);
+        assert_eq!(preview.summary.manual, 1);
+        assert_eq!(preview.summary.clean, 0);
+        let readme = preview
+            .files
+            .iter()
+            .find(|file| file.path == "README.md")
+            .expect("README result");
+        assert_eq!(readme.category, "manual");
+        assert!(readme.conflict_count > 0);
+        assert!(!readme.auto_resolvable);
+    }
+
+    #[test]
+    fn preview_merge_reports_binary_and_add_delete_without_worktree_changes() {
+        let (dir, _repo) = test_repo();
+        let path = dir.path().to_str().unwrap();
+        initial_commit(dir.path());
+
+        fs::write(dir.path().join("binary.bin"), [0_u8, 1, 2, 3]).expect("write binary base");
+        write_file(dir.path(), "remove-me.txt", "base\n");
+        stage_paths_core(
+            path,
+            vec!["binary.bin".to_string(), "remove-me.txt".to_string()],
+        )
+        .expect("stage base files");
+        commit_core(path, "base preview files".to_string()).expect("commit base files");
+
+        create_branch_core(path, "feature/preview-nontext".to_string(), true, None)
+            .expect("create feature");
+        fs::write(dir.path().join("binary.bin"), [0_u8, 1, 9, 3]).expect("write binary feature");
+        write_file(dir.path(), "remove-me.txt", "feature update\n");
+        stage_paths_core(
+            path,
+            vec!["binary.bin".to_string(), "remove-me.txt".to_string()],
+        )
+        .expect("stage feature files");
+        commit_core(path, "feature preview files".to_string()).expect("commit feature files");
+
+        checkout_branch_core(path, "master".to_string()).expect("checkout master");
+        fs::write(dir.path().join("binary.bin"), [0_u8, 4, 2, 3]).expect("write binary master");
+        fs::remove_file(dir.path().join("remove-me.txt")).expect("remove file");
+        stage_paths_core(
+            path,
+            vec!["binary.bin".to_string(), "remove-me.txt".to_string()],
+        )
+        .expect("stage master files");
+        commit_core(path, "master preview files".to_string()).expect("commit master files");
+
+        let before = run_git(
+            dir.path(),
+            vec!["status".to_string(), "--porcelain".to_string()],
+            None,
+        )
+        .expect("status before");
+        let preview =
+            preview_merge_core(path, "feature/preview-nontext".to_string()).expect("preview merge");
+        let after = run_git(
+            dir.path(),
+            vec!["status".to_string(), "--porcelain".to_string()],
+            None,
+        )
+        .expect("status after");
+
+        assert_eq!(before, after);
+        assert!(!preview.clean);
+        assert_eq!(preview.summary.binary, 1);
+        assert_eq!(preview.summary.add_delete, 1);
+
+        let binary = preview
+            .files
+            .iter()
+            .find(|file| file.path == "binary.bin")
+            .expect("binary result");
+        assert_eq!(binary.category, "binary");
+        assert!(!binary.auto_resolvable);
+
+        let removed = preview
+            .files
+            .iter()
+            .find(|file| file.path == "remove-me.txt")
+            .expect("add/delete result");
+        assert_eq!(removed.category, "add_delete");
+        assert_eq!(removed.conflict_count, 1);
+        assert!(!removed.auto_resolvable);
     }
 
     #[test]

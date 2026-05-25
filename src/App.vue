@@ -90,6 +90,7 @@ const {
   noticeToast,
   errorDialog,
   pullConfirmDialog,
+  mergePreviewDialog,
   submitConfirmDialog,
   activeResizePanel,
   changeFileGroups,
@@ -144,11 +145,15 @@ const {
   resultHasConflictMarkers,
   mergeConflictCount,
   mergeConflictSummary,
+  mergeConflictAnalysisBlocks,
+  mergeConflictAnalysisSummary,
   mergeConflictPositionLabel,
   mergeResultStateLabel,
   pullConfirmFiles,
   pullConfirmExtraCount,
   pullConfirmModeLabel,
+  mergePreviewFiles,
+  mergePreviewExtraCount,
   isMergeConflictOperation,
   showMergeConflictWorkbench,
   mergeCurrentSide,
@@ -210,6 +215,8 @@ const {
   runRemoteActionFromPointer,
   cancelPullConfirmDialog,
   confirmPullSmartMerge,
+  cancelMergePreviewDialog,
+  confirmMergePreviewDialog,
   selectSide,
   setIncludeIgnored,
   nudgePanelWidth,
@@ -345,6 +352,7 @@ const {
   createBranchFromLogRefContext,
   renameLogBranchFromContext,
   deleteLogRefFromContext,
+  previewLogRefMerge,
   mergeLogRefIntoCurrent,
   rebaseCurrentOntoLogRef,
   setCurrentBranchUpstreamFromContext,
@@ -368,6 +376,9 @@ const {
   logFileTreeRowTitle,
   formatCommitFileStatusCode,
   formatSubmitConfirmFileStatus,
+  conflictAnalysisKindLabel,
+  conflictAnalysisSideLabel,
+  mergePreviewCategoryLabel,
   selectCommit,
   runOperationControl,
   toggleCommitFile,
@@ -504,6 +515,67 @@ const {
             <LoaderCircle v-if="pullConfirmDialog.loading" :size="14" class="button-spinner" />
             <Check v-else :size="14" />
             <span>{{ pullConfirmDialog.loading ? "合并中" : "智能合并" }}</span>
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="mergePreviewDialog" class="modal-backdrop" @click.self="cancelMergePreviewDialog">
+      <section
+        class="pull-confirm-modal merge-preview-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="合并预览"
+        @keydown.esc.prevent="cancelMergePreviewDialog"
+      >
+        <header>
+          <div>
+            <h2>合并预览</h2>
+          </div>
+          <button
+            class="icon-only-button"
+            type="button"
+            title="关闭"
+            :disabled="mergePreviewDialog.loading"
+            @click="cancelMergePreviewDialog"
+          >
+            <X :size="14" />
+          </button>
+        </header>
+        <p>
+          {{ mergePreviewDialog.preview.target }} 将合并到当前分支。预览只读取提交内容，不会改动工作区。
+        </p>
+        <div class="pull-confirm-summary merge-preview-summary">
+          <span>{{ mergePreviewDialog.preview.clean ? "可合并" : "需要检查" }}</span>
+          <strong>{{ mergePreviewDialog.preview.target }}</strong>
+          <small>
+            {{ mergePreviewDialog.preview.summary.clean }} 直接 ·
+            {{ mergePreviewDialog.preview.summary.autoResolvable }} 可合成 ·
+            {{ mergePreviewDialog.preview.summary.manual }} 人工 ·
+            {{ mergePreviewDialog.preview.summary.addDelete }} 增删 ·
+            {{ mergePreviewDialog.preview.summary.binary }} 二进制
+          </small>
+        </div>
+        <div class="merge-preview-file-list" aria-label="合并预览文件">
+          <div v-for="file in mergePreviewFiles" :key="file.path" class="merge-preview-file" :class="file.category">
+            <span>{{ mergePreviewCategoryLabel(file.category) }}</span>
+            <strong>{{ file.path }}</strong>
+            <small>{{ file.explanation }}</small>
+          </div>
+          <div v-if="mergePreviewExtraCount > 0" class="merge-preview-file">
+            <span>更多</span>
+            <strong>还有 {{ mergePreviewExtraCount }} 个文件</strong>
+          </div>
+        </div>
+        <footer>
+          <button class="icon-button" type="button" :disabled="mergePreviewDialog.loading" @click="cancelMergePreviewDialog">
+            <X :size="14" />
+            <span>关闭</span>
+          </button>
+          <button class="icon-button primary" type="button" :disabled="mergePreviewDialog.loading" @click="confirmMergePreviewDialog">
+            <LoaderCircle v-if="mergePreviewDialog.loading" :size="14" class="button-spinner" />
+            <Check v-else :size="14" />
+            <span>{{ mergePreviewDialog.loading ? "合并中" : "继续合并" }}</span>
           </button>
         </footer>
       </section>
@@ -1421,6 +1493,26 @@ const {
                 <RefreshCw :size="14" />
                 <span>保存结果</span>
               </button>
+            </div>
+          </div>
+
+          <div v-if="mergeConflictAnalysisBlocks.length > 0" class="merge-analysis-panel">
+            <div class="merge-analysis-heading">
+              <strong>冲突分析</strong>
+              <span>{{ mergeConflictAnalysisSummary }}</span>
+            </div>
+            <div class="merge-analysis-list">
+              <div
+                v-for="block in mergeConflictAnalysisBlocks"
+                :key="block.index"
+                class="merge-analysis-item"
+                :class="block.confidence"
+              >
+                <span class="merge-analysis-kind">{{ conflictAnalysisKindLabel(block.kind) }}</span>
+                <strong>块 {{ block.index + 1 }}</strong>
+                <small>{{ block.score }} · {{ conflictAnalysisSideLabel(block.suggestedSide) }}</small>
+                <p>{{ block.explanation }}</p>
+              </div>
             </div>
           </div>
 
@@ -2573,6 +2665,13 @@ const {
       </button>
 
       <div class="context-menu-separator" />
+      <button
+        v-if="logRefContextMenu.kind !== 'tag'"
+        :disabled="!canMergeOrRebaseLogRefContext(logRefContextMenu)"
+        @click="previewLogRefMerge(logRefContextMenu)"
+      >
+        <span>预览合并</span>
+      </button>
       <button
         v-if="logRefContextMenu.kind !== 'tag'"
         :disabled="!canMergeOrRebaseLogRefContext(logRefContextMenu)"

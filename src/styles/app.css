@@ -1273,6 +1273,87 @@ button[aria-busy="true"]:disabled {
   flex: 0 0 auto;
 }
 
+.merge-analysis-panel {
+  display: grid;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #e5ebe7;
+  background: #f4f8f5;
+}
+
+.merge-analysis-heading,
+.merge-analysis-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.merge-analysis-heading strong {
+  color: #25312b;
+  font-size: 13px;
+}
+
+.merge-analysis-heading span {
+  color: #68756d;
+  font-size: 12px;
+}
+
+.merge-analysis-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 7px;
+}
+
+.merge-analysis-item {
+  align-items: flex-start;
+  flex-wrap: wrap;
+  padding: 8px;
+  border: 1px solid #d9e3dc;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.merge-analysis-item.low {
+  border-color: #ead0bd;
+  background: #fff8f2;
+}
+
+.merge-analysis-kind {
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: #2c6b50;
+  background: #dff2e8;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.merge-analysis-item.low .merge-analysis-kind {
+  color: #9a4b16;
+  background: #f6dfcc;
+}
+
+.merge-analysis-item strong,
+.merge-analysis-item small {
+  font-size: 12px;
+}
+
+.merge-analysis-item strong {
+  color: #25312b;
+}
+
+.merge-analysis-item small {
+  color: #68756d;
+}
+
+.merge-analysis-item p {
+  flex-basis: 100%;
+  margin: 0;
+  color: #4b574f;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .merge-conflict-jump-actions .icon-only-button {
   width: 28px;
   height: 28px;
@@ -2298,6 +2379,10 @@ button[aria-busy="true"]:disabled {
   width: min(560px, calc(100vw - 56px));
 }
 
+.merge-preview-modal {
+  width: min(720px, calc(100vw - 56px));
+}
+
 .pull-confirm-modal p,
 .submit-confirm-modal p {
   margin: 0;
@@ -2471,6 +2556,52 @@ button[aria-busy="true"]:disabled {
   font-size: 12px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.merge-preview-file-list {
+  display: grid;
+  gap: 7px;
+  max-height: min(360px, calc(100vh - 300px));
+  overflow: auto;
+}
+
+.merge-preview-file {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  gap: 4px 8px;
+  align-items: center;
+  padding: 8px 9px;
+  border: 1px solid #e0e6e1;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.merge-preview-file span {
+  color: #2c6b50;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.merge-preview-file.manual span,
+.merge-preview-file.add_delete span,
+.merge-preview-file.binary span {
+  color: #9a4b16;
+}
+
+.merge-preview-file strong {
+  overflow: hidden;
+  color: #25312b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.merge-preview-file small {
+  grid-column: 2;
+  color: #68756d;
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .submit-confirm-empty {
@@ -5285,6 +5416,32 @@ html[data-theme="dark"] .merge-editor-toolbar .warning {
   color: #ffb86c;
 }
 
+html[data-theme="dark"] .merge-analysis-panel {
+  border-color: #3c3f41;
+  background: #252629;
+}
+
+html[data-theme="dark"] .merge-analysis-heading strong,
+html[data-theme="dark"] .merge-analysis-item strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .merge-analysis-heading span,
+html[data-theme="dark"] .merge-analysis-item small,
+html[data-theme="dark"] .merge-analysis-item p {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .merge-analysis-item {
+  border-color: #3c3f41;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .merge-analysis-item.low {
+  border-color: #6b4a31;
+  background: #241b14;
+}
+
 html[data-theme="dark"] .merge-editor {
   background: #3c3f41;
 }
@@ -5679,6 +5836,19 @@ html[data-theme="dark"] .pull-confirm-file-list span {
 html[data-theme="dark"] .pull-confirm-summary span,
 html[data-theme="dark"] .pull-confirm-summary small,
 html[data-theme="dark"] .pull-confirm-file-list span {
+  color: #a9b7c6;
+}
+
+html[data-theme="dark"] .merge-preview-file {
+  border-color: #3c3f41;
+  background: #1e1f22;
+}
+
+html[data-theme="dark"] .merge-preview-file strong {
+  color: #dfe1e5;
+}
+
+html[data-theme="dark"] .merge-preview-file small {
   color: #a9b7c6;
 }
 
