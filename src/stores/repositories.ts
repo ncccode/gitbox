@@ -116,13 +116,25 @@ function mergeProjectItems(current: ProjectItem, incoming: ProjectItem) {
   };
 }
 
-function sortQuickSwitchItems(items: ProjectItem[]) {
+function sortProjectItemsByRecency(items: ProjectItem[]) {
   return [...items].sort((left, right) => {
     if (Boolean(left.pinned) !== Boolean(right.pinned)) return left.pinned ? -1 : 1;
     const recentDelta = (right.lastOpenedAt ?? 0) - (left.lastOpenedAt ?? 0);
     if (recentDelta !== 0) return recentDelta;
     return nameFromPath(left.path).localeCompare(nameFromPath(right.path));
   });
+}
+
+function sortQuickSwitchItems(items: ProjectItem[]) {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      if (Boolean(left.item.pinned) !== Boolean(right.item.pinned)) {
+        return left.item.pinned ? -1 : 1;
+      }
+      return left.index - right.index;
+    })
+    .map(({ item }) => item);
 }
 
 function dedupeProjectItems(items: ProjectItem[]) {
@@ -141,6 +153,10 @@ function findProjectItem(items: ProjectItem[], path: string | null | undefined) 
   return items.find((item) => projectPathKey(item.path) === key) ?? null;
 }
 
+function normalizeStoredProjectItems(items: ProjectItem[]) {
+  return sortProjectItemsByRecency(dedupeProjectItems(items));
+}
+
 function readStoredRepositories(): StoredRepositories {
   if (typeof window === "undefined") return { items: [] };
 
@@ -151,7 +167,7 @@ function readStoredRepositories(): StoredRepositories {
     const parsed = JSON.parse(raw) as Partial<StoredRepositories> | RepositoryInfo[];
     if (Array.isArray(parsed)) {
       return {
-        items: dedupeProjectItems(
+        items: normalizeStoredProjectItems(
           parsed.map(normalizeProjectItem).filter((item): item is ProjectItem => Boolean(item)),
         ),
       };
@@ -162,7 +178,7 @@ function readStoredRepositories(): StoredRepositories {
       : [];
 
     return {
-      items: dedupeProjectItems(items),
+      items: normalizeStoredProjectItems(items),
       activePath: typeof parsed.activePath === "string" ? normalizeProjectPath(parsed.activePath) : null,
     };
   } catch {
@@ -203,8 +219,8 @@ export const useRepositoriesStore = defineStore("repositories", {
       state.items
         .map((item) => item.repository)
         .filter((repo): repo is RepositoryInfo => Boolean(repo)),
-    pinnedItems: (state) => sortQuickSwitchItems(state.items.filter((item) => item.pinned)),
-    recentItems: (state) => sortQuickSwitchItems(state.items),
+    pinnedItems: (state) => state.items.filter((item) => item.pinned),
+    recentItems: (state) => state.items.slice(),
     quickSwitchItems: (state) => sortQuickSwitchItems(state.items),
     name: (state) => {
       const path = state.current?.path ?? state.activePath;
